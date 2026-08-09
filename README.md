@@ -39,8 +39,8 @@ VoiceFlow AI answers each of the five problems above directly:
 | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | Missed calls                | An AI voice agent picks up every inbound call instantly, 24/7 — understands the query, answers it, or books and logs the lead.        |
 | Can't hire agents           | One agent handles unlimited concurrent calls, so a clinic or shop gets round-the-clock coverage without hiring or training anyone.    |
-| English-first tools         | Built for India — Sarvam AI for native Hindi TTS/STT plus Groq for fast LLM responses, giving natural sub-second conversation.        |
-| Data leaving the country    | Entirely self-hosted on the business's own backend and database. No per-minute USD billing, no customer data handed to cloud vendors. |
+| English-first tools         | Multilingual transcription with auto language detection, so the agent answers in whatever language the caller actually used.          |
+| Data leaving the country    | Telephony, call records, transcripts and the CRM all live on our own infrastructure — only the live audio leg goes to the voice provider. |
 | Manual WhatsApp             | The same agent auto-replies the moment a message lands — text in your writing style, voice notes in your cloned voice.                |
 | Five disconnected tools     | Calls, WhatsApp conversations and customer records unified in one dashboard and CRM.                                                  |
 
@@ -68,28 +68,71 @@ Until then, run it locally with the setup steps below.
 - Tailwind CSS v4
 - lucide-react
 
-**Backend**
+**Backend (`backend/`)**
 
-- FastAPI (Python)
-- Celery for background jobs
-- PostgreSQL
+- FastAPI (Python 3.12)
+- SQLite via stdlib `sqlite3` — swap the DSN for PostgreSQL when scale needs it
+- httpx for the Vapi REST calls
 
 **AI / Voice**
 
-- Faster-Whisper — multilingual speech-to-text + language detection
-- Groq / Llama — LLM orchestration, intent understanding, persona engine
-- Sarvam AI — native Hindi/Indic text-to-speech
-- Voice cloning model — replies in the owner's own voice
+- **Vapi** — runs the realtime conversation loop: speech-to-text, LLM
+  response, and text-to-speech, with barge-in and turn-taking handled for us
+- Multilingual transcription with automatic language detection, so the agent
+  replies in whatever language the caller used
+- Cloned-voice output via a voice provider (ElevenLabs voice id), so replies
+  come back in the owner's own voice
 
-**Channels & Infrastructure**
+**Telephony — our own**
 
-- WhatsApp Business API
-- Telephony: Exotel / Asterisk (VPS-based rollout)
-- Fully self-hosted — no per-minute USD billing, data stays in India
+Vapi handles the conversation, **not** the phone line. Our own dialer / PBX
+(Asterisk or FreeSWITCH) owns the call and hands the audio leg to Vapi over
+SIP. On each inbound call Vapi asks this backend which assistant to use
+(`assistant-request` webhook) and we answer with the persona defined in
+[`backend/vapi.py`](backend/vapi.py). That keeps numbers, routing and call
+records on our infrastructure.
 
-> Note: this repository is the frontend — landing page plus dashboard. Every
-> screen renders from mock data in [`src/data.js`](src/data.js); the shapes
-> there are what the backend API is expected to return.
+**Channels**
+
+- WhatsApp Business API (conversations are stored and displayed; auto-send
+  not wired yet)
+
+## Architecture
+
+Full developer documentation — every file, folder and diagram — is in
+[`backend/ARCHITECTURE.md`](backend/ARCHITECTURE.md).
+
+```
+Caller ──► our PBX / dialer ──SIP──► Vapi (STT → LLM → cloned-voice TTS)
+                                       │
+                                       │ webhooks
+                                       ▼
+                          FastAPI backend  ──►  SQLite  ──►  React dashboard
+```
+
+| Vapi webhook         | What the backend does                                    |
+| -------------------- | -------------------------------------------------------- |
+| `assistant-request`  | Returns the assistant config — persona, prompt, voice     |
+| `status-update`      | Tracks ringing / in-progress / ended                      |
+| `end-of-call-report` | Saves duration, transcript, recording, outcome, language  |
+| `tool-calls`         | Runs assistant functions (e.g. `book_appointment`)        |
+
+### API endpoints
+
+| Method | Route                   | Purpose                                |
+| ------ | ----------------------- | -------------------------------------- |
+| GET    | `/health`               | Liveness + whether Vapi is configured  |
+| GET    | `/api/stats`            | The four dashboard tiles               |
+| GET    | `/api/calls?limit=`     | Call log                               |
+| GET    | `/api/calls-by-hour`    | Call-volume chart                      |
+| GET    | `/api/languages`        | Language mix                           |
+| GET    | `/api/conversations`    | WhatsApp inbox with messages           |
+| POST   | `/api/calls/outbound`   | Place a call through Vapi              |
+| POST   | `/api/vapi/sip-number`  | One-time: register our SIP endpoint    |
+| POST   | `/api/vapi/webhook`     | Vapi events (secured by `X-Vapi-Secret`) |
+
+The frontend falls back to the mock data in [`src/data.js`](src/data.js) if the
+backend is unreachable, so the dashboard still renders during a demo.
 
 ## Team Members
 
@@ -98,27 +141,69 @@ Until then, run it locally with the setup steps below.
 | **Abhinav Cheepa**  | Team Lead |
 | **Raghav Goyal**    | Member    |
 
+## API Keys Required
+
+Everything goes in `backend/.env` (copy from `backend/.env.example`). `.env` is
+gitignored — never commit real keys.
+
+| Key                   | Required?               | Where to get it                                                                                     |
+| --------------------- | ----------------------- | --------------------------------------------------------------------------------------------------- |
+| `VAPI_PRIVATE_KEY`    | **Yes**                 | vapi.ai → Dashboard → Settings → API Keys → **Private Key**                                          |
+| `VAPI_WEBHOOK_SECRET` | **Yes**                 | Invent any random string. Paste the same value into Vapi → Assistant → Server URL → Secret            |
+| `PUBLIC_URL`          | Yes, for real calls     | Public HTTPS URL of this backend. Locally use `ngrok http 8000` and paste the https URL               |
+| `VOICE_ID`            | For the cloned voice    | elevenlabs.io → clone the owner's voice → copy the Voice ID. Add your ElevenLabs key inside Vapi      |
+| `VAPI_ASSISTANT_ID`   | Optional                | Only if you build the assistant in Vapi's dashboard instead of `backend/vapi.py`                      |
+| `VAPI_PHONE_NUMBER_ID`| Optional                | Only if you rent a number from Vapi. Not needed — we use our own telephony                            |
+
+No OpenAI / Deepgram / ElevenLabs keys are needed in this repo: those providers
+are configured once inside the Vapi dashboard, and Vapi bills them.
+
+Until `VAPI_PRIVATE_KEY` is set, the dashboard and all read endpoints work
+normally — only the outbound-call and SIP-registration routes return 503.
+
 ## Setup Instructions
 
-**Requirements:** Node.js 18 or newer.
+**Requirements:** Node.js 18+ and Python 3.11+.
+
+**1. Backend**
 
 ```bash
-git clone <repo-url>
-cd voiceflow-ai
+cd backend
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+copy .env.example .env
+uvicorn main:app --reload --port 8000
+```
+
+On first run it creates `voiceflow.db` and seeds a demo dataset so the
+dashboard isn't empty. Set `SEED_DEMO_DATA=false` in `.env` to start clean.
+
+**2. Frontend** (in a second terminal)
+
+```bash
 npm install
 npm run dev
 ```
 
-Open **http://localhost:5174** in your browser.
+Open **http://localhost:5174**. The API is expected at `http://localhost:8000`
+— override with `VITE_API_URL` if you host it elsewhere.
 
-**Other commands**
+**3. Connect your telephony (when you're ready for real calls)**
+
+Expose the backend, then register a SIP endpoint for your PBX to dial:
+
+```bash
+curl -X POST http://localhost:8000/api/vapi/sip-number -H "Content-Type: application/json" -d "{\"sip_uri\":\"sip:voiceflow@sip.vapi.ai\"}"
+```
+
+Point your Asterisk/FreeSWITCH dialplan at that URI. Inbound calls will hit the
+`assistant-request` webhook and be answered by the assistant in `backend/vapi.py`.
+
+**Build for production**
 
 ```bash
 npm run build
-```
-
-```bash
-npm run preview
 ```
 
 ## Routes

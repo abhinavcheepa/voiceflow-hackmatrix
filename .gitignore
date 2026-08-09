@@ -3,3 +3,9 @@ dist
 .claude
 .DS_Store
 *.local
+
+# backend
+.env
+venv/
+__pycache__/
+*.db

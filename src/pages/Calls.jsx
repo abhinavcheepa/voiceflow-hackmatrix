@@ -1,14 +1,15 @@
 import { useState } from "react";
 import { Search, PhoneIncoming } from "lucide-react";
-import { Card } from "../ui.jsx";
+import { Card, EmptyState, ErrorNote } from "../ui.jsx";
 import { OutcomeBadge } from "./Dashboard.jsx";
-import { calls } from "../data.js";
+import { useApi } from "../api.js";
 
-const filters = ["All", "Booked", "Lead captured", "Answered", "Escalated"];
+const filters = ["All", "Booked", "Lead captured", "Answered", "Escalated", "Missed"];
 
 export default function Calls() {
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState("All");
+  const { data: calls, error } = useApi("/api/calls?limit=200", []);
 
   const needle = q.trim().toLowerCase();
   const rows = calls.filter(
@@ -26,6 +27,12 @@ export default function Calls() {
           Every inbound call, transcribed and logged automatically.
         </p>
       </header>
+
+      {error && (
+        <div className="mt-5">
+          <ErrorNote error={error} />
+        </div>
+      )}
 
       <div className="mt-7 flex flex-wrap items-center gap-3">
         <label className="flex flex-1 items-center gap-2.5 rounded-xl border border-line bg-panel px-3.5 py-2.5 focus-within:border-violet/50 sm:max-w-xs">
@@ -90,8 +97,16 @@ export default function Calls() {
             ))}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={6} className="px-5 py-14 text-center text-dim">
-                  No calls match that filter.
+                <td colSpan={6}>
+                  <EmptyState
+                    icon={PhoneIncoming}
+                    title={calls.length === 0 ? "No calls yet" : "No calls match that filter"}
+                    sub={
+                      calls.length === 0
+                        ? "Once your number is connected, every answered call lands here with its transcript and outcome."
+                        : undefined
+                    }
+                  />
                 </td>
               </tr>
             )}

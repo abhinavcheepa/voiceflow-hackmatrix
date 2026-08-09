@@ -31,6 +31,35 @@ export function SectionTitle({ eyebrow, title, sub }) {
 }
 
 /**
+ * Shown wherever there's genuinely no data yet — before the first real call or
+ * message arrives. Never stands in for a loading state.
+ */
+export function EmptyState({ icon: Icon, title, sub, action }) {
+  return (
+    <div className="grid place-items-center px-6 py-16 text-center">
+      {Icon && (
+        <span className="grid size-12 place-items-center rounded-2xl bg-panel-2 ring-1 ring-line">
+          <Icon className="size-5 text-dim" />
+        </span>
+      )}
+      <p className="mt-4 text-sm font-medium">{title}</p>
+      {sub && <p className="mt-1.5 max-w-sm text-xs leading-relaxed text-dim">{sub}</p>}
+      {action}
+    </div>
+  );
+}
+
+/** Backend unreachable or erroring — distinct from "no data yet". */
+export function ErrorNote({ error }) {
+  return (
+    <div className="rounded-xl border border-saffron/30 bg-saffron/5 px-4 py-3 text-xs text-saffron">
+      Backend not reachable — {error}. Start it with{" "}
+      <code className="font-mono">uvicorn main:app --port 8000</code> in <code>backend/</code>.
+    </div>
+  );
+}
+
+/**
  * Animated voice waveform. `bars` sets the count; each bar gets a staggered
  * delay and a stable pseudo-random height so it reads as speech, not a sine.
  */
