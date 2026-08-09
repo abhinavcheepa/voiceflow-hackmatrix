@@ -10,7 +10,9 @@ from dotenv import load_dotenv
 
 load_dotenv()  # must run before db/vapi read os.getenv at import time
 
+import asyncio  # noqa: E402
 import os  # noqa: E402
+import re  # noqa: E402
 from datetime import datetime  # noqa: E402
 
 from fastapi import (  # noqa: E402
@@ -24,13 +26,17 @@ from fastapi import (  # noqa: E402
     Request,
     Response,
     UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
+import asterisk_ari  # noqa: E402
 import brain  # noqa: E402
 import db  # noqa: E402
 import vapi  # noqa: E402
 import voice  # noqa: E402
+import webcall  # noqa: E402
 import whatsapp  # noqa: E402
 
 app = FastAPI(title="VoiceFlow AI", version="0.1.0")
@@ -44,8 +50,11 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-def startup() -> None:
+async def startup() -> None:
     db.init()
+    # Only when Asterisk is configured — a machine without it starts normally.
+    if asterisk_ari.configured():
+        asyncio.create_task(asterisk_ari.listen())
 
 
 @app.get("/health")
@@ -58,6 +67,8 @@ def health() -> dict:
         "voice": voice.configured(),
         "brain": brain.configured(),
         "voiceCloned": bool(voice.voice_id()),
+        "stt": brain.stt_backend(),
+        "asterisk": asterisk_ari.configured(),
     }
 
 
@@ -187,6 +198,192 @@ def voice_style(style: str = Body(..., embed=True)) -> dict:
     """The writing style WhatsApp text replies imitate."""
     db.set_setting(brain.STYLE_KEY, style)
     return {"style": style}
+
+
+# --- agents -------------------------------------------------------------
+
+@app.get("/api/agents")
+def agents() -> list[dict]:
+    return db.get_agents()
+
+
+@app.post("/api/agents")
+def agent_create(
+    name: str = Body(...),
+    prompt: str = Body(...),
+    greeting: str = Body(...),
+    language: str = Body("Hindi"),
+    is_default: bool = Body(False),
+) -> dict:
+    return db.save_agent(None, name=name, prompt=prompt, greeting=greeting,
+                         language=language, is_default=is_default)
+
+
+@app.put("/api/agents/{agent_id}")
+def agent_update(
+    agent_id: int,
+    name: str = Body(...),
+    prompt: str = Body(...),
+    greeting: str = Body(...),
+    language: str = Body("Hindi"),
+    is_default: bool = Body(False),
+) -> dict:
+    return db.save_agent(agent_id, name=name, prompt=prompt, greeting=greeting,
+                         language=language, is_default=is_default)
+
+
+@app.delete("/api/agents/{agent_id}")
+def agent_delete(agent_id: int) -> dict:
+    try:
+        db.delete_agent(agent_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+# --- contacts -----------------------------------------------------------
+
+@app.get("/api/contacts")
+def contacts() -> list[dict]:
+    return db.get_contacts()
+
+
+@app.get("/api/contacts/{contact_id}")
+def contact(contact_id: int) -> dict:
+    found = db.get_contact(contact_id)
+    if not found:
+        raise HTTPException(404, "No such contact")
+    return found
+
+
+@app.put("/api/contacts/{contact_id}")
+def contact_update(
+    contact_id: int,
+    name: str = Body(None),
+    email: str = Body(None),
+    status: str = Body(None),
+    notes: str = Body(None),
+) -> dict:
+    fields = {k: v for k, v in
+              {"name": name, "email": email, "status": status, "notes": notes}.items()
+              if v is not None}
+    updated = db.update_contact(contact_id, **fields)
+    if not updated:
+        raise HTTPException(404, "No such contact")
+    return updated
+
+
+# --- campaigns ----------------------------------------------------------
+
+@app.get("/api/campaigns")
+def campaigns() -> list[dict]:
+    return db.get_campaigns()
+
+
+@app.get("/api/campaigns/{campaign_id}/targets")
+def campaign_targets(campaign_id: int) -> list[dict]:
+    return db.get_campaign_targets(campaign_id)
+
+
+@app.post("/api/campaigns")
+def campaign_create(
+    name: str = Body(...),
+    numbers: str = Body(...),
+    agent_id: int = Body(None),
+) -> dict:
+    """`numbers` is pasted text — one per line, optional "name, phone"."""
+    targets = _parse_numbers(numbers)
+    if not targets:
+        raise HTTPException(400, "No valid phone numbers found")
+    return {"id": db.create_campaign(name, agent_id, targets), "targets": len(targets)}
+
+
+@app.post("/api/campaigns/{campaign_id}/start")
+async def campaign_start(campaign_id: int, tasks: BackgroundTasks) -> dict:
+    if not vapi.configured():
+        raise HTTPException(503, "No telephony configured — set VAPI_PRIVATE_KEY or Asterisk")
+    db.set_campaign_status(campaign_id, "running")
+    tasks.add_task(_run_campaign, campaign_id)
+    return {"ok": True, "status": "running"}
+
+
+@app.post("/api/campaigns/{campaign_id}/stop")
+def campaign_stop(campaign_id: int) -> dict:
+    db.set_campaign_status(campaign_id, "paused")
+    return {"ok": True, "status": "paused"}
+
+
+PHONE_RE = re.compile(r"\+?\d[\d\s-]{7,18}\d")
+
+
+def _parse_numbers(text: str) -> list[dict]:
+    """Accept pasted lists: bare numbers, or "Name, +91..." per line."""
+    out, seen = [], set()
+    for line in text.splitlines():
+        match = PHONE_RE.search(line)
+        if not match:
+            continue
+        phone = re.sub(r"[\s-]", "", match.group())
+        if phone in seen:
+            continue
+        seen.add(phone)
+        name = line[: match.start()].strip(" ,\t") or None
+        out.append({"name": name, "phone": phone})
+    return out
+
+
+async def _run_campaign(campaign_id: int) -> None:
+    """Dial targets one at a time.
+
+    Sequential on purpose: a parallel dialer on an unverified trunk is how you
+    get rate-limited or flagged for spam on the first run.
+    """
+    while (target := db.next_pending_target(campaign_id)):
+        if db.get_campaigns() and next(
+            (c for c in db.get_campaigns() if c["id"] == campaign_id), {}
+        ).get("status") != "running":
+            return  # stopped from the dashboard
+        try:
+            result = await vapi.create_call(target["phone"])
+            db.set_target_status(target["id"], "called", call_id=result.get("id", ""))
+        except Exception as e:  # noqa: BLE001
+            db.set_target_status(target["id"], "failed", error=str(e)[:200])
+        await asyncio.sleep(float(os.getenv("CAMPAIGN_GAP_SECONDS", "5")))
+    db.set_campaign_status(campaign_id, "done")
+
+
+# --- analytics ----------------------------------------------------------
+
+@app.get("/api/analytics")
+def analytics(days: int = 30) -> dict:
+    return db.get_analytics(days)
+
+
+# --- web calling --------------------------------------------------------
+
+@app.websocket("/api/web-call/ws")
+async def web_call(ws: WebSocket) -> None:
+    """Talk to the agent from the browser. One socket per call."""
+    await ws.accept()
+    agent_id = ws.query_params.get("agent")
+    session = webcall.Session(int(agent_id) if agent_id else None)
+    session.open_record()
+    await ws.send_json(
+        {"type": "connected", "callId": session.id, "agent": session.agent.get("name", "")}
+    )
+
+    try:
+        await webcall.speak(ws, session, session.greeting)
+        while True:
+            message = await ws.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+            if (audio := message.get("bytes")) is not None:
+                await webcall.handle_turn(ws, session, audio)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        session.close_record()
 
 
 # --- vapi webhook -------------------------------------------------------

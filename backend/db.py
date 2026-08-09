@@ -7,7 +7,7 @@ Swap the DSN for Postgres when there's a reason to; nothing here needs it yet.
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 DB_PATH = os.getenv("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "voiceflow.db"))
 
@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS calls (
     phone          TEXT NOT NULL,
     language       TEXT NOT NULL DEFAULT 'Hindi',
     intent         TEXT NOT NULL DEFAULT 'General enquiry',
+    agent_id       INTEGER,
     duration_sec   INTEGER NOT NULL DEFAULT 0,
     outcome        TEXT NOT NULL DEFAULT 'Answered',
     status         TEXT NOT NULL DEFAULT 'ended',
@@ -52,6 +53,49 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS agents (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    prompt     TEXT NOT NULL,
+    greeting   TEXT NOT NULL,
+    language   TEXT NOT NULL DEFAULT 'Hindi',
+    voice_id   TEXT,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS contacts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT,
+    phone        TEXT NOT NULL UNIQUE,
+    email        TEXT,
+    status       TEXT NOT NULL DEFAULT 'New',
+    notes        TEXT,
+    created_at   TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS campaigns (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    agent_id   INTEGER REFERENCES agents(id),
+    status     TEXT NOT NULL DEFAULT 'draft',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS campaign_targets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
+    name        TEXT,
+    phone       TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    call_id     TEXT,
+    error       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_targets_campaign ON campaign_targets(campaign_id, status);
+CREATE INDEX IF NOT EXISTS idx_contacts_seen    ON contacts(last_seen_at);
+
 CREATE INDEX IF NOT EXISTS idx_calls_started  ON calls(started_at);
 CREATE INDEX IF NOT EXISTS idx_msgs_conv      ON messages(conversation_id, created_at);
 """
@@ -78,6 +122,7 @@ def fmt_duration(seconds: int) -> str:
 def init() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+    ensure_default_agent()
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -227,6 +272,9 @@ def upsert_call(vapi_call_id: str, **fields) -> None:
                 {','.join(f'{c}=excluded.{c}' for c in fields if c != 'id')}""",
             [vapi_call_id, *fields.values()],
         )
+    # The CRM fills itself from real activity rather than manual entry.
+    if fields.get("phone"):
+        touch_contact(fields["phone"], fields.get("name"))
 
 
 def get_history(phone: str, limit: int = 12) -> list[dict]:
@@ -259,6 +307,332 @@ def add_message(phone: str, sender: str, kind: str, body: str, seconds: int | No
                VALUES (?,?,?,?,?,?,?)""",
             (conv_id, sender, kind, body, seconds, int(failed), now),
         )
+    touch_contact(phone, name)
+
+
+# --- agents -------------------------------------------------------------
+
+DEFAULT_AGENT = {
+    "name": "Front desk",
+    "prompt": (
+        "You answer for the business. Be warm and efficient, like a good shop "
+        "owner — not a call-centre script. Answer questions about timings, "
+        "pricing and availability, and take bookings. Never invent prices, "
+        "stock or appointment slots you were not given."
+    ),
+    "greeting": "Namaste! Main aapki kya madad kar sakti hoon?",
+    "language": "Hindi",
+}
+
+
+def _row_to_agent(r) -> dict:
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "prompt": r["prompt"],
+        "greeting": r["greeting"],
+        "language": r["language"],
+        "voiceId": r["voice_id"] or "",
+        "isDefault": bool(r["is_default"]),
+    }
+
+
+def ensure_default_agent() -> None:
+    """Every install needs one agent, or calls have no persona to run."""
+    with connect() as conn:
+        if conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]:
+            return
+        conn.execute(
+            """INSERT INTO agents (name, prompt, greeting, language, is_default, created_at)
+               VALUES (?,?,?,?,1,?)""",
+            (DEFAULT_AGENT["name"], DEFAULT_AGENT["prompt"], DEFAULT_AGENT["greeting"],
+             DEFAULT_AGENT["language"], datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def get_agents() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM agents ORDER BY is_default DESC, name").fetchall()
+    return [_row_to_agent(r) for r in rows]
+
+
+def get_agent(agent_id: int | None = None) -> dict | None:
+    """A specific agent, or the default one when no id is given."""
+    with connect() as conn:
+        if agent_id:
+            r = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
+        else:
+            r = conn.execute(
+                "SELECT * FROM agents ORDER BY is_default DESC, id LIMIT 1"
+            ).fetchone()
+    return _row_to_agent(r) if r else None
+
+
+def save_agent(agent_id: int | None, **fields) -> dict:
+    with connect() as conn:
+        if fields.pop("is_default", False):
+            conn.execute("UPDATE agents SET is_default = 0")
+            fields["is_default"] = 1
+        if agent_id:
+            sets = ",".join(f"{k}=?" for k in fields)
+            conn.execute(f"UPDATE agents SET {sets} WHERE id = ?", [*fields.values(), agent_id])
+        else:
+            fields["created_at"] = datetime.now(timezone.utc).isoformat()
+            cols = ",".join(fields)
+            conn.execute(
+                f"INSERT INTO agents ({cols}) VALUES ({','.join('?' * len(fields))})",
+                list(fields.values()),
+            )
+            agent_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return get_agent(agent_id)
+
+
+def delete_agent(agent_id: int) -> None:
+    with connect() as conn:
+        # Never delete the last one — calls would have no persona to fall back to.
+        if conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0] <= 1:
+            raise ValueError("Cannot delete the only agent")
+        conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+        if not conn.execute("SELECT 1 FROM agents WHERE is_default = 1").fetchone():
+            conn.execute("UPDATE agents SET is_default = 1 WHERE id = (SELECT MIN(id) FROM agents)")
+
+
+# --- contacts -----------------------------------------------------------
+
+def touch_contact(phone: str, name: str | None = None) -> None:
+    """Called on every call and message, so the CRM fills itself.
+
+    An existing name is never overwritten by a blank one — WhatsApp gives us a
+    profile name, phone calls usually don't.
+    """
+    if not phone or phone == "unknown":
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO contacts (name, phone, created_at, last_seen_at) VALUES (?,?,?,?)
+               ON CONFLICT(phone) DO UPDATE SET
+                   last_seen_at = excluded.last_seen_at,
+                   name = COALESCE(NULLIF(excluded.name,''), contacts.name)""",
+            (name, phone, now, now),
+        )
+
+
+def get_contacts(limit: int = 200) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT c.*,
+                      (SELECT COUNT(*) FROM calls WHERE calls.phone = c.phone)      AS calls,
+                      (SELECT COUNT(*) FROM messages m
+                         JOIN conversations v ON v.id = m.conversation_id
+                        WHERE v.phone = c.phone)                                    AS messages
+               FROM contacts c ORDER BY c.last_seen_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"] or "Unknown",
+            "phone": r["phone"],
+            "email": r["email"] or "",
+            "status": r["status"],
+            "notes": r["notes"] or "",
+            "calls": r["calls"],
+            "messages": r["messages"],
+            "lastSeen": _ago(r["last_seen_at"]),
+        }
+        for r in rows
+    ]
+
+
+def get_contact(contact_id: int) -> dict | None:
+    """One contact with calls and messages merged into a single timeline.
+
+    This is the 'one dashboard, not five tools' promise — both channels for one
+    customer, newest first.
+    """
+    with connect() as conn:
+        c = conn.execute("SELECT * FROM contacts WHERE id = ?", (contact_id,)).fetchone()
+        if not c:
+            return None
+        calls = conn.execute(
+            "SELECT * FROM calls WHERE phone = ? ORDER BY started_at DESC", (c["phone"],)
+        ).fetchall()
+        msgs = conn.execute(
+            """SELECT m.* FROM messages m
+               JOIN conversations v ON v.id = m.conversation_id
+               WHERE v.phone = ? ORDER BY m.created_at DESC""",
+            (c["phone"],),
+        ).fetchall()
+
+    timeline = [
+        {
+            "kind": "call",
+            "at": r["started_at"],
+            "when": _ago(r["started_at"]),
+            "title": r["intent"],
+            "detail": f"{fmt_duration(r['duration_sec'])} · {r['language']}",
+            "outcome": r["outcome"],
+        }
+        for r in calls
+    ] + [
+        {
+            "kind": "message",
+            "at": r["created_at"],
+            "when": _ago(r["created_at"]),
+            "title": "You" if r["sender"] == "us" else "Customer",
+            "detail": r["body"],
+            "outcome": "voice note" if r["kind"] == "voice" else "text",
+        }
+        for r in msgs
+    ]
+    timeline.sort(key=lambda x: x["at"], reverse=True)
+
+    return {
+        "id": c["id"],
+        "name": c["name"] or "Unknown",
+        "phone": c["phone"],
+        "email": c["email"] or "",
+        "status": c["status"],
+        "notes": c["notes"] or "",
+        "timeline": timeline,
+    }
+
+
+def update_contact(contact_id: int, **fields) -> dict | None:
+    if fields:
+        with connect() as conn:
+            sets = ",".join(f"{k}=?" for k in fields)
+            conn.execute(
+                f"UPDATE contacts SET {sets} WHERE id = ?", [*fields.values(), contact_id]
+            )
+    return get_contact(contact_id)
+
+
+# --- campaigns ----------------------------------------------------------
+
+def create_campaign(name: str, agent_id: int | None, targets: list[dict]) -> int:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO campaigns (name, agent_id, created_at) VALUES (?,?,?)",
+            (name, agent_id, datetime.now(timezone.utc).isoformat()),
+        )
+        cid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.executemany(
+            "INSERT INTO campaign_targets (campaign_id, name, phone) VALUES (?,?,?)",
+            [(cid, t.get("name"), t["phone"]) for t in targets],
+        )
+    return cid
+
+
+def get_campaigns() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT c.*, a.name AS agent_name,
+                      (SELECT COUNT(*) FROM campaign_targets t WHERE t.campaign_id = c.id) AS total,
+                      (SELECT COUNT(*) FROM campaign_targets t
+                        WHERE t.campaign_id = c.id AND t.status = 'called')                AS called,
+                      (SELECT COUNT(*) FROM campaign_targets t
+                        WHERE t.campaign_id = c.id AND t.status = 'failed')                AS failed
+               FROM campaigns c LEFT JOIN agents a ON a.id = c.agent_id
+               ORDER BY c.created_at DESC"""
+        ).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "agentName": r["agent_name"] or "Default",
+            "status": r["status"],
+            "total": r["total"],
+            "called": r["called"],
+            "failed": r["failed"],
+            "created": _ago(r["created_at"]),
+        }
+        for r in rows
+    ]
+
+
+def get_campaign_targets(campaign_id: int) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM campaign_targets WHERE campaign_id = ? ORDER BY id", (campaign_id,)
+        ).fetchall()
+    return [
+        {"id": r["id"], "name": r["name"] or "", "phone": r["phone"],
+         "status": r["status"], "error": r["error"] or ""}
+        for r in rows
+    ]
+
+
+def next_pending_target(campaign_id: int) -> dict | None:
+    with connect() as conn:
+        r = conn.execute(
+            "SELECT * FROM campaign_targets WHERE campaign_id = ? AND status = 'pending' LIMIT 1",
+            (campaign_id,),
+        ).fetchone()
+    return dict(r) if r else None
+
+
+def set_target_status(target_id: int, status: str, call_id: str = "", error: str = "") -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE campaign_targets SET status = ?, call_id = ?, error = ? WHERE id = ?",
+            (status, call_id, error, target_id),
+        )
+
+
+def set_campaign_status(campaign_id: int, status: str) -> None:
+    with connect() as conn:
+        conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", (status, campaign_id))
+
+
+# --- analytics ----------------------------------------------------------
+
+def get_analytics(days: int = 30) -> dict:
+    """Everything the analytics page needs, in one round trip."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with connect() as conn:
+        daily = conn.execute(
+            """SELECT date(started_at) AS day, COUNT(*) AS calls,
+                      COALESCE(AVG(duration_sec), 0) AS avg_sec
+               FROM calls WHERE started_at >= ? GROUP BY day ORDER BY day""",
+            (since,),
+        ).fetchall()
+        outcomes = conn.execute(
+            """SELECT outcome, COUNT(*) AS n FROM calls WHERE started_at >= ?
+               GROUP BY outcome ORDER BY n DESC""",
+            (since,),
+        ).fetchall()
+        by_agent = conn.execute(
+            """SELECT COALESCE(a.name, 'Unassigned') AS agent, COUNT(*) AS calls,
+                      COALESCE(AVG(c.duration_sec), 0) AS avg_sec
+               FROM calls c LEFT JOIN agents a ON a.id = c.agent_id
+               WHERE c.started_at >= ? GROUP BY agent ORDER BY calls DESC""",
+            (since,),
+        ).fetchall()
+        msgs = conn.execute(
+            """SELECT date(created_at) AS day,
+                      SUM(sender = 'them') AS inbound,
+                      SUM(sender = 'us' AND failed = 0) AS replies
+               FROM messages WHERE created_at >= ? GROUP BY day ORDER BY day""",
+            (since,),
+        ).fetchall()
+
+    return {
+        "days": days,
+        "daily": [
+            {"day": r["day"], "calls": r["calls"], "avgSec": round(r["avg_sec"])} for r in daily
+        ],
+        "outcomes": [{"outcome": r["outcome"], "count": r["n"]} for r in outcomes],
+        "byAgent": [
+            {"agent": r["agent"], "calls": r["calls"], "avgDuration": fmt_duration(round(r["avg_sec"]))}
+            for r in by_agent
+        ],
+        "whatsapp": [
+            {"day": r["day"], "inbound": r["inbound"] or 0, "replies": r["replies"] or 0}
+            for r in msgs
+        ],
+    }
 
 
 # --- helpers ------------------------------------------------------------

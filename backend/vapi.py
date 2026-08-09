@@ -9,6 +9,7 @@ import os
 
 import httpx
 
+import db
 import voice
 
 BASE_URL = os.getenv("VAPI_BASE_URL", "https://api.vapi.ai")
@@ -36,18 +37,23 @@ Rules:
 """
 
 
-def assistant() -> dict:
+def assistant(agent_id: int | None = None) -> dict:
     """Transient assistant returned to Vapi on `assistant-request`.
 
-    Editing this file changes behaviour on the next call — no dashboard edits.
+    Persona comes from the selected agent in the dashboard; SYSTEM_PROMPT here
+    is the base brief that every agent's own prompt is appended to.
     """
+    agent = db.get_agent(agent_id) or {}
+    prompt = f"{SYSTEM_PROMPT}\n{agent.get('prompt', '')}".strip()
+
     config = {
-        "name": BUSINESS_NAME,
-        "firstMessage": f"Namaste! {BUSINESS_NAME} me aapka swagat hai. Main aapki kya madad kar sakti hoon?",
+        "name": agent.get("name") or BUSINESS_NAME,
+        "firstMessage": agent.get("greeting")
+        or f"Namaste! {BUSINESS_NAME} me aapka swagat hai. Main aapki kya madad kar sakti hoon?",
         "model": {
             "provider": "openai",
             "model": "gpt-4o-mini",
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT}],
+            "messages": [{"role": "system", "content": prompt}],
         },
         "transcriber": {"provider": "deepgram", "model": "nova-2", "language": "multi"},
         "endCallFunctionEnabled": True,

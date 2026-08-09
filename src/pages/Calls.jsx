@@ -1,15 +1,91 @@
 import { useState } from "react";
-import { Search, PhoneIncoming } from "lucide-react";
+import { Search, PhoneIncoming, PhoneOutgoing, Loader2, X } from "lucide-react";
 import { Card, EmptyState, ErrorNote } from "../ui.jsx";
 import { OutcomeBadge } from "./Dashboard.jsx";
-import { useApi } from "../api.js";
+import { useApi, post } from "../api.js";
 
 const filters = ["All", "Booked", "Lead captured", "Answered", "Escalated", "Missed"];
+
+/** E.164-ish: optional +, 8–15 digits. Spaces and dashes are stripped first. */
+const normalise = (s) => s.replace(/[\s-()]/g, "");
+const isValidNumber = (s) => /^\+?\d{8,15}$/.test(normalise(s));
+
+function NewCall({ onPlaced }) {
+  const [open, setOpen] = useState(false);
+  const [number, setNumber] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+
+  async function place() {
+    setBusy(true);
+    setResult(null);
+    try {
+      await post("/api/calls/outbound", { number: normalise(number) });
+      setResult({ ok: true, text: `Calling ${number}…` });
+      setNumber("");
+      onPlaced();
+    } catch (e) {
+      setResult({ ok: false, text: e.message });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        className="flex items-center gap-2 rounded-xl bg-violet px-4 py-2.5 text-sm font-medium text-white transition hover:bg-violet-soft"
+      >
+        <PhoneOutgoing className="size-4" /> New call
+      </button>
+    );
+  }
+
+  return (
+    <Card className="w-full sm:w-96">
+      <div className="flex items-center justify-between">
+        <p className="text-sm font-medium">Place a call</p>
+        <button onClick={() => setOpen(false)} className="text-dim transition hover:text-white">
+          <X className="size-4" />
+        </button>
+      </div>
+      <p className="mt-1 text-xs text-dim">
+        The agent dials and handles the conversation on its own.
+      </p>
+      <div className="mt-4 flex gap-2">
+        <input
+          value={number}
+          onChange={(e) => setNumber(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && isValidNumber(number) && place()}
+          placeholder="+91 98765 43210"
+          inputMode="tel"
+          autoFocus
+          className="flex-1 rounded-xl border border-line bg-panel-2 px-3.5 py-2.5 text-sm outline-none focus:border-violet/50"
+        />
+        <button
+          onClick={place}
+          disabled={busy || !isValidNumber(number)}
+          className="flex items-center gap-2 rounded-xl bg-violet px-4 py-2.5 text-sm font-medium text-white transition hover:bg-violet-soft disabled:opacity-40"
+        >
+          {busy ? <Loader2 className="size-4 animate-spin" /> : <PhoneOutgoing className="size-4" />}
+          Call
+        </button>
+      </div>
+      {number && !isValidNumber(number) && (
+        <p className="mt-2 text-xs text-dim">Enter 8–15 digits, optionally starting with +.</p>
+      )}
+      {result && (
+        <p className={`mt-3 text-xs ${result.ok ? "text-mint" : "text-saffron"}`}>{result.text}</p>
+      )}
+    </Card>
+  );
+}
 
 export default function Calls() {
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState("All");
-  const { data: calls, error } = useApi("/api/calls?limit=200", []);
+  const { data: calls, error, reload } = useApi("/api/calls?limit=200", []);
 
   const needle = q.trim().toLowerCase();
   const rows = calls.filter(
@@ -21,11 +97,14 @@ export default function Calls() {
 
   return (
     <div className="mx-auto max-w-6xl p-6 lg:p-8">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight">Calls</h1>
-        <p className="mt-1 text-sm text-dim">
-          Every inbound call, transcribed and logged automatically.
-        </p>
+      <header className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Calls</h1>
+          <p className="mt-1 text-sm text-dim">
+            Every call, inbound and outbound, transcribed and logged automatically.
+          </p>
+        </div>
+        <NewCall onPlaced={reload} />
       </header>
 
       {error && (
