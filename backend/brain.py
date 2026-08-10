@@ -7,6 +7,7 @@ through here — Vapi runs that loop itself.
 
 import asyncio
 import io
+import logging
 import os
 import re
 
@@ -14,15 +15,19 @@ import httpx
 
 import db
 
+log = logging.getLogger("voiceflow.brain")
+
 GROQ_URL = "https://api.groq.com/openai/v1"
 GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 
 # Reply generation. Any OpenAI-compatible provider works — set CHAT_BASE_URL to
 # https://integrate.api.nvidia.com/v1 with an nvapi- key to use NVIDIA instead.
 # Defaults to Groq so one key covers both jobs.
-CHAT_BASE_URL = os.getenv("CHAT_BASE_URL", GROQ_URL)
-CHAT_API_KEY = os.getenv("CHAT_API_KEY", "") or GROQ_KEY
-CHAT_MODEL = os.getenv("CHAT_MODEL", "llama-3.3-70b-versatile")
+# `or` not a getenv default: a key present in .env but left blank returns "",
+# and getenv's default never fires. Blank must mean "use ours".
+CHAT_BASE_URL = os.getenv("CHAT_BASE_URL") or GROQ_URL
+CHAT_API_KEY = os.getenv("CHAT_API_KEY") or GROQ_KEY
+CHAT_MODEL = os.getenv("CHAT_MODEL") or "llama-3.3-70b-versatile"
 
 # Transcription. Two backends, both real:
 #   "groq"  — hosted Whisper, fastest, needs GROQ_API_KEY
@@ -30,9 +35,9 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "llama-3.3-70b-versatile")
 #   "auto"  — groq when its key is present, otherwise local
 # NVIDIA is not an option here: its speech models ship as self-hosted NIM
 # containers, so there is no endpoint to point a key at.
-STT_PROVIDER = os.getenv("STT_PROVIDER", "auto").lower()
-STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3")
-LOCAL_STT_MODEL = os.getenv("LOCAL_STT_MODEL", "small")
+STT_PROVIDER = (os.getenv("STT_PROVIDER") or "auto").lower()
+STT_MODEL = os.getenv("GROQ_STT_MODEL") or "whisper-large-v3"
+LOCAL_STT_MODEL = os.getenv("LOCAL_STT_MODEL") or "small"
 
 BUSINESS_NAME = os.getenv("BUSINESS_NAME", "our business")
 OWNER_NAME = os.getenv("OWNER_NAME", "the owner")
@@ -63,22 +68,87 @@ def _stt_headers() -> dict:
     return {"Authorization": f"Bearer {GROQ_KEY}"}
 
 
-def system_prompt() -> str:
+def system_prompt(customer: str | None = None) -> str:
+    """The brief for WhatsApp replies.
+
+    Carries the selected agent's own instructions — its timings, prices and
+    rules — because without them the model has no facts and cheerfully invents
+    slots and rates.
+    """
     style = db.get_setting(STYLE_KEY) or DEFAULT_STYLE
-    return f"""You are replying to WhatsApp messages on behalf of {OWNER_NAME}, who runs {BUSINESS_NAME}.
+    agent = db.get_agent() or {}
+    business = agent.get("name") or BUSINESS_NAME
+    persona = agent.get("prompt", "").strip()
+
+    # Only claim to know the name when we actually do. Telling the model to
+    # "greet by name" with no name makes it invent one.
+    who = (
+        f"The customer's name is {customer}. Use it naturally."
+        if customer
+        else "You do NOT know the customer's name. Never guess or make one up."
+    )
+
+    return f"""You are replying to WhatsApp messages on behalf of {OWNER_NAME}, who runs {business}.
+
+{persona}
 
 Language: reply in the SAME language and script the customer used. If they wrote
 Hinglish in Latin script, reply in Hinglish in Latin script. Never switch.
 
 Writing style to imitate: {style}
 
+{who}
+
 Rules:
 - You are answering as the business, not as an AI. Never mention being an AI.
-- Answer questions about timings, pricing, availability, and take bookings.
-- Never invent prices, stock, or appointment slots you were not told about.
-  If you don't know, say you'll confirm and get back to them.
+- Only state facts given above. If a fact was not given to you, you do not know
+  it. Never guess.
+
+You have NO access to a calendar, booking system or stock list. You cannot see
+what is free. So:
+- Never say a specific time, date or item IS available or IS booked.
+- When someone asks for a time, take their name and the time they want, and say
+  it will be confirmed shortly. Do not confirm it yourself.
+- Opening hours are not availability.
+
 - No emoji unless the customer used one first.
 """
+
+
+# Whisper was trained on subtitle data, so when it is handed silence or room
+# noise it emits stock phrases from that data rather than nothing. These are
+# the ones that actually show up; they are never real customer speech in a
+# one-line turn, so drop them instead of replying to them.
+HALLUCINATIONS = {
+    "you", "thank you", "thank you.", "thanks", "thanks.", "bye", "bye.",
+    "thank you for watching", "thanks for watching", "thanks for watching!",
+    "please subscribe", "subscribe to my channel", "the end", "okay", "ok",
+    "उपशीर्षक", "शुक्रिया", "धन्यवाद", "अगला वीडियो",
+}
+
+# A run of the same words is the other tell — "the episode of the episode of".
+REPEAT_RE = re.compile(r"\b(\w+(?:\s+\w+){0,3})\b(?:\s+\1\b){2,}", re.IGNORECASE)
+
+# Above this, Whisper itself believes the audio held no speech.
+NO_SPEECH_LIMIT = float(os.getenv("STT_NO_SPEECH_LIMIT") or 0.6)
+
+
+def _clean(text: str) -> str:
+    """Empty string for anything that looks like a hallucination, not speech."""
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    key = stripped.lower().strip(" .!?,")
+    if key in HALLUCINATIONS:
+        log.debug("dropped hallucination: %r", stripped)
+        return ""
+    if REPEAT_RE.search(stripped):
+        log.debug("dropped looping transcript: %r", stripped[:60])
+        return ""
+    # A single short token carries no intent and is almost always noise.
+    if len(stripped) < 3:
+        return ""
+    return stripped
 
 
 def stt_backend() -> str:
@@ -101,10 +171,18 @@ async def _transcribe_groq(audio: bytes, filename: str) -> str:
             f"{GROQ_URL}/audio/transcriptions",
             headers=_stt_headers(),
             files={"file": (filename, audio, "application/octet-stream")},
-            data={"model": STT_MODEL, "response_format": "json"},
+            # verbose_json carries no_speech_prob per segment, which is the only
+            # reliable signal that Whisper was handed silence.
+            data={"model": STT_MODEL, "response_format": "verbose_json"},
         )
         r.raise_for_status()
-        return r.json().get("text", "").strip()
+        body = r.json()
+
+    segments = body.get("segments") or []
+    if segments and all(s.get("no_speech_prob", 0) > NO_SPEECH_LIMIT for s in segments):
+        log.debug("dropped: every segment looks like silence")
+        return ""
+    return _clean(body.get("text", ""))
 
 
 _local_model = None
@@ -129,18 +207,19 @@ def _transcribe_local(audio: bytes) -> str:
     # beam_size=1 is greedy decoding: noticeably faster on CPU, and voice notes
     # are short and clear enough that the accuracy difference doesn't show.
     segments, _ = _load_local().transcribe(io.BytesIO(audio), beam_size=1)
-    return " ".join(s.text for s in segments).strip()
+    kept = [s for s in segments if getattr(s, "no_speech_prob", 0) <= NO_SPEECH_LIMIT]
+    return _clean(" ".join(s.text for s in kept))
 
 
 async def reply(phone: str, message: str, history: list[dict] | None = None,
-                prompt: str | None = None) -> str:
+                prompt: str | None = None, customer: str | None = None) -> str:
     """Generate one reply.
 
     `history` overrides the stored thread — web calls keep their turns in memory
     rather than in the WhatsApp tables.
     """
     messages = [
-        {"role": "system", "content": prompt or system_prompt()},
+        {"role": "system", "content": prompt or system_prompt(customer)},
         *(db.get_history(phone) if history is None else history),
         {"role": "user", "content": message},
     ]

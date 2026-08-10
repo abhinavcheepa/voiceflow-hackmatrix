@@ -9,3 +9,8 @@ dist
 venv/
 __pycache__/
 *.db
+
+# wa-bridge — holds the linked WhatsApp session; leaking it hands over the number
+.session/
+bridge.log
+bridge.err

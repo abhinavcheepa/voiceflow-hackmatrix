@@ -24,6 +24,26 @@ def test_detect_language():
         assert got == expected, f"{text!r} -> {got}, expected {expected}"
 
 
+def test_drops_whisper_hallucinations():
+    """Whisper answers silence with stock subtitle phrases; never reply to those."""
+    for junk in [
+        "Thank you.", "you", "Thanks for watching!", "Bye.", " okay ", "ok",
+        "धन्यवाद", "a",
+        "I'm going to go to the next episode of the episode of the episode of the",
+    ]:
+        assert brain._clean(junk) == "", f"should have dropped {junk!r}"
+
+
+def test_keeps_real_speech():
+    for real in [
+        "kya aaj shaam ka slot khaali hai?",
+        "Thank you, aur cleaning ka charge kitna hai?",   # starts like junk, isn't
+        "नमस्ते, आज शाम का स्लॉट मिलेगा?",
+        "Do you have an appointment tomorrow?",
+    ]:
+        assert brain._clean(real) == real.strip(), f"should have kept {real!r}"
+
+
 def test_parse_ignores_status_receipts():
     """Delivery/read receipts arrive on the same webhook and must not reply."""
     receipts = {"entry": [{"changes": [{"value": {"statuses": [{"status": "delivered"}]}}]}]}

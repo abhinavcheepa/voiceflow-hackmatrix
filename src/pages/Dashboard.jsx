@@ -111,7 +111,7 @@ function SetupStatus({ health }) {
   const parts = [
     ["Calls", health.vapi],
     ["WhatsApp", health.whatsapp],
-    ["Voice clone", health.voiceCloned],
+    ["Voice", health.voiceReady],
     ["Replies", health.brain],
   ];
   if (parts.every(([, on]) => on)) return null;

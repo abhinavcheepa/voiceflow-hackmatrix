@@ -6,14 +6,27 @@ Vapi only runs the conversation.
     uvicorn main:app --reload --port 8000
 """
 
+import os
+
 from dotenv import load_dotenv
 
-load_dotenv()  # must run before db/vapi read os.getenv at import time
+load_dotenv()  # must run before the local imports read os.getenv at import time
+
+# A key that exists in .env but is left blank returns "", and os.getenv's
+# default never fires — so `CHAT_BASE_URL=` silently became an empty URL rather
+# than falling back. Dropping blanks makes "left blank" mean "use the default"
+# everywhere at once, instead of patching ~19 call sites.
+for _key, _value in list(os.environ.items()):
+    if _value == "":
+        del os.environ[_key]
 
 import asyncio  # noqa: E402
+import logging  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
 from datetime import datetime  # noqa: E402
+
+import httpx  # noqa: E402
 
 from fastapi import (  # noqa: E402
     BackgroundTasks,
@@ -30,6 +43,7 @@ from fastapi import (  # noqa: E402
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
 
 import asterisk_ari  # noqa: E402
 import brain  # noqa: E402
@@ -38,8 +52,38 @@ import vapi  # noqa: E402
 import voice  # noqa: E402
 import webcall  # noqa: E402
 import whatsapp  # noqa: E402
+import whatsapp_web  # noqa: E402
 
 app = FastAPI(title="VoiceFlow AI", version="0.1.0")
+
+log = logging.getLogger("voiceflow")
+
+
+@app.middleware("http")
+async def surface_errors(request: Request, call_next):
+    """Turn any unhandled exception into JSON the browser can actually read.
+
+    Without this, an exception escapes to Starlette's outermost error handler,
+    which sits ABOVE the CORS middleware — so the 500 arrives with no
+    Access-Control-Allow-Origin header and the browser reports a CORS failure
+    instead of the real cause. Every provider error looked like a CORS bug.
+
+    Registered BEFORE CORSMiddleware on purpose: add_middleware prepends, so
+    whatever is added last ends up outermost. CORS must stay outermost to wrap
+    these responses.
+    """
+    try:
+        return await call_next(request)
+    except httpx.HTTPStatusError as e:
+        # Providers explain themselves in the response body — pass that through
+        # rather than a generic 500.
+        detail = f"{e.request.url.host} returned {e.response.status_code}: {e.response.text[:400]}"
+        log.warning("%s %s -> %s", request.method, request.url.path, detail)
+        return JSONResponse({"detail": detail}, status_code=502)
+    except Exception as e:  # noqa: BLE001
+        log.exception("%s %s failed", request.method, request.url.path)
+        return JSONResponse({"detail": f"{type(e).__name__}: {e}"}, status_code=500)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -66,7 +110,7 @@ def health() -> dict:
         "whatsapp": whatsapp.configured(),
         "voice": voice.configured(),
         "brain": brain.configured(),
-        "voiceCloned": bool(voice.voice_id()),
+        "voiceReady": bool(voice.voice_id()),
         "stt": brain.stt_backend(),
         "asterisk": asterisk_ari.configured(),
     }
@@ -145,6 +189,105 @@ async def whatsapp_receive(request: Request, tasks: BackgroundTasks) -> dict:
     return {"ok": True}
 
 
+@app.post("/api/whatsapp/web/incoming")
+async def whatsapp_web_incoming(
+    request: Request, tasks: BackgroundTasks, x_bridge_token: str | None = Header(default=None)
+) -> dict:
+    """Inbound from the local wa-bridge. Same pipeline as the Meta webhook."""
+    if whatsapp_web.TOKEN and x_bridge_token != whatsapp_web.TOKEN:
+        raise HTTPException(401, "bad bridge token")
+    tasks.add_task(whatsapp.handle, whatsapp_web.parse(await request.json()))
+    return {"ok": True}
+
+
+@app.get("/api/whatsapp/link")
+async def whatsapp_link() -> dict:
+    """Connection state for the dashboard: whether a QR needs scanning."""
+    if whatsapp.PROVIDER != "web":
+        return {"provider": "meta", "status": "connected" if whatsapp.configured() else "offline"}
+    state = await whatsapp_web.status()
+    return {
+        "provider": "web",
+        "status": state.get("status", "offline"),
+        "number": state.get("me"),
+        "qr": state.get("qr"),
+        "error": state.get("error"),
+    }
+
+
+@app.get("/api/whatsapp/auto-reply")
+def auto_reply_get() -> dict:
+    return {"enabled": db.auto_reply_global(), "allowlist": db.get_allowlist()}
+
+
+@app.put("/api/whatsapp/allowlist")
+def allowlist_set(numbers: str = Body(..., embed=True)) -> dict:
+    """Restrict auto-replies to specific numbers.
+
+    Empty means everyone — right for a dedicated business number, wrong for a
+    number that also carries personal chats.
+    """
+    return {"allowlist": db.set_allowlist(numbers.replace("\n", ",").split(","))}
+
+
+@app.put("/api/whatsapp/auto-reply")
+def auto_reply_set(enabled: bool = Body(..., embed=True)) -> dict:
+    """Master switch. Off means the agent answers nobody — messages still
+    arrive and are stored, they just don't get a reply."""
+    db.set_auto_reply_global(enabled)
+    return {"enabled": enabled}
+
+
+@app.put("/api/conversations/{phone}/auto-reply")
+def auto_reply_thread(phone: str, enabled: bool = Body(..., embed=True)) -> dict:
+    """Per-thread override, for taking one conversation over by hand."""
+    db.set_auto_reply_for(phone, enabled)
+    return {"phone": phone, "enabled": enabled}
+
+
+@app.post("/api/whatsapp/sync")
+async def whatsapp_sync(chats: int = Body(20, embed=True), messages: int = Body(10, embed=True)) -> dict:
+    """Pull existing WhatsApp chats into the dashboard.
+
+    History only — these are written straight to the database and never run
+    through the agent, so importing cannot fire replies at old conversations.
+    Safe to run twice: messages carry WhatsApp's own id and duplicates are
+    ignored.
+    """
+    if whatsapp.PROVIDER != "web":
+        raise HTTPException(400, "Chat import is only available on the WhatsApp Web provider")
+
+    try:
+        threads = await whatsapp_web.sync(chats, messages)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 503:
+            raise HTTPException(503, e.response.json().get("error", "Chat import unavailable"))
+        raise
+    imported = 0
+    for thread in threads:
+        for m in thread["messages"]:
+            db.add_message(
+                thread["from"],
+                m["sender"],
+                "voice" if m["type"] == "audio" else "text",
+                m["text"] or "🎤 Voice note",
+                name=thread.get("name"),
+                language=brain.detect_language(m["text"] or ""),
+                at=m.get("at"),
+                wa_id=m.get("id"),
+            )
+            imported += 1
+    return {"threads": len(threads), "messages": imported}
+
+
+@app.post("/api/whatsapp/logout")
+async def whatsapp_logout() -> dict:
+    if whatsapp.PROVIDER != "web":
+        raise HTTPException(400, "Only the WhatsApp Web provider can log out")
+    await whatsapp_web.logout()
+    return {"ok": True}
+
+
 @app.post("/api/whatsapp/send")
 async def whatsapp_send(to: str = Body(...), text: str = Body(...)) -> dict:
     """Manual send from the dashboard — the owner taking over a thread."""
@@ -161,6 +304,21 @@ async def whatsapp_send(to: str = Body(...), text: str = Body(...)) -> dict:
 @app.get("/api/voice/profile")
 def voice_profile() -> dict:
     return {**voice.profile(), "style": db.get_setting(brain.STYLE_KEY, brain.DEFAULT_STYLE)}
+
+
+@app.get("/api/voice/library")
+async def voice_library(refresh: bool = False) -> list[dict]:
+    """Ready-made voices. Free on every Cartesia plan, unlike cloning."""
+    try:
+        return await voice.library(refresh)
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+
+
+@app.post("/api/voice/select")
+def voice_select(voice_id: str = Body(...), name: str = Body(...)) -> dict:
+    voice.select(voice_id, name)
+    return voice.profile()
 
 
 @app.post("/api/voice/clone")
@@ -185,9 +343,12 @@ async def voice_clone_delete() -> dict:
 
 
 @app.post("/api/voice/preview")
-async def voice_preview(text: str = Body(..., embed=True)) -> Response:
+async def voice_preview(
+    text: str = Body(...), voice_id: str = Body(None), language: str = Body(None)
+) -> Response:
+    """Speak `text`. Pass `voice_id` to audition a voice without selecting it."""
     try:
-        audio = await voice.synthesize(text)
+        audio = await voice.synthesize(text, language, as_voice=voice_id)
     except RuntimeError as e:
         raise HTTPException(503, str(e))
     return Response(content=audio, media_type=voice.OUTPUT_MIME)

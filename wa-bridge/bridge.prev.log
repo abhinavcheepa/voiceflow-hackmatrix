@@ -1,0 +1,49 @@
+Using browser: C:/Program Files/Google/Chrome/Application/chrome.exe
+Bridge listening on http://localhost:8100
+Connected as 917000759702
+[msg:create] from=225112255103065@lid type=chat fromMe=true status=false
+[msg:create] skipped (own message, status, or group)
+[msg:create] from=917000759702@c.us type=chat fromMe=true status=false
+[msg:create] skipped (own message, status, or group)
+[msg:create] from=172623443058716@lid type=chat fromMe=false status=false
+[msg:create] skipped (already handled)
+[msg:message] from=172623443058716@lid type=chat fromMe=false status=false
+[msg:message] skipped (already handled)
+[msg:create] from=917000759702@c.us type=chat fromMe=true status=false
+[msg:create] skipped (own message, status, or group)
+[msg:create] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:create] skipped (own message, status, or group)
+[msg:message] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:message] skipped (own message, status, or group)
+[msg:create] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:create] skipped (own message, status, or group)
+[msg:message] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:message] skipped (own message, status, or group)
+[msg:create] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:create] skipped (own message, status, or group)
+[msg:message] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:message] skipped (own message, status, or group)
+[msg:create] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:create] skipped (own message, status, or group)
+[msg:message] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:message] skipped (own message, status, or group)
+[msg:create] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:create] skipped (own message, status, or group)
+[msg:message] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:message] skipped (own message, status, or group)
+[msg:create] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:create] skipped (own message, status, or group)
+[msg:message] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:message] skipped (own message, status, or group)
+[msg:create] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:create] skipped (own message, status, or group)
+[msg:message] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:message] skipped (own message, status, or group)
+[msg:create] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:create] skipped (own message, status, or group)
+[msg:message] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:message] skipped (own message, status, or group)
+[msg:create] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:create] skipped (own message, status, or group)
+[msg:message] from=120363413839628167@g.us type=chat fromMe=false status=false
+[msg:message] skipped (own message, status, or group)

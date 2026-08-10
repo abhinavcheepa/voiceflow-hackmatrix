@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     name       TEXT NOT NULL,
     phone      TEXT NOT NULL UNIQUE,
     language   TEXT NOT NULL DEFAULT 'Hindi',
+    auto_reply INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL
 );
 
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS messages (
     seconds         INTEGER,
     read            INTEGER NOT NULL DEFAULT 0,
     failed          INTEGER NOT NULL DEFAULT 0,
+    wa_id           TEXT UNIQUE,
     created_at      TEXT NOT NULL
 );
 
@@ -119,9 +121,28 @@ def fmt_duration(seconds: int) -> str:
     return f"{seconds // 60}m {seconds % 60:02d}s"
 
 
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS won't add
+# them to a database that already exists, so they're applied separately.
+MIGRATIONS = [
+    ("messages", "wa_id", "TEXT"),
+    ("calls", "agent_id", "INTEGER"),
+    ("conversations", "auto_reply", "INTEGER NOT NULL DEFAULT 1"),
+]
+
+
+def _migrate(conn) -> None:
+    for table, column, coltype in MIGRATIONS:
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    # UNIQUE can't be added by ALTER, so the dedupe index is created here.
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msgs_wa_id ON messages(wa_id)")
+
+
 def init() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     ensure_default_agent()
 
 
@@ -240,6 +261,7 @@ def get_conversations() -> list[dict]:
                     "phone": c["phone"],
                     "language": c["language"],
                     "unread": unread,
+                    "autoReply": bool(c["auto_reply"]),
                     "last": _preview(last),
                     "time": _ago(c["updated_at"], short=True),
                     "messages": [
@@ -293,21 +315,100 @@ def get_history(phone: str, limit: int = 12) -> list[dict]:
 
 
 def add_message(phone: str, sender: str, kind: str, body: str, seconds: int | None = None,
-                name: str | None = None, language: str = "Hindi", failed: bool = False) -> None:
-    now = datetime.now(timezone.utc).isoformat()
+                name: str | None = None, language: str = "Hindi", failed: bool = False,
+                at: str | None = None, wa_id: str | None = None) -> None:
+    """Append a message.
+
+    `at` preserves the original timestamp when importing history — without it
+    every imported message would claim to be from right now. `wa_id` is
+    WhatsApp's own message id, which makes re-running an import a no-op instead
+    of duplicating the thread.
+    """
+    now = at or datetime.now(timezone.utc).isoformat()
     with connect() as conn:
         conn.execute(
             """INSERT INTO conversations (name, phone, language, updated_at) VALUES (?,?,?,?)
-               ON CONFLICT(phone) DO UPDATE SET updated_at = excluded.updated_at""",
+               ON CONFLICT(phone) DO UPDATE SET
+                   updated_at = MAX(conversations.updated_at, excluded.updated_at),
+                   name = COALESCE(NULLIF(excluded.name,''), conversations.name)""",
             (name or phone, phone, language, now),
         )
         conv_id = conn.execute("SELECT id FROM conversations WHERE phone = ?", (phone,)).fetchone()[0]
         conn.execute(
-            """INSERT INTO messages (conversation_id, sender, kind, body, seconds, failed, created_at)
-               VALUES (?,?,?,?,?,?,?)""",
-            (conv_id, sender, kind, body, seconds, int(failed), now),
+            """INSERT OR IGNORE INTO messages
+                   (conversation_id, sender, kind, body, seconds, failed, wa_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (conv_id, sender, kind, body, seconds, int(failed), wa_id, now),
         )
     touch_contact(phone, name)
+
+
+# --- auto-reply switches ------------------------------------------------
+
+AUTO_REPLY_KEY = "auto_reply"
+ALLOWLIST_KEY = "auto_reply_allowlist"
+
+
+def _digits(s: str) -> str:
+    return "".join(ch for ch in s if ch.isdigit())
+
+
+def get_allowlist() -> list[str]:
+    raw = get_setting(ALLOWLIST_KEY, "")
+    return [n for n in (_digits(p) for p in raw.split(",")) if n]
+
+
+def set_allowlist(numbers: list[str]) -> list[str]:
+    cleaned = [n for n in (_digits(p) for p in numbers) if n]
+    set_setting(ALLOWLIST_KEY, ",".join(cleaned))
+    return cleaned
+
+
+def allowed(phone: str) -> bool:
+    """Empty allowlist means everyone — normal for a business number.
+
+    Set it when the agent runs on a number that also carries personal chats,
+    so friends don't get answered by a bot.
+    """
+    allow = get_allowlist()
+    if not allow:
+        return True
+    # Compare on the last 10 digits: the same person appears as 9812345678,
+    # 919812345678 and +91 98123 45678 depending on where the number came from.
+    tail = _digits(phone)[-10:]
+    return any(a[-10:] == tail for a in allow)
+
+
+def auto_reply_global() -> bool:
+    """Master switch. Off means the agent answers nobody."""
+    return get_setting(AUTO_REPLY_KEY, "on") == "on"
+
+
+def set_auto_reply_global(enabled: bool) -> None:
+    set_setting(AUTO_REPLY_KEY, "on" if enabled else "off")
+
+
+def set_auto_reply_for(phone: str, enabled: bool) -> None:
+    """Per-thread override — the owner taking one conversation over by hand."""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE conversations SET auto_reply = ? WHERE phone = ?", (int(enabled), phone)
+        )
+
+
+def should_auto_reply(phone: str) -> bool:
+    """Both switches must be on. Incoming messages are always stored either way.
+
+    An unknown number defaults to on: a first-time customer should get an
+    answer, not silence.
+    """
+    if not auto_reply_global() or not allowed(phone):
+        return False
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT auto_reply FROM conversations WHERE phone = ?", (phone,)
+        ).fetchone()
+    return bool(row[0]) if row else True
 
 
 # --- agents -------------------------------------------------------------

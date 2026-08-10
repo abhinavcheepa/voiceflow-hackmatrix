@@ -1,5 +1,8 @@
 # Asterisk setup — Phases 1 to 5
 
+> Looking for **"how do I make my own phone ring into this?"** — that's
+> [PHONE-SETUP.md](PHONE-SETUP.md). This document is the software layer only.
+
 Goal of this document: a softphone on your laptop dials extension **1001**,
 Asterisk answers, hands the channel to our Python code, and you hear a greeting.
 That proves the whole telephony path before any AI audio work starts.

@@ -27,16 +27,24 @@ OWNER_NAME = os.getenv("OWNER_NAME", "the owner")
 
 # Spoken conversation needs a different brief from WhatsApp: no formatting, no
 # lists, and short enough that the caller isn't left waiting.
-CALL_PROMPT = f"""You are answering a phone call for {BUSINESS_NAME}, on behalf of {OWNER_NAME}.
+CALL_PROMPT = """You are answering a phone call for {business}, on behalf of {owner}.
 
-{{persona}}
+{persona}
 
 - Reply in the SAME language the caller used. Never switch.
 - This is speech, not text. One or two short sentences. No bullet points, no
   emoji, no markdown, no numbered lists.
-- Answer questions about timings, pricing and availability, and take bookings.
-- Never invent prices, stock or appointment slots. If you don't know, say you'll
-  check and confirm.
+- Only state facts given above. If a fact was not given to you, you do not
+  know it. Never guess.
+
+You have NO access to a calendar, booking system or stock list. You cannot see
+what is free. So:
+- Never say a specific time, date or item IS available or IS booked.
+- When someone asks for a time, take down their name and the time they want,
+  and tell them it will be confirmed shortly. Do not confirm it yourself.
+- Opening hours are not availability. "We are open until 7" is fine;
+  "7 o'clock is free" is not.
+
 - If the caller says goodbye, close warmly in one short line.
 """
 
@@ -47,6 +55,11 @@ GREETING = os.getenv(
 
 # Anything shorter is a click, a cough, or the mic opening — not a turn.
 MIN_AUDIO_BYTES = 2000
+
+# Spoken when the LLM fails, so the caller hears something instead of silence.
+FALLBACK = os.getenv(
+    "WEBCALL_FALLBACK", "Maaf kijiye, ek baar phir se boliye — main sun nahi paayi."
+)
 
 
 class Session:
@@ -64,7 +77,14 @@ class Session:
 
     @property
     def prompt(self) -> str:
-        return CALL_PROMPT.format(persona=self.agent.get("prompt", ""))
+        # The agent's own name wins over BUSINESS_NAME from .env — otherwise
+        # every agent introduces itself as whatever the env file says, which is
+        # how "VoiceFlow Demo" ended up answering as a dental clinic.
+        return CALL_PROMPT.format(
+            business=self.agent.get("name") or BUSINESS_NAME,
+            owner=OWNER_NAME,
+            persona=self.agent.get("prompt", ""),
+        )
 
     @property
     def greeting(self) -> str:
@@ -140,7 +160,11 @@ async def handle_turn(ws, session: Session, audio: bytes) -> None:
     try:
         answer = await brain.reply("", heard, history=session.history[:-1], prompt=session.prompt)
     except Exception as e:  # noqa: BLE001
+        # Free LLM endpoints rate-limit under load. Say something rather than
+        # leaving the caller in silence — the call stays up either way.
+        log.warning("LLM failed on %s: %s", session.id, e)
         await ws.send_json({"type": "error", "text": f"Could not answer: {e}"})
+        await speak(ws, session, FALLBACK)
         return
 
     await speak(ws, session, answer)

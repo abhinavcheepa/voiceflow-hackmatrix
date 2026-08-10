@@ -1,15 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Phone, PhoneOff, Loader2, AlertTriangle } from "lucide-react";
 import { Card, Waveform } from "../ui.jsx";
-import { API } from "../api.js";
+import { API, useApi } from "../api.js";
 
-const WS_URL = `${API.replace(/^http/, "ws")}/api/web-call/ws`;
+const WS_BASE = `${API.replace(/^http/, "ws")}/api/web-call/ws`;
 
 // Turn detection. The browser decides when the caller has finished speaking so
 // the backend never has to guess — it just receives one blob per turn.
-const SILENCE_RMS = 0.012; // below this counts as silence
-const SILENCE_MS = 1100; // how long that silence must hold
-const MIN_SPEECH_MS = 400; // ignore coughs and mic clicks
+//
+// These thresholds matter more than they look. Send near-silence to Whisper and
+// it does not return nothing — it returns stock subtitle phrases it was trained
+// on ("Thank you.", "you", "I'm going to go to the next episode…"), and the
+// agent then answers that nonsense. The gate below is what stops that.
+const SILENCE_RMS = 0.02; // below this counts as silence
+const SPEECH_RMS = 0.045; // a real voice peaks well above room noise
+const SILENCE_MS = 1100; // how long silence must hold to end a turn
+const MIN_SPEECH_MS = 700; // ignore coughs, clicks and door slams
 
 const STATUS_TEXT = {
   idle: "Ready",
@@ -26,6 +32,19 @@ export default function WebCall() {
   const [turns, setTurns] = useState([]);
   const [error, setError] = useState(null);
   const [callId, setCallId] = useState(null);
+  const [agentId, setAgentId] = useState("");
+
+  const { data: agents } = useApi("/api/agents", [], 0);
+
+  // Default to whichever agent is marked default, but let it be changed
+  // before dialling — otherwise every call goes to the generic one.
+  useEffect(() => {
+    if (!agentId && agents.length) {
+      setAgentId(String((agents.find((a) => a.isDefault) ?? agents[0]).id));
+    }
+  }, [agents, agentId]);
+
+  const agent = agents.find((a) => String(a.id) === agentId);
 
   const ws = useRef(null);
   const stream = useRef(null);
@@ -35,6 +54,8 @@ export default function WebCall() {
   const chunks = useRef([]);
   const speechMs = useRef(0);
   const silenceMs = useRef(0);
+  const peakRms = useRef(0);
+  const dropNext = useRef(false);
   const raf = useRef(null);
 
   const cleanup = useCallback(() => {
@@ -55,6 +76,14 @@ export default function WebCall() {
     mr.stop(); // onstop ships the blob and restarts recording
   }, []);
 
+  /** Same, but throw the audio away — it was noise, not a turn. */
+  const discardTurn = useCallback(() => {
+    const mr = recorder.current;
+    if (!mr || mr.state !== "recording") return;
+    dropNext.current = true;
+    mr.stop();
+  }, []);
+
   /** Watch the mic level and call flushTurn once the caller goes quiet. */
   const watchLevel = useCallback(
     (analyser, buffer) => {
@@ -65,22 +94,29 @@ export default function WebCall() {
         const rms = Math.sqrt(sum / buffer.length);
 
         // ~16ms a frame at 60fps; good enough for turn detection.
+        peakRms.current = Math.max(peakRms.current, rms);
+
         if (rms > SILENCE_RMS) {
           speechMs.current += 16;
           silenceMs.current = 0;
         } else if (speechMs.current > MIN_SPEECH_MS) {
           silenceMs.current += 16;
           if (silenceMs.current > SILENCE_MS) {
+            // Sustained sound alone isn't speech — a fan clears SILENCE_RMS all
+            // day. Require a peak only a voice reaches before sending anything.
+            const wasSpeech = peakRms.current >= SPEECH_RMS;
             speechMs.current = 0;
             silenceMs.current = 0;
-            flushTurn();
+            peakRms.current = 0;
+            if (wasSpeech) flushTurn();
+            else discardTurn();
           }
         }
         raf.current = requestAnimationFrame(tick);
       };
       raf.current = requestAnimationFrame(tick);
     },
-    [flushTurn],
+    [flushTurn, discardTurn],
   );
 
   function startRecorder() {
@@ -90,7 +126,9 @@ export default function WebCall() {
     mr.onstop = () => {
       const blob = new Blob(chunks.current, { type: "audio/webm" });
       chunks.current = [];
-      if (ws.current?.readyState === WebSocket.OPEN) {
+      const drop = dropNext.current;
+      dropNext.current = false;
+      if (!drop && ws.current?.readyState === WebSocket.OPEN) {
         blob.arrayBuffer().then((buf) => ws.current?.send(buf));
       }
       // Keep the mic hot for the next turn unless the call is over.
@@ -121,7 +159,7 @@ export default function WebCall() {
     analyser.fftSize = 1024;
     source.connect(analyser);
 
-    const socket = new WebSocket(WS_URL);
+    const socket = new WebSocket(agentId ? `${WS_BASE}?agent=${agentId}` : WS_BASE);
     socket.binaryType = "arraybuffer";
     ws.current = socket;
 
@@ -149,7 +187,15 @@ export default function WebCall() {
       else if (msg.type === "agent") setTurns((t) => [...t, { who: "agent", ...msg }]);
       else if (msg.type === "thinking") setStatus("thinking");
       else if (msg.type === "idle") setStatus("listening");
-      else if (msg.type === "warning" || msg.type === "error") setError(msg.text);
+      else if (msg.type === "warning" || msg.type === "error") {
+        setError(msg.text);
+        // A failed turn sends no audio, so nothing else would hand the mic
+        // back — without this the call sits on "Thinking…" forever.
+        if (ws.current?.readyState === WebSocket.OPEN) {
+          setStatus("listening");
+          if (recorder.current?.state !== "recording") startRecorder();
+        }
+      }
     };
 
     socket.onopen = () => {
@@ -178,6 +224,30 @@ export default function WebCall() {
       </header>
 
       <Card className="mt-7">
+        {/* Which persona answers. Without this every call went to whichever
+            agent happened to be default. */}
+        <label className="block text-xs text-dim">
+          Agent
+          <select
+            value={agentId}
+            onChange={(e) => setAgentId(e.target.value)}
+            disabled={live}
+            className="mt-1.5 w-full rounded-xl border border-line bg-panel-2 px-3.5 py-2.5 text-sm text-white outline-none focus:border-violet/50 disabled:opacity-50"
+          >
+            {agents.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.name}
+                {a.isDefault ? " (default)" : ""}
+              </option>
+            ))}
+          </select>
+        </label>
+        {agent && (
+          <p className="mt-2 text-xs text-dim">
+            Answers with: “{agent.greeting}”
+          </p>
+        )}
+
         <div className="flex flex-col items-center py-4">
           <button
             onClick={live ? hangUp : start}

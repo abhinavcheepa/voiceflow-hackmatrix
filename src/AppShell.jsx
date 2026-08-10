@@ -49,13 +49,13 @@ function VoiceProfile() {
   const { data: agent } = useApi("/api/agents", [], 0);
 
   const active = agent.find((a) => a.isDefault) ?? agent[0];
-  const ready = profile?.cloned && health?.brain;
+  const ready = profile?.ready && health?.brain;
 
   return (
     <div className="mt-auto rounded-xl border border-line bg-panel-2 p-3.5">
-      <p className="text-xs text-dim">Voice profile</p>
+      <p className="text-xs text-dim">Voice</p>
       <p className="mt-1 truncate text-sm font-medium">
-        {profile?.cloned ? profile.name : "Not cloned yet"}
+        {profile?.ready ? profile.name : "Not set up yet"}
       </p>
       {active && <p className="mt-0.5 truncate text-xs text-dim">{active.name}</p>}
       <p

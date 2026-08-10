@@ -9,6 +9,7 @@ A voice note gets a voice note back, in the owner's cloned voice. A text gets
 text back, written in the owner's style. Both are logged to the dashboard.
 """
 
+import logging
 import os
 
 import httpx
@@ -16,6 +17,9 @@ import httpx
 import brain
 import db
 import voice
+import whatsapp_web
+
+log = logging.getLogger("voiceflow.whatsapp")
 
 GRAPH_VERSION = os.getenv("WHATSAPP_API_VERSION", "v21.0")
 BASE_URL = f"https://graph.facebook.com/{GRAPH_VERSION}"
@@ -23,8 +27,15 @@ TOKEN = os.getenv("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 
+# "meta" = official Cloud API (needs business KYC).
+# "web"  = the local wa-bridge driving WhatsApp Web (no KYC, against WhatsApp's
+#          terms, ban risk — use a dedicated number).
+PROVIDER = (os.getenv("WHATSAPP_PROVIDER") or "meta").lower()
+
 
 def configured() -> bool:
+    if PROVIDER == "web":
+        return whatsapp_web.configured()
     return bool(TOKEN and PHONE_NUMBER_ID)
 
 
@@ -46,6 +57,19 @@ def verify(mode: str, token: str, challenge: str) -> str:
 # --- outbound -----------------------------------------------------------
 
 async def send_text(to: str, body: str) -> dict:
+    """Send a text reply through whichever provider is active."""
+    if PROVIDER == "web":
+        return await whatsapp_web.send_text(to, body)
+    return await _meta_send_text(to, body)
+
+
+async def send_voice(to: str, audio: bytes) -> dict:
+    if PROVIDER == "web":
+        return await whatsapp_web.send_voice(to, audio, voice.OUTPUT_MIME)
+    return await _meta_send_voice(to, audio)
+
+
+async def _meta_send_text(to: str, body: str) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             f"{BASE_URL}/{PHONE_NUMBER_ID}/messages",
@@ -62,7 +86,7 @@ async def send_text(to: str, body: str) -> dict:
         return r.json()
 
 
-async def send_voice(to: str, audio: bytes) -> dict:
+async def _meta_send_voice(to: str, audio: bytes) -> dict:
     """Upload the synthesised audio, then send it as a message."""
     async with httpx.AsyncClient(timeout=60) as client:
         up = await client.post(
@@ -135,9 +159,13 @@ async def handle(message: dict) -> None:
 
     try:
         if is_voice:
-            if not message.get("media_id"):
-                return
-            audio = await download_media(message["media_id"])
+            # The web bridge hands us the bytes directly; Meta gives a media id
+            # that needs fetching first.
+            audio = message.get("audio")
+            if audio is None:
+                if not message.get("media_id"):
+                    return
+                audio = await download_media(message["media_id"])
             incoming = await brain.transcribe(audio)
         else:
             incoming = message.get("text", "")
@@ -149,7 +177,16 @@ async def handle(message: dict) -> None:
         db.add_message(sender, "them", "voice" if is_voice else "text", incoming,
                        name=name, language=language)
 
-        answer = await brain.reply(sender, incoming)
+        # The message is now recorded whatever happens next. Only the *reply*
+        # is switchable — turning auto-reply off must never lose a customer's
+        # message, just leave it for the owner to answer.
+        if not db.should_auto_reply(sender):
+            log.info("auto-reply off for %s — message stored, not answered", sender)
+            return
+
+        # WhatsApp gives us the sender's profile name; pass it through so the
+        # agent can greet them properly instead of guessing.
+        answer = await brain.reply(sender, incoming, customer=name)
 
         if is_voice:
             audio_out = await voice.synthesize(answer, language)
