@@ -7,7 +7,7 @@
 # Each service runs detached, so closing this window leaves them running.
 # Use -Stop to shut them down.
 
-param([switch]$Stop, [switch]$NoBridge)
+param([switch]$Stop, [switch]$NoBridge, [switch]$Watch)
 
 $ErrorActionPreference = "Continue"
 $root = $PSScriptRoot
@@ -20,9 +20,16 @@ function Get-EnvValue($key) {
 }
 
 function Stop-Ours($pattern) {
-    Get-CimInstance Win32_Process -Filter "Name='node.exe' OR Name='python.exe'" |
+    $ids = @(Get-CimInstance Win32_Process -Filter "Name='node.exe' OR Name='python.exe'" |
         Where-Object { $_.CommandLine -like $pattern } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        ForEach-Object { $_.ProcessId })
+    # A command line doesn't always name the project — the bridge runs plain
+    # "node index.js", and a system-Python uvicorn names no path at all. So
+    # also take whoever is holding our ports, or the next start finds them taken.
+    $ids += @(Get-NetTCPConnection -LocalPort 8000, 5174, 8100 -State Listen -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.OwningProcess })
+    $ids | Select-Object -Unique |
+        ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
 }
 
 function Wait-For($url, $headers, $seconds = 40) {
@@ -105,20 +112,68 @@ if ($backendUp) {
     Write-Host "`nIntegrations" -ForegroundColor Cyan
     Line "Replies (LLM)" $h.brain "Groq"
     Line "Transcription" ($h.stt -ne $null) $h.stt
-    Line "Voice (TTS)" $h.voiceReady (Invoke-RestMethod "http://127.0.0.1:8000/api/voice/profile").name
+    Line "Voice (TTS)" $h.voiceReady (Get-EnvValue "VOICE_PROVIDER")
     Line "WhatsApp" $h.whatsapp $(if ($provider -eq "web") { "WhatsApp Web" } else { "Meta Cloud API" })
     Line "Phone calls (Vapi)" $h.vapi "needs VAPI_PRIVATE_KEY"
     Line "Phone calls (Asterisk)" $h.asterisk "needs ASTERISK_ARI_URL"
 
+    # Asked of the bridge, not the backend: the backend's route needs a
+    # dashboard session, and this script has no account to sign in with.
     if ($bridgeUp -and $provider -eq "web") {
-        $link = Invoke-RestMethod "http://127.0.0.1:8000/api/whatsapp/link"
+        $link = Invoke-RestMethod "http://127.0.0.1:8100/status" `
+            -Headers @{ "X-Bridge-Token" = (Get-EnvValue "WA_BRIDGE_TOKEN") }
         if ($link.status -eq "qr") {
             Write-Host "`n  WhatsApp needs linking — open http://localhost:5174/app/whatsapp and scan the QR" -ForegroundColor Yellow
         }
         elseif ($link.status -eq "connected") {
-            Write-Host "`n  WhatsApp linked as $($link.number)" -ForegroundColor Green
+            Write-Host "`n  WhatsApp linked as $($link.me)" -ForegroundColor Green
         }
     }
 }
 
 Write-Host "`nOpen  http://localhost:5174/app          Stop  .\start.ps1 -Stop`n" -ForegroundColor Cyan
+
+# ── watch ───────────────────────────────────────────────────────────────
+# The bridge repairs its own WhatsApp session, but nothing restarts the
+# process if it dies outright. -Watch keeps this window open and does that.
+if ($Watch) {
+    Write-Host "Watching. Ctrl+C to stop watching (services keep running).`n" -ForegroundColor DarkGray
+    $token = Get-EnvValue "WA_BRIDGE_TOKEN"
+    while ($true) {
+        Start-Sleep -Seconds 30
+
+        $pythonAlive = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+            Where-Object { $_.CommandLine -like "*voiceflow-ai*" }
+        if (-not $pythonAlive) {
+            Write-Host "$(Get-Date -Format 'HH:mm:ss')  backend died — restarting" -ForegroundColor Yellow
+            Start-Process -FilePath $python -ArgumentList "-m", "uvicorn", "main:app", "--port", "8000" `
+                -WorkingDirectory (Join-Path $root "backend") -WindowStyle Hidden
+        }
+
+        if (-not $NoBridge -and $provider -eq "web") {
+            $bridgeAlive = Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+                Where-Object { $_.CommandLine -like "*index.js*" }
+            if (-not $bridgeAlive) {
+                Write-Host "$(Get-Date -Format 'HH:mm:ss')  bridge died — restarting" -ForegroundColor Yellow
+                $env:BRIDGE_TOKEN = $token
+                Start-Process -FilePath "node.exe" -ArgumentList "index.js" -WorkingDirectory $bridgeDir `
+                    -WindowStyle Hidden -RedirectStandardOutput "$bridgeDir\stdout.log" `
+                    -RedirectStandardError "$bridgeDir\bridge.err"
+            }
+            else {
+                # Alive but possibly deaf — the bridge reports how long it has
+                # been silent, which is the failure that hid for three hours.
+                try {
+                    $link = Invoke-RestMethod "http://127.0.0.1:8100/status" `
+                        -Headers @{ "X-Bridge-Token" = $token } -TimeoutSec 5
+                    if ($link.status -ne "connected" -and $link.status -ne "qr") {
+                        Write-Host "$(Get-Date -Format 'HH:mm:ss')  bridge status: $($link.status)" -ForegroundColor Yellow
+                    }
+                }
+                catch {
+                    Write-Host "$(Get-Date -Format 'HH:mm:ss')  bridge not answering on 8100" -ForegroundColor Yellow
+                }
+            }
+        }
+    }
+}

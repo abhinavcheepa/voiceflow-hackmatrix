@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 
 export const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
-async function request(path, options) {
+async function request(path, options = {}) {
   const r = await fetch(`${API}${path}`, options);
   if (!r.ok) {
     const detail = await r.json().catch(() => null);

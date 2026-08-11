@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS messages (
     seconds         INTEGER,
     read            INTEGER NOT NULL DEFAULT 0,
     failed          INTEGER NOT NULL DEFAULT 0,
+    needs_reply     INTEGER NOT NULL DEFAULT 0,
     wa_id           TEXT UNIQUE,
     created_at      TEXT NOT NULL
 );
@@ -127,6 +128,7 @@ MIGRATIONS = [
     ("messages", "wa_id", "TEXT"),
     ("calls", "agent_id", "INTEGER"),
     ("conversations", "auto_reply", "INTEGER NOT NULL DEFAULT 1"),
+    ("messages", "needs_reply", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -299,6 +301,33 @@ def upsert_call(vapi_call_id: str, **fields) -> None:
         touch_contact(fields["phone"], fields.get("name"))
 
 
+def pending_replies(max_age_minutes: int = 20) -> list[dict]:
+    """Incoming messages that were accepted but never answered.
+
+    A reply runs as an in-process background task, so a restart or crash between
+    "message stored" and "reply sent" used to lose it silently — the customer
+    just never heard back. These are picked up on the next startup.
+
+    Age-capped on purpose: answering a message from yesterday is worse than not
+    answering it.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)).isoformat()
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT m.id, m.body, m.kind, v.phone, v.name
+               FROM messages m JOIN conversations v ON v.id = m.conversation_id
+               WHERE m.needs_reply = 1 AND m.sender = 'them' AND m.created_at >= ?
+               ORDER BY m.created_at""",
+            (since,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def clear_needs_reply(message_id: int) -> None:
+    with connect() as conn:
+        conn.execute("UPDATE messages SET needs_reply = 0 WHERE id = ?", (message_id,))
+
+
 def get_history(phone: str, limit: int = 12) -> list[dict]:
     """Recent turns for one number, oldest first — fed to the LLM as context."""
     with connect() as conn:
@@ -316,7 +345,8 @@ def get_history(phone: str, limit: int = 12) -> list[dict]:
 
 def add_message(phone: str, sender: str, kind: str, body: str, seconds: int | None = None,
                 name: str | None = None, language: str = "Hindi", failed: bool = False,
-                at: str | None = None, wa_id: str | None = None) -> None:
+                at: str | None = None, wa_id: str | None = None,
+                needs_reply: bool = False) -> int | None:
     """Append a message.
 
     `at` preserves the original timestamp when importing history — without it
@@ -334,13 +364,16 @@ def add_message(phone: str, sender: str, kind: str, body: str, seconds: int | No
             (name or phone, phone, language, now),
         )
         conv_id = conn.execute("SELECT id FROM conversations WHERE phone = ?", (phone,)).fetchone()[0]
-        conn.execute(
+        cur = conn.execute(
             """INSERT OR IGNORE INTO messages
-                   (conversation_id, sender, kind, body, seconds, failed, wa_id, created_at)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (conv_id, sender, kind, body, seconds, int(failed), wa_id, now),
+                   (conversation_id, sender, kind, body, seconds, failed, needs_reply,
+                    wa_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (conv_id, sender, kind, body, seconds, int(failed), int(needs_reply), wa_id, now),
         )
+        message_id = cur.lastrowid if cur.rowcount else None
     touch_contact(phone, name)
+    return message_id
 
 
 # --- auto-reply switches ------------------------------------------------

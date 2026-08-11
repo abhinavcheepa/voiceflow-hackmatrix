@@ -8,6 +8,7 @@ import {
   QrCode,
   LogOut,
   RefreshCw,
+  X,
 } from "lucide-react";
 import { Card, EmptyState, ErrorNote, Waveform } from "../ui.jsx";
 import { useApi, post, put } from "../api.js";
@@ -151,6 +152,14 @@ export default function WhatsApp() {
   const [imported, setImported] = useState(null);
   const [allowlist, setAllowlist] = useState("");
 
+  // Clear the import result on its own — it used to sit there until a reload,
+  // which made a one-off message look like a permanent fault.
+  useEffect(() => {
+    if (!imported) return;
+    const t = setTimeout(() => setImported(null), imported.ok ? 5000 : 10000);
+    return () => clearTimeout(t);
+  }, [imported]);
+
   useEffect(() => {
     if (autoReply?.allowlist) setAllowlist(autoReply.allowlist.join("\n"));
   }, [autoReply?.allowlist]);
@@ -211,13 +220,20 @@ export default function WhatsApp() {
             )}
           </div>
           {imported && (
-            <p
-              className={`mt-2 text-[11px] leading-relaxed ${
+            <div
+              className={`mt-2 flex items-start gap-2 text-[11px] leading-relaxed ${
                 imported.ok ? "text-mint" : "text-saffron"
               }`}
             >
-              {imported.text}
-            </p>
+              <span className="min-w-0 flex-1">{imported.text}</span>
+              <button
+                onClick={() => setImported(null)}
+                title="Dismiss"
+                className="shrink-0 opacity-60 transition hover:opacity-100"
+              >
+                <X className="size-3" />
+              </button>
+            </div>
           )}
 
           {/* Master switch. Off means nobody gets an automatic answer. */}

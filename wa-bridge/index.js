@@ -13,7 +13,7 @@
  *   Use a dedicated number you can afford to lose. Never a personal number.
  */
 
-import { existsSync } from "node:fs";
+import fs, { existsSync } from "node:fs";
 
 import express from "express";
 import qrcode from "qrcode";
@@ -27,7 +27,33 @@ const BACKEND = (process.env.BACKEND_URL || "http://127.0.0.1:8000").replace(/\/
 const TOKEN = process.env.BRIDGE_TOKEN || "";
 
 // Everything the backend needs to know about the link, in one place.
-const state = { status: "starting", qr: null, me: null, error: null };
+const state = {
+  status: "starting",
+  qr: null,
+  me: null,
+  error: null,
+  lastEventAt: null,   // last time WhatsApp actually told us anything
+  lastCheckAt: null,   // last successful liveness poll
+  recoveries: 0,
+};
+
+/**
+ * Log to a file synchronously.
+ *
+ * Node block-buffers stdout when it is redirected to a file, so the log can be
+ * hours behind reality — which is exactly when you need it. This appends
+ * immediately.
+ */
+const LOG_FILE = process.env.BRIDGE_LOG || "bridge.log";
+function log(...parts) {
+  const line = `${new Date().toISOString()} ${parts.join(" ")}\n`;
+  process.stdout.write(line);
+  try {
+    fs.appendFileSync(LOG_FILE, line);
+  } catch {
+    /* logging must never take the bridge down */
+  }
+}
 
 /**
  * Puppeteer downloads its own Chromium on install, which is ~150 MB and the
@@ -72,7 +98,8 @@ client.on("ready", () => {
   state.status = "connected";
   state.qr = null;
   state.me = client.info?.wid?.user ?? null;
-  console.log(`Connected as ${state.me}`);
+  state.lastEventAt = Date.now();
+  log(`Connected as ${state.me}`);
 });
 
 client.on("auth_failure", (m) => {
@@ -84,11 +111,107 @@ client.on("auth_failure", (m) => {
 client.on("disconnected", (reason) => {
   state.status = "disconnected";
   state.error = reason;
-  console.warn("Disconnected:", reason);
-  // The session on disk is usually still good; a restart re-links without a
-  // new QR unless WhatsApp actually revoked the device.
-  client.initialize().catch((e) => console.error("Re-init failed:", e));
+  log("Disconnected:", reason);
+  recover("disconnected event");
 });
+
+/**
+ * Bring the session back up.
+ *
+ * Guarded so overlapping triggers (a disconnect event and a failed heartbeat
+ * arriving together) don't start two browsers fighting over the same profile.
+ */
+let recovering = false;
+
+/** Never await a hang forever — a stuck promise here freezes the watchdog. */
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
+async function recover(why) {
+  if (recovering) return;
+  recovering = true;
+  state.recoveries += 1;
+  log(`Recovering (${why}) — attempt ${state.recoveries}`);
+  try {
+    await withTimeout(client.destroy().catch(() => {}), 30_000, "destroy");
+    await withTimeout(client.initialize(), 120_000, "initialize");
+    state.lastCheckAt = Date.now();
+    log("Recovery finished");
+  } catch (e) {
+    state.status = "error";
+    state.error = e.message;
+    log("Recovery failed:", e.message);
+  } finally {
+    // Always released, even on timeout. Leaving this true would silently
+    // disable every future heartbeat — the exact failure we are fixing.
+    recovering = false;
+  }
+}
+
+/**
+ * Ask WhatsApp whether it is really there.
+ *
+ * The `disconnected` event is not reliable — the page can die, or WhatsApp can
+ * stop delivering, while the library still believes it is connected. That is
+ * how this bridge sat "connected" for nearly three hours without receiving a
+ * single message. getState() round-trips to the page, so it fails when the
+ * session is actually gone.
+ */
+const HEARTBEAT_MS = Number(process.env.BRIDGE_HEARTBEAT_MS || 60_000);
+
+// If getState() keeps saying CONNECTED but nothing at all arrives for this
+// long, stop believing it and rebuild the session anyway. Groups and status
+// updates land constantly on a live account, so real silence this long means
+// the socket is dead even when the library disagrees.
+const STALE_MS = Number(process.env.BRIDGE_STALE_MS || 30 * 60_000);
+
+async function heartbeat() {
+  if (recovering || state.status === "qr") return;
+  try {
+    const reported = await withTimeout(client.getState(), 20_000, "getState");
+
+    if (reported !== "CONNECTED") {
+      log(`Heartbeat: WhatsApp reports ${reported}`);
+      state.status = "disconnected";
+      return await recover(`state ${reported}`);
+    }
+
+    state.lastCheckAt = Date.now();
+    if (state.status !== "connected") {
+      state.status = "connected";
+      state.error = null;
+      log("Session healthy again");
+    }
+
+    const quiet = state.lastEventAt ? Date.now() - state.lastEventAt : 0;
+    if (quiet > STALE_MS) {
+      log(`Heartbeat: says CONNECTED but silent for ${Math.round(quiet / 60000)} min`);
+      await recover("stale despite healthy state");
+    }
+  } catch (e) {
+    log("Heartbeat failed:", e.message);
+    state.status = "disconnected";
+    state.error = e.message;
+    await recover("heartbeat failed");
+  }
+}
+
+// `await` inside setInterval doesn't chain, so a slow beat could overlap the
+// next — the `recovering` guard and the timeouts above keep that harmless.
+setInterval(() => {
+  heartbeat().catch((e) => log("Heartbeat threw:", e.message));
+}, HEARTBEAT_MS);
+
+// A crash anywhere else must not take the bridge down silently. Log it and
+// keep running; the heartbeat repairs whatever broke.
+process.on("unhandledRejection", (e) => log("Unhandled rejection:", e?.message ?? e));
+process.on("uncaughtException", (e) => log("Uncaught exception:", e?.message ?? e));
 
 // Ids already forwarded. Two events can describe the same message, and a
 // customer must never get two replies. Bounded so a long-running bridge does
@@ -121,18 +244,19 @@ function firstTime(key) {
 async function onIncoming(msg, source) {
   // Log before filtering: when "the agent isn't replying", the first thing you
   // need to know is whether the event fired at all.
-  console.log(
+  state.lastEventAt = Date.now();
+  log(
     `[msg:${source}] from=${msg.from} type=${msg.type} fromMe=${msg.fromMe} status=${msg.isStatus}`
   );
 
   // Ignore groups, status broadcasts and our own messages — this agent answers
   // one-to-one customer chats only.
   if (msg.fromMe || msg.isStatus || msg.from?.endsWith("@g.us")) {
-    console.log(`[msg:${source}] skipped (own message, status, or group)`);
+    log(`[msg:${source}] skipped (own message, status, or group)`);
     return;
   }
   if (!firstTime(dedupeKey(msg))) {
-    console.log(`[msg:${source}] skipped (already handled)`);
+    log(`[msg:${source}] skipped (already handled)`);
     return;
   }
 
@@ -146,7 +270,7 @@ async function onIncoming(msg, source) {
     text: msg.body || "",
     audio_base64: null,
   };
-  console.log(`[msg:${source}] forwarding as ${from} (${payload.name || "no name"})`);
+  log(`[msg:${source}] forwarding as ${from} (${payload.name || "no name"})`);
 
   if (payload.type === "audio" && msg.hasMedia) {
     const media = await msg.downloadMedia().catch(() => null);
@@ -155,15 +279,38 @@ async function onIncoming(msg, source) {
     if (media) payload.audio_base64 = media.data;
   }
 
+  await forward(payload);
+}
+
+/**
+ * Hand a message to the backend, retrying briefly.
+ *
+ * The backend restarts on every code change, and a customer message that lands
+ * in that window used to be dropped with one line in the log. A few spaced
+ * retries cover a restart without holding the message forever.
+ */
+async function forward(payload, attempt = 1) {
+  const MAX = 5;
   try {
     const r = await fetch(`${BACKEND}/api/whatsapp/web/incoming`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Bridge-Token": TOKEN },
       body: JSON.stringify(payload),
     });
-    if (!r.ok) console.error("Backend rejected message:", r.status, await r.text());
+    if (r.ok) {
+      if (attempt > 1) log(`Forwarded on attempt ${attempt}`);
+      return;
+    }
+    // A 4xx is our bug, not a blip — retrying can't fix a rejected payload.
+    if (r.status < 500) return log("Backend rejected message:", r.status, await r.text());
+    throw new Error(`backend returned ${r.status}`);
   } catch (e) {
-    console.error("Backend unreachable:", e.message);
+    if (attempt >= MAX) {
+      return log(`Backend unreachable after ${MAX} attempts — message lost:`, e.message);
+    }
+    const wait = attempt * 3000;
+    log(`Backend unreachable (${e.message}) — retry ${attempt + 1}/${MAX} in ${wait / 1000}s`);
+    setTimeout(() => forward(payload, attempt + 1), wait);
   }
 }
 
@@ -203,7 +350,7 @@ app.post("/send/text", async (req, res) => {
     // missing receipt.
     res.json({ id: sent?.id?._serialized ?? null, receipt: Boolean(sent) });
   } catch (e) {
-    console.error("send/text failed:", e);
+    log("send/text failed:", e);
     res.status(502).json({ error: e.message, stack: String(e.stack || "").slice(0, 600) });
   }
 });
@@ -221,7 +368,7 @@ app.post("/send/audio", async (req, res) => {
     // missing receipt.
     res.json({ id: sent?.id?._serialized ?? null, receipt: Boolean(sent) });
   } catch (e) {
-    console.error("send/audio failed:", e);
+    log("send/audio failed:", e);
     res.status(502).json({ error: e.message, stack: String(e.stack || "").slice(0, 600) });
   }
 });
@@ -244,12 +391,10 @@ app.post("/sync", async (req, res) => {
     // whenever WhatsApp ships a change ahead of whatsapp-web.js. Live message
     // events use a different path and keep working, so this is not fatal —
     // report it plainly instead of a one-letter error from the bundle.
-    console.error("getChats failed:", e);
+    log("getChats failed:", e);
     return res.status(503).json({
       error:
-        "WhatsApp Web changed and this version of whatsapp-web.js can't list " +
-        "chats. Live messages still work — new conversations will appear as " +
-        "they arrive.",
+        "Chat import unavailable — WhatsApp Web changed. Live messages still work.",
       detail: e.message,
     });
   }
@@ -280,7 +425,7 @@ app.post("/sync", async (req, res) => {
   } catch (e) {
     // whatsapp-web.js surfaces errors from WhatsApp's own minified bundle, so
     // e.message is often a single letter. Log the stack or it's undebuggable.
-    console.error("sync failed:", e);
+    log("sync failed:", e);
     res.status(502).json({ error: e.message, stack: String(e.stack || "").slice(0, 800) });
   }
 });

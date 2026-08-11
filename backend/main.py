@@ -24,6 +24,7 @@ import asyncio  # noqa: E402
 import logging  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
+import time  # noqa: E402
 from datetime import datetime  # noqa: E402
 
 import httpx  # noqa: E402
@@ -96,6 +97,10 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup() -> None:
     db.init()
+    # Anything that arrived while we were down, or whose reply threw, still
+    # deserves an answer — once now, then on a timer.
+    asyncio.create_task(whatsapp.answer_pending())
+    asyncio.create_task(whatsapp.sweep_forever())
     # Only when Asterisk is configured — a machine without it starts normally.
     if asterisk_ari.configured():
         asyncio.create_task(asterisk_ari.listen())
@@ -206,12 +211,19 @@ async def whatsapp_link() -> dict:
     if whatsapp.PROVIDER != "web":
         return {"provider": "meta", "status": "connected" if whatsapp.configured() else "offline"}
     state = await whatsapp_web.status()
+    # "connected" alone has been wrong before — the bridge once sat healthy for
+    # three hours without receiving anything. Surface how long it has been
+    # quiet so the dashboard can say so.
+    last = state.get("lastEventAt") or state.get("lastCheckAt")
+    quiet_minutes = round((time.time() * 1000 - last) / 60000) if last else None
     return {
         "provider": "web",
         "status": state.get("status", "offline"),
         "number": state.get("me"),
         "qr": state.get("qr"),
         "error": state.get("error"),
+        "quietMinutes": quiet_minutes,
+        "recoveries": state.get("recoveries", 0),
     }
 
 
