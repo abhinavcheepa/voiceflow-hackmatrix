@@ -13,6 +13,7 @@
  *   Use a dedicated number you can afford to lose. Never a personal number.
  */
 
+import { exec } from "node:child_process";
 import fs, { existsSync } from "node:fs";
 
 import express from "express";
@@ -44,6 +45,7 @@ const state = {
  * hours behind reality — which is exactly when you need it. This appends
  * immediately.
  */
+const SESSION_DIR = "./.session";
 const LOG_FILE = process.env.BRIDGE_LOG || "bridge.log";
 function log(...parts) {
   const line = `${new Date().toISOString()} ${parts.join(" ")}\n`;
@@ -133,15 +135,53 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
+/**
+ * Kill the headless browser for real.
+ *
+ * `client.destroy()` does not reliably kill Chrome once the page has detached —
+ * the processes survive, keep the lock on .session, and every later
+ * `initialize()` dies with "The browser is already running". That loop ran 15
+ * times here before anyone noticed. So: ask nicely, then kill the process tree.
+ */
+async function killBrowser() {
+  const browser = client.pupBrowser;
+  const pid = browser?.process?.()?.pid;
+
+  await withTimeout(Promise.resolve(client.destroy()), 15_000, "destroy").catch(() => {});
+  await withTimeout(Promise.resolve(browser?.close?.()), 10_000, "close").catch(() => {});
+
+  if (pid) {
+    // Chrome spawns renderers and GPU helpers; killing the parent alone leaves
+    // them holding the profile. /T takes the whole tree.
+    const cmd =
+      process.platform === "win32"
+        ? `taskkill /PID ${pid} /T /F`
+        : `kill -9 -${pid} 2>/dev/null || kill -9 ${pid}`;
+    await new Promise((resolve) => exec(cmd, () => resolve()));
+    log(`Killed browser process tree (pid ${pid})`);
+  }
+
+  // Chrome leaves these behind on an unclean exit and refuses to start again.
+  for (const name of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
+    try {
+      fs.rmSync(`${SESSION_DIR}/session/${name}`, { force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+  await new Promise((r) => setTimeout(r, 2000)); // let the OS release the handles
+}
+
 async function recover(why) {
   if (recovering) return;
   recovering = true;
   state.recoveries += 1;
   log(`Recovering (${why}) — attempt ${state.recoveries}`);
   try {
-    await withTimeout(client.destroy().catch(() => {}), 30_000, "destroy");
+    await killBrowser();
     await withTimeout(client.initialize(), 120_000, "initialize");
     state.lastCheckAt = Date.now();
+    state.error = null;
     log("Recovery finished");
   } catch (e) {
     state.status = "error";
@@ -533,6 +573,37 @@ async function shutdown(signal) {
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"]) {
   process.on(sig, () => shutdown(sig));
 }
+
+/**
+ * Clear anything left over from a previous run before the first launch.
+ *
+ * A hard kill (Ctrl+C, a tool timeout, a crash) leaves Chrome running and the
+ * profile locked. The next start then fails with "browser is already running"
+ * and the bridge sits there receiving nothing.
+ */
+function clearStaleSession() {
+  for (const name of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
+    try {
+      fs.rmSync(`${SESSION_DIR}/session/${name}`, { force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+  if (process.platform === "win32") {
+    // Only Chrome instances pointed at OUR profile — never the user's browser.
+    const dir = fs.realpathSync(SESSION_DIR).replace(/\\/g, "\\\\");
+    exec(
+      `wmic process where "name='chrome.exe' and commandline like '%${dir}%'" get processid`,
+      (err, out) => {
+        const pids = (out || "").match(/\d+/g) || [];
+        for (const pid of pids) exec(`taskkill /PID ${pid} /T /F`);
+        if (pids.length) log(`Cleared ${pids.length} stale browser process(es)`);
+      }
+    );
+  }
+}
+
+clearStaleSession();
 
 client.initialize().catch((e) => {
   state.status = "error";
