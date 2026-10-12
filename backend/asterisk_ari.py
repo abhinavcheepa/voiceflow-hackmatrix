@@ -3,11 +3,9 @@
 Asterisk's dialplan hands a channel to Stasis(voiceflow-ai); this module picks
 it up over the ARI WebSocket, answers, logs the call, and plays the greeting.
 
-Scope note: the realtime audio loop (ExternalMedia RTP, streaming STT, barge-in)
-is Phases 6-11 and is NOT here. Today the conversation still runs on Vapi — set
-VAPI_SIP_URI and the answered channel is bridged out to it. Without that the
-channel gets the greeting and hangs up, which is exactly what you want while
-proving the plumbing works.
+Campaign and outbound calls are originated via Asterisk ARI directly. When
+answered, they enter Stasis, play the greeting (ASTERISK_GREETING, ~6 seconds),
+and hang up.
 
 Runs only when ASTERISK_ARI_URL is set, so a machine without Asterisk starts
 normally.
@@ -18,6 +16,7 @@ import base64
 import json
 import logging
 import os
+import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote, urlencode
 
@@ -32,15 +31,17 @@ ARI_USER = os.getenv("ASTERISK_ARI_USERNAME", "voiceflow")
 ARI_PASS = os.getenv("ASTERISK_ARI_PASSWORD", "")
 APP_NAME = os.getenv("ASTERISK_ARI_APP", "voiceflow-ai")
 
+# Outbound trunk configured in Asterisk pjsip.conf
+ASTERISK_TRUNK = os.getenv("ASTERISK_TRUNK", "trunk")
+
 # Stock Asterisk sound, no file needed. Swap for "sound:voiceflow-greeting"
 # once you drop a generated clip into Asterisk's sounds directory.
 GREETING_MEDIA = os.getenv("ASTERISK_GREETING", "sound:hello-world")
 
-# Where to send the audio leg for the actual conversation. Empty = Phase 1-5
-# mode: greet and hang up.
-VAPI_SIP_URI = os.getenv("VAPI_SIP_URI", "")
-
 MAX_CALL_SECONDS = int(os.getenv("MAX_CALL_SECONDS", "1800"))
+
+# Tracks outbound channel IDs originated by this process to correlate ChannelDestroyed
+_OUTBOUND_CHANNELS: set[str] = set()
 
 
 def configured() -> bool:
@@ -78,25 +79,40 @@ async def hangup(channel_id: str) -> None:
     await _rest("DELETE", f"/channels/{quote(channel_id)}")
 
 
-async def bridge_to_vapi(channel_id: str) -> None:
-    """Dial the Vapi SIP endpoint and bridge both legs together.
+async def create_call(number: str) -> dict:
+    """Originate an outbound call via Asterisk ARI.
 
-    This is the Path 1 architecture: Asterisk owns the number and the call
-    record, Vapi runs the conversation.
+    Dials the configured trunk and drops the answered call into Stasis(APP_NAME).
+    Pre-registers channelId in _OUTBOUND_CHANNELS and db before dispatching to prevent
+    race conditions if ChannelDestroyed fires immediately.
     """
-    bridge = await _rest("POST", "/bridges", type="mixing")
-    if not bridge:
-        return
-    outbound = await _rest(
-        "POST", "/channels", endpoint=VAPI_SIP_URI, app=APP_NAME, appArgs="vapi-leg"
-    )
-    if not outbound:
-        return
-    await _rest(
-        "POST",
-        f"/bridges/{bridge['id']}/addChannel",
-        channel=f"{channel_id},{outbound['id']}",
-    )
+    if not configured():
+        raise RuntimeError("Asterisk ARI is not configured — check ASTERISK_ARI_URL and ASTERISK_ARI_PASSWORD")
+
+    channel_id = f"out-{uuid.uuid4().hex[:12]}"
+    _OUTBOUND_CHANNELS.add(channel_id)
+    db.upsert_call(channel_id, phone=number, status="ringing")
+
+    endpoint = f"PJSIP/{number}@{ASTERISK_TRUNK}"
+    caller_id = os.getenv("ASTERISK_CALLER_ID", "VoiceFlow")
+
+    try:
+        res = await _rest(
+            "POST",
+            "/channels",
+            endpoint=endpoint,
+            app=APP_NAME,
+            channelId=channel_id,
+            callerId=caller_id,
+            timeout=45,
+        )
+        if not res:
+            raise RuntimeError(f"Asterisk ARI originate failed for {endpoint}")
+        return res
+    except Exception:
+        db.upsert_call(channel_id, status="failed", outcome="Missed")
+        _OUTBOUND_CHANNELS.discard(channel_id)
+        raise
 
 
 # --- event handling -----------------------------------------------------
@@ -105,11 +121,6 @@ async def _on_stasis_start(event: dict) -> None:
     channel = event.get("channel", {})
     channel_id = channel.get("id", "")
     caller = channel.get("caller", {}).get("number") or "unknown"
-    args = event.get("args", [])
-
-    # The outbound leg we created ourselves re-enters Stasis; don't recurse.
-    if "vapi-leg" in args:
-        return
 
     log.info("call started: %s from %s", channel_id, caller)
     db.upsert_call(
@@ -119,27 +130,60 @@ async def _on_stasis_start(event: dict) -> None:
         started_at=datetime.now(timezone.utc).isoformat(),
     )
 
-    await answer(channel_id)
+    state = channel.get("state", "").lower()
+    if state != "up":
+        await answer(channel_id)
     await play(channel_id, GREETING_MEDIA)
 
-    if VAPI_SIP_URI:
-        await bridge_to_vapi(channel_id)
-    else:
-        # Phase 1-5: prove the path, then release the channel rather than
-        # leaving it open with nothing driving it.
-        await asyncio.sleep(6)
-        await hangup(channel_id)
+    # Phase 1-5: prove the path, then release the channel rather than
+    # leaving it open with nothing driving it (~6 seconds greeting).
+    await asyncio.sleep(6)
+    await hangup(channel_id)
 
 
 async def _on_stasis_end(event: dict) -> None:
     channel_id = event.get("channel", {}).get("id", "")
     log.info("call ended: %s", channel_id)
+    _OUTBOUND_CHANNELS.discard(channel_id)
     db.upsert_call(channel_id, status="ended")
+
+
+async def _on_channel_destroyed(event: dict) -> None:
+    channel = event.get("channel", {})
+    channel_id = channel.get("id", "")
+    if channel_id not in _OUTBOUND_CHANNELS:
+        return
+
+    _OUTBOUND_CHANNELS.discard(channel_id)
+
+    # Check if the call was already answered/active or ended normally
+    with db.connect() as conn:
+        row = conn.execute("SELECT status FROM calls WHERE vapi_call_id = ?", (channel_id,)).fetchone()
+    current_status = row["status"] if row else ""
+
+    if current_status in ("active", "ended"):
+        return
+
+    cause = event.get("cause")
+    cause_txt = (event.get("cause_txt") or "").lower()
+
+    if cause == 17 or "busy" in cause_txt:
+        status = "busy"
+    elif cause in (18, 19) or "no answer" in cause_txt:
+        status = "no_answer"
+    elif cause == 21 or "reject" in cause_txt:
+        status = "rejected"
+    else:
+        status = "failed"
+
+    log.info("originated channel destroyed before answer: %s (cause: %s / %s -> %s)", channel_id, cause, cause_txt, status)
+    db.upsert_call(channel_id, status=status, outcome="Missed")
 
 
 HANDLERS = {
     "StasisStart": _on_stasis_start,
     "StasisEnd": _on_stasis_end,
+    "ChannelDestroyed": _on_channel_destroyed,
 }
 
 

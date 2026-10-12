@@ -107,7 +107,6 @@ if ($backendUp) {
     Line "Transcription" ($h.stt -ne $null) $h.stt
     Line "Voice (TTS)" $h.voiceReady (Invoke-RestMethod "http://127.0.0.1:8000/api/voice/profile").name
     Line "WhatsApp" $h.whatsapp $(if ($provider -eq "web") { "WhatsApp Web" } else { "Meta Cloud API" })
-    Line "Phone calls (Vapi)" $h.vapi "needs VAPI_PRIVATE_KEY"
     Line "Phone calls (Asterisk)" $h.asterisk "needs ASTERISK_ARI_URL"
 
     if ($bridgeUp -and $provider -eq "web") {

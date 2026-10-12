@@ -109,7 +109,7 @@ function LanguageMix({ languages }) {
 function SetupStatus({ health }) {
   if (!health) return null;
   const parts = [
-    ["Calls", health.vapi],
+    ["Calls", health.asterisk],
     ["WhatsApp", health.whatsapp],
     ["Voice", health.voiceReady],
     ["Replies", health.brain],

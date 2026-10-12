@@ -106,7 +106,6 @@ def health() -> dict:
     """Which integrations are live. The dashboard uses this to warn on setup gaps."""
     return {
         "ok": True,
-        "vapi": vapi.configured(),
         "whatsapp": whatsapp.configured(),
         "voice": voice.configured(),
         "brain": brain.configured(),
@@ -148,16 +147,7 @@ def conversations() -> list[dict]:
 @app.post("/api/calls/outbound")
 async def outbound(number: str = Body(..., embed=True)) -> dict:
     try:
-        return await vapi.create_call(number)
-    except RuntimeError as e:
-        raise HTTPException(503, str(e))
-
-
-@app.post("/api/vapi/sip-number")
-async def sip_number(sip_uri: str = Body(..., embed=True)) -> dict:
-    """One-time setup: give our own PBX a Vapi SIP endpoint to dial."""
-    try:
-        return await vapi.register_sip_number(sip_uri)
+        return await asterisk_ari.create_call(number)
     except RuntimeError as e:
         raise HTTPException(503, str(e))
 
@@ -461,8 +451,8 @@ def campaign_create(
 
 @app.post("/api/campaigns/{campaign_id}/start")
 async def campaign_start(campaign_id: int, tasks: BackgroundTasks) -> dict:
-    if not vapi.configured():
-        raise HTTPException(503, "No telephony configured — set VAPI_PRIVATE_KEY or Asterisk")
+    if not asterisk_ari.configured():
+        raise HTTPException(503, "No telephony configured — check Asterisk ARI settings")
     db.set_campaign_status(campaign_id, "running")
     tasks.add_task(_run_campaign, campaign_id)
     return {"ok": True, "status": "running"}
@@ -494,7 +484,7 @@ def _parse_numbers(text: str) -> list[dict]:
 
 
 async def _run_campaign(campaign_id: int) -> None:
-    """Dial targets one at a time.
+    """Dial targets one at a time via Asterisk ARI.
 
     Sequential on purpose: a parallel dialer on an unverified trunk is how you
     get rate-limited or flagged for spam on the first run.
@@ -505,7 +495,7 @@ async def _run_campaign(campaign_id: int) -> None:
         ).get("status") != "running":
             return  # stopped from the dashboard
         try:
-            result = await vapi.create_call(target["phone"])
+            result = await asterisk_ari.create_call(target["phone"])
             db.set_target_status(target["id"], "called", call_id=result.get("id", ""))
         except Exception as e:  # noqa: BLE001
             db.set_target_status(target["id"], "failed", error=str(e)[:200])
