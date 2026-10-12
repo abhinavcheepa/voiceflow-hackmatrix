@@ -1,20 +1,15 @@
 """Vapi client + assistant definition.
 
-Vapi runs the realtime voice loop (STT -> LLM -> TTS). Telephony stays ours:
-our own dialer/PBX sends the leg to Vapi over SIP, and Vapi asks this backend
-which assistant to use via the `assistant-request` webhook.
+Telephony is handled via Asterisk. This module retains the Vapi assistant configuration
+and persona definition to support the Vapi webhook (/api/vapi/webhook) when active.
 """
 
 import os
-
-import httpx
 
 import db
 import voice
 
 BASE_URL = os.getenv("VAPI_BASE_URL", "https://api.vapi.ai")
-PRIVATE_KEY = os.getenv("VAPI_PRIVATE_KEY", "")
-ASSISTANT_ID = os.getenv("VAPI_ASSISTANT_ID", "")
 WEBHOOK_SECRET = os.getenv("VAPI_WEBHOOK_SECRET", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")
 
@@ -66,42 +61,3 @@ def assistant(agent_id: int | None = None) -> dict:
     if PUBLIC_URL:
         config["server"] = {"url": f"{PUBLIC_URL}/api/vapi/webhook", "secret": WEBHOOK_SECRET}
     return config
-
-
-def configured() -> bool:
-    return bool(PRIVATE_KEY)
-
-
-async def _post(path: str, payload: dict) -> dict:
-    if not configured():
-        raise RuntimeError("VAPI_PRIVATE_KEY is not set — copy .env.example to .env and fill it in")
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            f"{BASE_URL}{path}",
-            json=payload,
-            headers={"Authorization": f"Bearer {PRIVATE_KEY}"},
-        )
-        r.raise_for_status()
-        return r.json()
-
-
-async def create_call(number: str, phone_number_id: str | None = None) -> dict:
-    """Outbound call. Only needed while our own dialer isn't wired up yet."""
-    payload: dict = {"customer": {"number": number}}
-    payload.update({"assistantId": ASSISTANT_ID} if ASSISTANT_ID else {"assistant": assistant()})
-    pnid = phone_number_id or os.getenv("VAPI_PHONE_NUMBER_ID", "")
-    if pnid:
-        payload["phoneNumberId"] = pnid
-    return await _post("/call", payload)
-
-
-async def register_sip_number(sip_uri: str) -> dict:
-    """Point our own PBX at Vapi.
-
-    Creates a SIP endpoint like sip:voiceflow@sip.vapi.ai. Our Asterisk/FreeSWITCH
-    dials that URI and Vapi handles the conversation. Run once during setup.
-    """
-    payload = {"provider": "vapi", "sipUri": sip_uri}
-    if ASSISTANT_ID:
-        payload["assistantId"] = ASSISTANT_ID
-    return await _post("/phone-number", payload)
