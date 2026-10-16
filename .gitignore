@@ -23,3 +23,8 @@ backend/voices/
 
 # runtime logs — carry customer phone numbers
 *.log
+
+# MITS agent data — real faculty emails, kept local only (repo is public)
+backend/mits_knowledge.md
+backend/load_mits_agent.py
+docs/MITS_FE_Faculty_Database.md
