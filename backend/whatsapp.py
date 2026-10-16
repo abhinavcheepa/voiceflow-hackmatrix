@@ -17,6 +17,7 @@ import httpx
 
 import brain
 import db
+import kb
 import voice
 import whatsapp_web
 
@@ -182,14 +183,16 @@ async def handle(message: dict) -> None:
         #
         # needs_reply survives a crash or restart between here and the send,
         # which used to drop the reply with no trace at all.
-        wants_reply = db.should_auto_reply(sender)
+        blocked = db.auto_reply_block(sender)
         message_id = db.add_message(
             sender, "them", "voice" if is_voice else "text", incoming,
-            name=name, language=language, needs_reply=wants_reply,
+            name=name, language=language, needs_reply=blocked is None,
         )
 
-        if not wants_reply:
-            log.info("auto-reply off for %s — message stored, not answered", sender)
+        if blocked:
+            # Name the switch. "Not replying" with three possible causes and no
+            # log line is the single most time-wasting failure this thing has.
+            log.warning("no auto-reply to %s — %s (message stored)", sender, blocked)
             return
 
         await reply_to(sender, name, incoming, is_voice, language, message_id)
@@ -222,7 +225,16 @@ async def reply_to(sender: str, name: str | None, incoming: str, is_voice: bool,
     """
     # WhatsApp gives us the sender's profile name; pass it through so the
     # agent can greet them properly instead of guessing.
-    answer = await brain.reply(sender, incoming, customer=name)
+    # WhatsApp replies draw on the default agent's knowledge base, if any, and
+    # can record a booking or escalation tied to this sender.
+    agent = db.get_agent() or {}
+    kb_context = kb.context_block(agent.get("id"), incoming)
+    answer = await brain.reply(
+        sender, incoming, customer=name, kb_context=kb_context,
+        tools_ctx={"phone": sender, "name": name, "channel": "whatsapp",
+                   "agent_id": agent.get("id")},
+        agent_id=agent.get("id"),
+    )
 
     if is_voice:
         audio_out = await voice.synthesize(answer, language)

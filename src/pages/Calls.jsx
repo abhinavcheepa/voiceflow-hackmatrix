@@ -166,7 +166,12 @@ export default function Calls() {
                   </div>
                 </td>
                 <td className="px-5 py-4 text-dim">{c.language}</td>
-                <td className="px-5 py-4">{c.intent}</td>
+                <td className="px-5 py-4">
+                  <p>{c.intent}</p>
+                  {c.summary && (
+                    <p className="mt-0.5 max-w-xs text-xs text-dim/80">{c.summary}</p>
+                  )}
+                </td>
                 <td className="px-5 py-4 text-dim">{c.duration}</td>
                 <td className="px-5 py-4">
                   <OutcomeBadge outcome={c.outcome} />

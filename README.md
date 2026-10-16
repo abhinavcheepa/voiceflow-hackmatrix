@@ -207,6 +207,8 @@ Everything lives in **[docs/](docs/README.md)** — architecture, WhatsApp setup
 telephony guides. Component notes sit next to their code
 ([wa-bridge](wa-bridge/README.md)).
 
+Setting this up on a different computer: **[docs/SETUP.md](docs/SETUP.md)**.
+
 ---
 
 ## Project layout

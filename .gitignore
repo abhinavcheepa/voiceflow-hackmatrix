@@ -16,3 +16,7 @@ __pycache__/
 bridge*.log
 bridge*.err
 stdout.log
+
+# local voice cloning — model weights, and the owner's voice embedding (biometric, never commit)
+backend/models/
+backend/voices/

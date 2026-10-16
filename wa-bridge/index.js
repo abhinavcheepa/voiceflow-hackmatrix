@@ -13,7 +13,8 @@
  *   Use a dedicated number you can afford to lose. Never a personal number.
  */
 
-import { exec } from "node:child_process";
+import { exec, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import fs, { existsSync } from "node:fs";
 
 import express from "express";
@@ -172,21 +173,81 @@ async function killBrowser() {
   await new Promise((r) => setTimeout(r, 2000)); // let the OS release the handles
 }
 
+/**
+ * Rebuild in a brand new process.
+ *
+ * whatsapp-web.js does not survive re-initialization once its browser has been
+ * killed. The socket comes back — getState() reports CONNECTED, the heartbeat
+ * looks fine — but `ready` never fires again, so client.info stays empty and
+ * not one message is ever delivered. Measured here: an in-process rebuild sat
+ * that way for 6+ minutes; a fresh process was ready in seconds.
+ *
+ * Nothing supervises this process, so it relaunches itself. log() writes
+ * straight to the log file, so the replacement keeps logging even detached.
+ */
+async function relaunch(why) {
+  log(`Relaunching in a fresh process (${why})`);
+
+  // Leave nothing behind for the replacement to trip over: a surviving Chrome
+  // keeps the lock on .session and the new process dies with "the browser is
+  // already running", and a held port 8100 stops it binding at all.
+  await killBrowser().catch(() => {});
+  await new Promise((done) => (server ? server.close(done) : done()));
+
+  try {
+    spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+      cwd: process.cwd(),
+      env: process.env,
+      detached: true,
+      stdio: "ignore",
+    }).unref();
+  } catch (e) {
+    log("Relaunch failed — the bridge stays down until it is started again:", e.message);
+    return;
+  }
+  setTimeout(() => process.exit(0), 500);
+}
+
+// How long after a rebuild to keep waiting for `ready` before giving up on this
+// process. Generous on purpose: a slow sync is normal, and relaunching a
+// session that was about to come back costs another two-minute outage.
+const READY_GRACE_MS = 120_000;
+
+// When the current attempt to become ready began — process start, or the last
+// recovery. Without it the first heartbeat would call a normal, still-syncing
+// startup "degraded".
+let initStartedAt = Date.now();
+
 async function recover(why) {
   if (recovering) return;
   recovering = true;
   state.recoveries += 1;
+  state.me = null; // stale until `ready` fires again — the degraded check reads this
+  initStartedAt = Date.now();
   log(`Recovering (${why}) — attempt ${state.recoveries}`);
   try {
     await killBrowser();
-    await withTimeout(client.initialize(), 120_000, "initialize");
+    // Loading a ~270 MB session profile and waiting for WhatsApp Web to finish
+    // syncing takes well over two minutes on a busy machine. 120s was timing
+    // out mid-rebuild and leaving the bridge stuck in "error".
+    await withTimeout(client.initialize(), 300_000, "initialize");
     state.lastCheckAt = Date.now();
     state.error = null;
     log("Recovery finished");
+
+    // initialize() resolving is not the same as being usable — `ready` lands a
+    // little afterwards (12s, measured here). Wait for it before concluding
+    // anything: relaunching on the gap would kill recoveries that were working.
+    const readyBy = Date.now() + READY_GRACE_MS;
+    while (!state.me && Date.now() < readyBy) {
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    if (!state.me) return relaunch("ready never fired after recovery");
   } catch (e) {
     state.status = "error";
     state.error = e.message;
     log("Recovery failed:", e.message);
+    return relaunch("recovery threw");
   } finally {
     // Always released, even on timeout. Leaving this true would silently
     // disable every future heartbeat — the exact failure we are fixing.
@@ -205,11 +266,24 @@ async function recover(why) {
  */
 const HEARTBEAT_MS = Number(process.env.BRIDGE_HEARTBEAT_MS || 60_000);
 
-// If getState() keeps saying CONNECTED but nothing at all arrives for this
-// long, stop believing it and rebuild the session anyway. Groups and status
-// updates land constantly on a live account, so real silence this long means
-// the socket is dead even when the library disagrees.
-const STALE_MS = Number(process.env.BRIDGE_STALE_MS || 30 * 60_000);
+// NOTE: there is deliberately no "silent for too long, rebuild anyway" check.
+// One existed and it was harmful: a quiet half hour is completely normal on a
+// WhatsApp account, and rebuilding on that killed healthy sessions — losing
+// every message that arrived during the ~2 minute restart.
+//
+// getState() is the authoritative signal. The failure the staleness check was
+// meant to catch (a dead page) already surfaces there as a thrown
+// "detached Frame", so the heuristic added risk without adding detection.
+
+// WhatsApp Web passes through these on its own during a normal reconnect.
+// Treating them as a fault is how the heartbeat ended up killing healthy
+// sessions and causing the very disconnects it was meant to fix.
+const TRANSIENT_STATES = new Set(["OPENING", "PAIRING", "TIMEOUT", "UNPAIRED_IDLE"]);
+
+// How many consecutive bad beats before rebuilding. One bad reading is noise;
+// three in a row (three minutes) is a real problem.
+const STRIKES_BEFORE_RECOVERY = 3;
+let strikes = 0;
 
 async function heartbeat() {
   if (recovering || state.status === "qr") return;
@@ -217,27 +291,53 @@ async function heartbeat() {
     const reported = await withTimeout(client.getState(), 20_000, "getState");
 
     if (reported !== "CONNECTED") {
-      log(`Heartbeat: WhatsApp reports ${reported}`);
+      strikes += 1;
+      const transient = TRANSIENT_STATES.has(reported);
+      log(
+        `Heartbeat: WhatsApp reports ${reported} ` +
+          `(strike ${strikes}/${STRIKES_BEFORE_RECOVERY}${transient ? ", transient" : ""})`
+      );
+      if (strikes < STRIKES_BEFORE_RECOVERY) return; // give it time to settle
       state.status = "disconnected";
+      strikes = 0;
       return await recover(`state ${reported}`);
     }
 
+    strikes = 0;
     state.lastCheckAt = Date.now();
+
+    // getState() only proves the socket is up. Until `ready` has fired there is
+    // no client.info, no chat list, and no message delivery: whatsapp-web.js
+    // reads WhatsApp Web's own internal modules, and those break whenever
+    // WhatsApp ships a new web build (the "getChats failed: r: r" in this log).
+    // Calling that "connected" is how the bridge sat green for hours while
+    // nothing arrived and nothing could be answered.
+    if (!state.me && Date.now() - initStartedAt > READY_GRACE_MS) {
+      if (state.status !== "degraded") {
+        state.status = "degraded";
+        state.error =
+          "WhatsApp Web is reachable but whatsapp-web.js never became ready — " +
+          "usually a WhatsApp web-build change. Messages will not arrive.";
+        log(`Degraded: ${state.error}`);
+      }
+      return;
+    }
+
     if (state.status !== "connected") {
       state.status = "connected";
       state.error = null;
       log("Session healthy again");
     }
 
-    const quiet = state.lastEventAt ? Date.now() - state.lastEventAt : 0;
-    if (quiet > STALE_MS) {
-      log(`Heartbeat: says CONNECTED but silent for ${Math.round(quiet / 60000)} min`);
-      await recover("stale despite healthy state");
-    }
   } catch (e) {
-    log("Heartbeat failed:", e.message);
+    // A thrown getState is a harder signal than a transient state, but still
+    // worth one retry — a single slow beat under load is not a dead session.
+    strikes += 1;
+    log(`Heartbeat failed (strike ${strikes}/2): ${e.message}`);
+    if (strikes < 2) return;
     state.status = "disconnected";
     state.error = e.message;
+    strikes = 0;
     await recover("heartbeat failed");
   }
 }
@@ -300,8 +400,20 @@ async function onIncoming(msg, source) {
     return;
   }
 
-  const contact = await msg.getContact().catch(() => null);
+  const contact = await msg.getContact().catch((e) => {
+    log(`[msg:${source}] getContact failed:`, e);
+    return null;
+  });
   const from = phoneOf(contact) || msg.from.replace(/@(c\.us|lid)$/, "");
+
+  // A LID is an opaque WhatsApp id, not a phone number. Without a contact to
+  // resolve it, the backend gets something no allowlist entry can ever match,
+  // and the reply is dropped further downstream with no obvious cause. Say so
+  // here, where the reason is still visible.
+  if (!phoneOf(contact) && msg.from?.endsWith("@lid")) {
+    log(`[msg:${source}] WARNING: could not resolve ${msg.from} to a phone number — ` +
+        `forwarding the raw id, which will not match the allowlist`);
+  }
 
   const payload = {
     from,
@@ -373,11 +485,35 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/status", (_req, res) => res.json(state));
+app.get("/status", (_req, res) => {
+  state.lastCheckAt = Date.now();
+  res.json(state);
+});
 
-/** QR as a plain image so the dashboard can show it without extra plumbing. */
-app.get("/qr", (_req, res) => {
-  if (!state.qr) return res.status(404).json({ status: state.status });
+/** QR as an image or HTML page so dashboard or browser can view it cleanly. */
+app.get("/qr", (req, res) => {
+  state.lastCheckAt = Date.now();
+  const acceptsHtml = (req.get("accept") || "").includes("text/html");
+  if (!state.qr) {
+    if (acceptsHtml) {
+      return res.send(`<!DOCTYPE html>
+<html><head><title>WhatsApp Bridge QR</title><meta http-equiv="refresh" content="3"></head>
+<body style="font-family:sans-serif;text-align:center;padding:50px;">
+  <h2>Status: ${state.status}</h2>
+  <p>${state.status === "ready" ? `WhatsApp is already connected! (${state.me || ""})` : "Waiting for QR code... page will auto-refresh."}</p>
+</body></html>`);
+    }
+    return res.status(200).json({ status: state.status, qr: null });
+  }
+  if (acceptsHtml) {
+    return res.send(`<!DOCTYPE html>
+<html><head><title>Scan WhatsApp QR</title></head>
+<body style="font-family:sans-serif;text-align:center;padding:40px;">
+  <h2>Scan with WhatsApp</h2>
+  <p>Open WhatsApp &rarr; Settings &rarr; Linked Devices &rarr; Link a device</p>
+  <img src="${state.qr}" alt="WhatsApp QR Code" style="border:1px solid #ddd;padding:10px;border-radius:8px;"/>
+</body></html>`);
+  }
   res.type("png").send(Buffer.from(state.qr.split(",")[1], "base64"));
 });
 

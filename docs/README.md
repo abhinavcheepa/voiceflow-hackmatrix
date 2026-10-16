@@ -5,6 +5,7 @@ today. These are the deeper documents.
 
 | Document | Read it when… |
 | -------- | ------------- |
+| **[SETUP.md](SETUP.md)** | You're setting this up on another machine. Runtimes, venv, keys, first call, and what does not transfer across machines. |
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | You're changing the code. Every module, the data model, the request flows, and the decisions that look arbitrary but aren't. |
 | **[WHATSAPP_SETUP.md](WHATSAPP_SETUP.md)** | You're connecting WhatsApp. Both routes compared, and the full Meta Cloud API setup. |
 | **[PHONE-SETUP.md](PHONE-SETUP.md)** | You want a real phone number. Call forwarding, virtual numbers, what's actually free in India and what isn't. |

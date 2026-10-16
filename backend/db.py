@@ -101,6 +101,114 @@ CREATE INDEX IF NOT EXISTS idx_contacts_seen    ON contacts(last_seen_at);
 
 CREATE INDEX IF NOT EXISTS idx_calls_started  ON calls(started_at);
 CREATE INDEX IF NOT EXISTS idx_msgs_conv      ON messages(conversation_id, created_at);
+
+-- Knowledge base: uploaded reference files the agent answers from. agent_id
+-- NULL means the document applies to every agent.
+CREATE TABLE IF NOT EXISTS kb_docs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id   INTEGER,
+    filename   TEXT NOT NULL,
+    chunks     INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kb_chunks (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id   INTEGER NOT NULL REFERENCES kb_docs(id) ON DELETE CASCADE,
+    agent_id INTEGER,
+    text     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_kb_chunks_agent ON kb_chunks(agent_id);
+
+-- Bookings the agent actually recorded mid-conversation via a tool call. This
+-- is the difference between "we'll confirm shortly" and a real entry a human
+-- can act on. status: new | confirmed | cancelled.
+CREATE TABLE IF NOT EXISTS bookings (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone      TEXT,
+    name       TEXT,
+    item       TEXT NOT NULL,
+    when_text  TEXT,
+    notes      TEXT,
+    channel    TEXT NOT NULL DEFAULT 'call',
+    status     TEXT NOT NULL DEFAULT 'new',
+    escalated  INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bookings_created ON bookings(created_at);
+
+-- Adaptive learning: Q&A pairs the agent extracts from real conversations.
+-- Owner approves before they influence future replies.
+CREATE TABLE IF NOT EXISTS learned_answers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id    INTEGER REFERENCES agents(id),
+    question    TEXT NOT NULL,
+    answer      TEXT NOT NULL,
+    source      TEXT NOT NULL DEFAULT 'conversation',
+    confidence  REAL NOT NULL DEFAULT 0.5,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    use_count   INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    approved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_learned_agent  ON learned_answers(agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_learned_status ON learned_answers(status);
+
+-- Stock inventory — items the business sells or tracks.
+CREATE TABLE IF NOT EXISTS stock (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id    INTEGER,
+    name        TEXT NOT NULL,
+    category    TEXT,
+    quantity    REAL NOT NULL DEFAULT 0,
+    unit        TEXT NOT NULL DEFAULT 'pcs',
+    rate        REAL NOT NULL DEFAULT 0,
+    gst_percent REAL NOT NULL DEFAULT 0,
+    min_stock   REAL NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_stock_name ON stock(name);
+
+-- Every stock movement — in, out, or manual adjustment.
+CREATE TABLE IF NOT EXISTS stock_entries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_id    INTEGER NOT NULL REFERENCES stock(id),
+    entry_type  TEXT NOT NULL CHECK (entry_type IN ('in', 'out', 'adjust')),
+    quantity    REAL NOT NULL,
+    notes       TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_stock_entries_stock ON stock_entries(stock_id);
+
+-- Bills generated during voice conversations or manually.
+CREATE TABLE IF NOT EXISTS bills (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_number     TEXT NOT NULL UNIQUE,
+    customer_name   TEXT,
+    customer_phone  TEXT,
+    agent_id        INTEGER,
+    channel         TEXT NOT NULL DEFAULT 'call',
+    subtotal        REAL NOT NULL DEFAULT 0,
+    gst_total       REAL NOT NULL DEFAULT 0,
+    total           REAL NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'draft',
+    notes           TEXT,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bills_created ON bills(created_at);
+
+-- Line items on a bill.
+CREATE TABLE IF NOT EXISTS bill_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_id     INTEGER NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+    stock_id    INTEGER,
+    item_name   TEXT NOT NULL,
+    quantity    REAL NOT NULL DEFAULT 1,
+    rate        REAL NOT NULL,
+    gst_percent REAL NOT NULL DEFAULT 0,
+    amount      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bill_items_bill ON bill_items(bill_id);
 """
 
 # Outcomes that count toward the success rate on the dashboard.
@@ -129,6 +237,18 @@ MIGRATIONS = [
     ("calls", "agent_id", "INTEGER"),
     ("conversations", "auto_reply", "INTEGER NOT NULL DEFAULT 1"),
     ("messages", "needs_reply", "INTEGER NOT NULL DEFAULT 0"),
+    # Hard business facts — prices, timings, address, catalogue — kept apart from
+    # the persona so the prompt can say "quote ONLY from here", which is what
+    # stops the agent inventing a price it was never given.
+    ("agents", "facts", "TEXT"),
+    # Post-call analysis (our own, not Vapi's): a one-line summary and a 0/1
+    # success flag the model assigns after reading the transcript.
+    ("calls", "summary", "TEXT"),
+    ("calls", "success", "INTEGER"),
+    # Semantic search: each chunk's embedding vector (float32 bytes). NULL for
+    # chunks stored before embeddings were added — search falls back to BM25
+    # for those, so nothing breaks during the transition.
+    ("kb_chunks", "embedding", "BLOB"),
 ]
 
 
@@ -240,6 +360,8 @@ def get_calls(limit: int = 50) -> list[dict]:
             "intent": r["intent"],
             "duration": fmt_duration(r["duration_sec"]),
             "outcome": r["outcome"],
+            "summary": (r["summary"] if "summary" in r.keys() else None) or "",
+            "success": (r["success"] if "success" in r.keys() else None),
             "time": _ago(r["started_at"]),
         }
         for r in rows
@@ -285,17 +407,40 @@ def get_conversations() -> list[dict]:
 # --- writes -------------------------------------------------------------
 
 def upsert_call(vapi_call_id: str, **fields) -> None:
-    """Insert or update a call keyed by its Vapi id. Used by the webhook."""
-    fields.setdefault("started_at", datetime.now(timezone.utc).isoformat())
-    fields.setdefault("id", f"CL-{vapi_call_id[:8]}")
-    cols = ["vapi_call_id", *fields.keys()]
+    """Insert or update a call keyed by its Vapi id.
+
+    Updates run as a plain UPDATE rather than INSERT .. ON CONFLICT. SQLite
+    builds the candidate INSERT row *before* the conflict clause can redirect
+    it, so a partial update — a call ending, which carries no phone — died on
+    `calls.phone NOT NULL`. Thrown from a WebSocket `finally`, that exception
+    went nowhere, and every web call stayed 'active' with no duration and no
+    transcript. The dashboard read zero calls for the same reason.
+    """
     with connect() as conn:
-        conn.execute(
-            f"""INSERT INTO calls ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})
-                ON CONFLICT(vapi_call_id) DO UPDATE SET
-                {','.join(f'{c}=excluded.{c}' for c in fields if c != 'id')}""",
-            [vapi_call_id, *fields.values()],
-        )
+        known = conn.execute(
+            "SELECT 1 FROM calls WHERE vapi_call_id = ?", (vapi_call_id,)
+        ).fetchone()
+
+        if known:
+            # id is the primary key and started_at belongs to the insert — an
+            # update that reset started_at would date every call to its end.
+            changes = {c: v for c, v in fields.items() if c != "id"}
+            if changes:
+                conn.execute(
+                    f"UPDATE calls SET {','.join(f'{c}=?' for c in changes)} "
+                    "WHERE vapi_call_id = ?",
+                    [*changes.values(), vapi_call_id],
+                )
+        else:
+            fields.setdefault("started_at", datetime.now(timezone.utc).isoformat())
+            fields.setdefault("id", f"CL-{vapi_call_id[:8]}")
+            cols = ["vapi_call_id", *fields.keys()]
+            conn.execute(
+                f"INSERT INTO calls ({','.join(cols)}) "
+                f"VALUES ({','.join('?' * len(cols))})",
+                [vapi_call_id, *fields.values()],
+            )
+
     # The CRM fills itself from real activity rather than manual entry.
     if fields.get("phone"):
         touch_contact(fields["phone"], fields.get("name"))
@@ -332,9 +477,13 @@ def get_history(phone: str, limit: int = 12) -> list[dict]:
     """Recent turns for one number, oldest first — fed to the LLM as context."""
     with connect() as conn:
         rows = conn.execute(
+            # failed = 0 matters: a failure leaves an "[auto-reply failed: …]"
+            # note in the thread. Without this the model is handed its own error
+            # text as something it said, and answers around it.
             """SELECT m.sender, m.body FROM messages m
                JOIN conversations c ON c.id = m.conversation_id
-               WHERE c.phone = ? ORDER BY m.created_at DESC LIMIT ?""",
+               WHERE c.phone = ? AND m.failed = 0
+               ORDER BY m.created_at DESC LIMIT ?""",
             (phone, limit),
         ).fetchall()
     return [
@@ -429,19 +578,32 @@ def set_auto_reply_for(phone: str, enabled: bool) -> None:
         )
 
 
-def should_auto_reply(phone: str) -> bool:
-    """Both switches must be on. Incoming messages are always stored either way.
+def auto_reply_block(phone: str) -> str | None:
+    """Why this number gets no auto-reply, or None if it does.
+
+    Three switches can each stop a reply, and for a long time all three failed
+    the same silent way — "it isn't replying" with nothing in the log to say
+    which one. Returning the reason is what makes that diagnosable.
 
     An unknown number defaults to on: a first-time customer should get an
     answer, not silence.
     """
-    if not auto_reply_global() or not allowed(phone):
-        return False
+    if not auto_reply_global():
+        return "auto-reply is switched off globally"
+    if not allowed(phone):
+        return f"{phone} is not on the allowlist ({', '.join(get_allowlist()) or 'empty'})"
     with connect() as conn:
         row = conn.execute(
             "SELECT auto_reply FROM conversations WHERE phone = ?", (phone,)
         ).fetchone()
-    return bool(row[0]) if row else True
+    if row and not row[0]:
+        return "auto-reply is switched off for this conversation"
+    return None
+
+
+def should_auto_reply(phone: str) -> bool:
+    """Both switches must be on. Incoming messages are always stored either way."""
+    return auto_reply_block(phone) is None
 
 
 # --- agents -------------------------------------------------------------
@@ -467,6 +629,7 @@ def _row_to_agent(r) -> dict:
         "greeting": r["greeting"],
         "language": r["language"],
         "voiceId": r["voice_id"] or "",
+        "facts": (r["facts"] if "facts" in r.keys() else None) or "",
         "isDefault": bool(r["is_default"]),
     }
 
@@ -800,3 +963,475 @@ def _preview(msg) -> str:
         return f"🎤 Voice note · 0:{msg['seconds']:02d}"
     return msg["body"]
 
+
+
+# --- knowledge base -----------------------------------------------------
+
+def add_kb_document(agent_id: int | None, filename: str, chunks: list[str],
+                    embeddings: list[bytes] | None = None) -> dict:
+    """Store one uploaded reference file, its text chunks, and (optionally) each
+    chunk's embedding vector for semantic search. `embeddings` aligns 1:1 with
+    `chunks`; pass None to store text only (BM25-only)."""
+    embs = embeddings if embeddings is not None else [None] * len(chunks)
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO kb_docs (agent_id, filename, chunks, created_at) VALUES (?,?,?,?)",
+            (agent_id, filename, len(chunks), datetime.now(timezone.utc).isoformat()),
+        )
+        doc_id = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO kb_chunks (doc_id, agent_id, text, embedding) VALUES (?,?,?,?)",
+            [(doc_id, agent_id, c, e) for c, e in zip(chunks, embs)],
+        )
+    return {"id": doc_id, "filename": filename, "chunks": len(chunks), "agentId": agent_id}
+
+
+def list_kb_docs(agent_id: int | None = None) -> list[dict]:
+    """Documents visible to an agent: its own plus the global (agent_id IS NULL)
+    ones. Pass None to list only the global set."""
+    with connect() as conn:
+        if agent_id is None:
+            rows = conn.execute(
+                "SELECT * FROM kb_docs WHERE agent_id IS NULL ORDER BY id DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM kb_docs WHERE agent_id = ? OR agent_id IS NULL ORDER BY id DESC",
+                (agent_id,),
+            ).fetchall()
+    return [
+        {"id": r["id"], "filename": r["filename"], "chunks": r["chunks"],
+         "agentId": r["agent_id"], "global": r["agent_id"] is None}
+        for r in rows
+    ]
+
+
+def delete_kb_doc(doc_id: int) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM kb_chunks WHERE doc_id = ?", (doc_id,))
+        conn.execute("DELETE FROM kb_docs WHERE id = ?", (doc_id,))
+
+
+def kb_chunks_for(agent_id: int | None) -> list[str]:
+    """Every chunk an agent may draw on: its own documents plus the global ones."""
+    with connect() as conn:
+        if agent_id is None:
+            rows = conn.execute("SELECT text FROM kb_chunks WHERE agent_id IS NULL").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT text FROM kb_chunks WHERE agent_id = ? OR agent_id IS NULL", (agent_id,)
+            ).fetchall()
+    return [r["text"] for r in rows]
+
+
+def kb_chunks_with_embeddings(agent_id: int | None) -> list[tuple[str, bytes | None]]:
+    """(text, embedding-bytes) for every chunk an agent may draw on. Embedding is
+    NULL for chunks stored before semantic search — the caller falls back to BM25."""
+    with connect() as conn:
+        if agent_id is None:
+            rows = conn.execute(
+                "SELECT text, embedding FROM kb_chunks WHERE agent_id IS NULL"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT text, embedding FROM kb_chunks WHERE agent_id = ? OR agent_id IS NULL",
+                (agent_id,),
+            ).fetchall()
+    return [(r["text"], r["embedding"]) for r in rows]
+
+
+# --- bookings (recorded by agent tool calls) -----------------------------
+
+def add_booking(item: str, name: str | None = None, phone: str | None = None,
+                when_text: str | None = None, notes: str | None = None,
+                channel: str = "call", escalated: bool = False) -> dict:
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO bookings (phone, name, item, when_text, notes, channel,
+                                     escalated, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (phone, name, item, when_text, notes, channel, int(escalated),
+             datetime.now(timezone.utc).isoformat()),
+        )
+        booking_id = cur.lastrowid
+    # A booking is real CRM activity — surface the caller as a contact too.
+    if phone:
+        touch_contact(phone, name)
+    return {"id": booking_id, "item": item, "name": name, "when": when_text}
+
+
+def get_bookings(limit: int = 50) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM bookings ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [
+        {"id": r["id"], "name": r["name"] or "—", "phone": r["phone"] or "—",
+         "item": r["item"], "when": r["when_text"] or "—", "notes": r["notes"] or "",
+         "channel": r["channel"], "status": r["status"],
+         "escalated": bool(r["escalated"]), "time": _ago(r["created_at"])}
+        for r in rows
+    ]
+
+
+def delete_booking(booking_id: int) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM bookings WHERE id = ?", (booking_id,))
+
+
+def delete_contact(contact_id: int) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM contacts WHERE id = ?", (contact_id,))
+
+
+# --- adaptive learning ---------------------------------------------------
+
+def add_learned_answer(agent_id: int | None, question: str, answer: str,
+                       source: str = "conversation", confidence: float = 0.5) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO learned_answers
+                   (agent_id, question, answer, source, confidence, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (agent_id, question, answer, source, confidence, now),
+        )
+        lid = cur.lastrowid
+    return {"id": lid, "question": question, "answer": answer, "status": "pending",
+            "source": source, "confidence": confidence}
+
+
+def get_learned_answers(agent_id: int | None = None, status: str | None = None,
+                        limit: int = 100) -> list[dict]:
+    with connect() as conn:
+        clauses, params = [], []
+        if agent_id is not None:
+            clauses.append("(agent_id = ? OR agent_id IS NULL)")
+            params.append(agent_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = conn.execute(
+            f"SELECT * FROM learned_answers {where} ORDER BY id DESC LIMIT ?",
+            [*params, limit],
+        ).fetchall()
+    return [
+        {"id": r["id"], "agentId": r["agent_id"], "question": r["question"],
+         "answer": r["answer"], "source": r["source"],
+         "confidence": r["confidence"], "status": r["status"],
+         "useCount": r["use_count"], "time": _ago(r["created_at"])}
+        for r in rows
+    ]
+
+
+def approved_answers_for(agent_id: int | None) -> list[dict]:
+    """Only approved answers, for injection into the reply prompt."""
+    with connect() as conn:
+        if agent_id is None:
+            rows = conn.execute(
+                "SELECT question, answer FROM learned_answers WHERE status = 'approved' AND agent_id IS NULL"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT question, answer FROM learned_answers WHERE status = 'approved' AND (agent_id = ? OR agent_id IS NULL)",
+                (agent_id,),
+            ).fetchall()
+    return [{"question": r["question"], "answer": r["answer"]} for r in rows]
+
+
+def update_learned_status(learned_id: int, status: str) -> dict | None:
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE learned_answers SET status = ?, approved_at = ? WHERE id = ?",
+            (status, now if status == "approved" else None, learned_id),
+        )
+        r = conn.execute("SELECT * FROM learned_answers WHERE id = ?", (learned_id,)).fetchone()
+    if not r:
+        return None
+    return {"id": r["id"], "status": r["status"], "question": r["question"], "answer": r["answer"]}
+
+
+def increment_learned_use(learned_id: int) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE learned_answers SET use_count = use_count + 1 WHERE id = ?",
+            (learned_id,),
+        )
+
+
+def delete_learned(learned_id: int) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM learned_answers WHERE id = ?", (learned_id,))
+
+
+# --- stock ---------------------------------------------------------------
+
+def add_stock_item(name: str, category: str | None = None, quantity: float = 0,
+                   unit: str = "pcs", rate: float = 0, gst_percent: float = 0,
+                   min_stock: float = 0, agent_id: int | None = None) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO stock
+                   (agent_id, name, category, quantity, unit, rate, gst_percent,
+                    min_stock, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (agent_id, name, category, quantity, unit, rate, gst_percent,
+             min_stock, now, now),
+        )
+        sid = cur.lastrowid
+    return get_stock_item(sid) or {"id": sid, "name": name}
+
+
+def get_stock_items(agent_id: int | None = None, limit: int = 200) -> list[dict]:
+    with connect() as conn:
+        if agent_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM stock WHERE agent_id = ? OR agent_id IS NULL ORDER BY name LIMIT ?",
+                (agent_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM stock ORDER BY name LIMIT ?", (limit,)
+            ).fetchall()
+    return [_stock_row(r) for r in rows]
+
+
+def get_stock_item(stock_id: int) -> dict | None:
+    with connect() as conn:
+        r = conn.execute("SELECT * FROM stock WHERE id = ?", (stock_id,)).fetchone()
+    return _stock_row(r) if r else None
+
+
+def _stock_row(r) -> dict:
+    return {
+        "id": r["id"], "agentId": r["agent_id"], "name": r["name"],
+        "category": r["category"] or "", "quantity": r["quantity"],
+        "unit": r["unit"], "rate": r["rate"], "gstPercent": r["gst_percent"],
+        "minStock": r["min_stock"],
+        "lowStock": r["quantity"] <= r["min_stock"] and r["min_stock"] > 0,
+        "updated": _ago(r["updated_at"]),
+    }
+
+
+def update_stock_item(stock_id: int, **fields) -> dict | None:
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        sets = ",".join(f"{k}=?" for k in fields)
+        conn.execute(f"UPDATE stock SET {sets} WHERE id = ?", [*fields.values(), stock_id])
+    return get_stock_item(stock_id)
+
+
+def delete_stock_item(stock_id: int) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM stock_entries WHERE stock_id = ?", (stock_id,))
+        conn.execute("DELETE FROM stock WHERE id = ?", (stock_id,))
+
+
+def search_stock(query: str, agent_id: int | None = None) -> list[dict]:
+    """Fuzzy name search for voice commands like 'check stock of cement'."""
+    q = f"%{query.strip()}%"
+    with connect() as conn:
+        if agent_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM stock WHERE (agent_id = ? OR agent_id IS NULL) AND name LIKE ? ORDER BY name LIMIT 10",
+                (agent_id, q),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM stock WHERE name LIKE ? ORDER BY name LIMIT 10", (q,)
+            ).fetchall()
+    return [_stock_row(r) for r in rows]
+
+
+def add_stock_entry(stock_id: int, entry_type: str, quantity: float,
+                    notes: str | None = None) -> dict:
+    """Record a stock movement and update the running total."""
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO stock_entries (stock_id, entry_type, quantity, notes, created_at) VALUES (?,?,?,?,?)",
+            (stock_id, entry_type, quantity, notes, now),
+        )
+        # Update running total
+        if entry_type == "in":
+            conn.execute("UPDATE stock SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
+                         (quantity, now, stock_id))
+        elif entry_type == "out":
+            conn.execute("UPDATE stock SET quantity = quantity - ?, updated_at = ? WHERE id = ?",
+                         (quantity, now, stock_id))
+        else:  # adjust — set absolute
+            conn.execute("UPDATE stock SET quantity = ?, updated_at = ? WHERE id = ?",
+                         (quantity, now, stock_id))
+        item = get_stock_item(stock_id)
+    return {"id": stock_id, "entry": entry_type, "quantity": quantity,
+            "newQuantity": item["quantity"] if item else quantity}
+
+
+def get_stock_entries(stock_id: int, limit: int = 50) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM stock_entries WHERE stock_id = ? ORDER BY id DESC LIMIT ?",
+            (stock_id, limit),
+        ).fetchall()
+    return [
+        {"id": r["id"], "type": r["entry_type"], "quantity": r["quantity"],
+         "notes": r["notes"] or "", "time": _ago(r["created_at"])}
+        for r in rows
+    ]
+
+
+# --- bills ---------------------------------------------------------------
+
+def _next_bill_number() -> str:
+    """Sequential bill numbers: BILL-0001, BILL-0002, etc."""
+    with connect() as conn:
+        row = conn.execute("SELECT COUNT(*) FROM bills").fetchone()
+    return f"BILL-{(row[0] + 1):04d}"
+
+
+def create_bill(customer_name: str | None = None, customer_phone: str | None = None,
+                agent_id: int | None = None, channel: str = "call") -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    bill_number = _next_bill_number()
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO bills
+                   (bill_number, customer_name, customer_phone, agent_id, channel, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (bill_number, customer_name, customer_phone, agent_id, channel, now),
+        )
+        bill_id = cur.lastrowid
+    return {"id": bill_id, "billNumber": bill_number, "customerName": customer_name,
+            "status": "draft", "subtotal": 0, "gstTotal": 0, "total": 0}
+
+
+def add_bill_item(bill_id: int, item_name: str, quantity: float, rate: float,
+                  gst_percent: float = 0, stock_id: int | None = None) -> dict:
+    """Add a line to the bill, update the bill totals, and deduct stock if linked."""
+    base = round(quantity * rate, 2)
+    gst = round(base * gst_percent / 100, 2)
+    amount = round(base + gst, 2)
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO bill_items
+                   (bill_id, stock_id, item_name, quantity, rate, gst_percent, amount)
+               VALUES (?,?,?,?,?,?,?)""",
+            (bill_id, stock_id, item_name, quantity, rate, gst_percent, amount),
+        )
+        # Recalculate bill totals
+        conn.execute(
+            """UPDATE bills SET
+                   subtotal = (SELECT COALESCE(SUM(quantity * rate), 0) FROM bill_items WHERE bill_id = ?),
+                   gst_total = (SELECT COALESCE(SUM(quantity * rate * gst_percent / 100), 0) FROM bill_items WHERE bill_id = ?),
+                   total = (SELECT COALESCE(SUM(amount), 0) FROM bill_items WHERE bill_id = ?)
+               WHERE id = ?""",
+            (bill_id, bill_id, bill_id, bill_id),
+        )
+    # Deduct from stock if linked
+    if stock_id:
+        try:
+            add_stock_entry(stock_id, "out", quantity, notes=f"Bill item: {item_name}")
+        except Exception:
+            pass  # stock deduction is best-effort
+    return {"itemName": item_name, "quantity": quantity, "rate": rate,
+            "gst": gst, "amount": amount}
+
+
+def finalize_bill(bill_id: int) -> dict | None:
+    with connect() as conn:
+        conn.execute("UPDATE bills SET status = 'final' WHERE id = ?", (bill_id,))
+    return get_bill(bill_id)
+
+
+def get_bill(bill_id: int) -> dict | None:
+    with connect() as conn:
+        r = conn.execute("SELECT * FROM bills WHERE id = ?", (bill_id,)).fetchone()
+        if not r:
+            return None
+        items = conn.execute(
+            "SELECT * FROM bill_items WHERE bill_id = ? ORDER BY id", (bill_id,)
+        ).fetchall()
+    return {
+        "id": r["id"], "billNumber": r["bill_number"],
+        "customerName": r["customer_name"] or "—",
+        "customerPhone": r["customer_phone"] or "—",
+        "channel": r["channel"], "status": r["status"],
+        "subtotal": r["subtotal"], "gstTotal": r["gst_total"], "total": r["total"],
+        "notes": r["notes"] or "", "time": _ago(r["created_at"]),
+        "items": [
+            {"id": i["id"], "name": i["item_name"], "quantity": i["quantity"],
+             "rate": i["rate"], "gst": i["gst_percent"], "amount": i["amount"]}
+            for i in items
+        ],
+    }
+
+
+def get_bills(limit: int = 50) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM bills ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [
+        {"id": r["id"], "billNumber": r["bill_number"],
+         "customerName": r["customer_name"] or "—",
+         "channel": r["channel"], "status": r["status"],
+         "total": r["total"], "time": _ago(r["created_at"])}
+        for r in rows
+    ]
+
+
+def delete_bill(bill_id: int) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM bill_items WHERE bill_id = ?", (bill_id,))
+        conn.execute("DELETE FROM bills WHERE id = ?", (bill_id,))
+
+
+def get_active_bill(channel: str = "call") -> dict | None:
+    """The most recent draft bill on this channel — for continuing a bill mid-conversation."""
+    with connect() as conn:
+        r = conn.execute(
+            "SELECT id FROM bills WHERE status = 'draft' AND channel = ? ORDER BY id DESC LIMIT 1",
+            (channel,),
+        ).fetchone()
+    return get_bill(r["id"]) if r else None
+
+
+# --- caller-scoped lookups for the agent's search tool --------------------
+# Always filtered by the caller's own number: the agent may look up THIS
+# customer's past bookings, bills and messages, never another customer's.
+
+def bookings_for(phone: str, limit: int = 10) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM bookings WHERE phone = ? ORDER BY id DESC LIMIT ?",
+            (phone, limit),
+        ).fetchall()
+    return [{"id": r["id"], "item": r["item"], "when": r["when_text"] or "",
+             "status": r["status"], "escalated": bool(r["escalated"]),
+             "time": _ago(r["created_at"])} for r in rows]
+
+
+def bills_for(phone: str, limit: int = 10) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM bills WHERE customer_phone = ? ORDER BY id DESC LIMIT ?",
+            (phone, limit),
+        ).fetchall()
+    return [b for r in rows if (b := get_bill(r["id"]))]
+
+
+def messages_for(phone: str, limit: int = 300) -> list[str]:
+    """This number's whole thread (beyond the short prompt window), newest first."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT m.sender, m.body, m.created_at FROM messages m
+               JOIN conversations c ON c.id = m.conversation_id
+               WHERE c.phone = ? AND m.failed = 0
+               ORDER BY m.created_at DESC LIMIT ?""",
+            (phone, limit),
+        ).fetchall()
+    return [f"[{_ago(r['created_at'])}] {'Customer' if r['sender'] == 'them' else 'Us'}: {r['body']}"
+            for r in rows]

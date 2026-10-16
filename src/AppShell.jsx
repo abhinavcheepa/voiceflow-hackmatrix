@@ -10,6 +10,10 @@ import {
   Users,
   Megaphone,
   BarChart3,
+  CalendarCheck,
+  Package,
+  Receipt,
+  Brain,
 } from "lucide-react";
 import { Logo } from "./ui.jsx";
 import { useApi } from "./api.js";
@@ -27,6 +31,15 @@ const groups = [
       { to: "/app/web-call", icon: Headphones, label: "Web call" },
       { to: "/app/calls", icon: Phone, label: "Calls" },
       { to: "/app/whatsapp", icon: MessageSquare, label: "WhatsApp" },
+      { to: "/app/bookings", icon: CalendarCheck, label: "Bookings" },
+    ],
+  },
+  {
+    title: "Business",
+    items: [
+      { to: "/app/stock", icon: Package, label: "Stock" },
+      { to: "/app/bills", icon: Receipt, label: "Bills" },
+      { to: "/app/learning", icon: Brain, label: "Learning" },
     ],
   },
   {

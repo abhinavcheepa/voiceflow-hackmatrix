@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Mic,
   Send,
@@ -11,7 +11,7 @@ import {
   X,
 } from "lucide-react";
 import { Card, EmptyState, ErrorNote, Waveform } from "../ui.jsx";
-import { useApi, post, put } from "../api.js";
+import { API, useApi, post, put } from "../api.js";
 
 /** Small switch. `on` drives the colour; the label sits outside. */
 function Toggle({ on, onChange, disabled, title }) {
@@ -151,6 +151,12 @@ export default function WhatsApp() {
   const [importing, setImporting] = useState(false);
   const [imported, setImported] = useState(null);
   const [allowlist, setAllowlist] = useState("");
+  const [allowlistSaved, setAllowlistSaved] = useState(false);
+  const allowlistRef = useRef(allowlist); // latest value for unload handler
+  const saveTimerRef = useRef(null);
+
+  // Keep the ref in sync so the unload handler always has the latest value.
+  useEffect(() => { allowlistRef.current = allowlist; }, [allowlist]);
 
   // Clear the import result on its own — it used to sit there until a reload,
   // which made a one-off message look like a permanent fault.
@@ -163,6 +169,33 @@ export default function WhatsApp() {
   useEffect(() => {
     if (autoReply?.allowlist) setAllowlist(autoReply.allowlist.join("\n"));
   }, [autoReply?.allowlist]);
+
+  // Debounced save: 800ms after the user stops typing, persist the allowlist.
+  const saveAllowlist = useCallback((value) => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      put("/api/whatsapp/allowlist", { numbers: value })
+        .then(() => {
+          setAllowlistSaved(true);
+          setTimeout(() => setAllowlistSaved(false), 2000);
+          reloadAuto();
+        })
+        .catch(() => {});
+    }, 800);
+  }, [reloadAuto]);
+
+  // Save on page close/refresh so edits are never lost.
+  useEffect(() => {
+    const onUnload = () => {
+      // navigator.sendBeacon doesn't support PUT, so use a sync XHR.
+      const xhr = new XMLHttpRequest();
+      xhr.open("PUT", `${API}/api/whatsapp/allowlist`, false);
+      xhr.setRequestHeader("Content-Type", "application/json");
+      xhr.send(JSON.stringify({ numbers: allowlistRef.current }));
+    };
+    window.addEventListener("beforeunload", onUnload);
+    return () => window.removeEventListener("beforeunload", onUnload);
+  }, []);
 
   /** History only — the backend stores these without running the agent. */
   async function importChats() {
@@ -256,7 +289,12 @@ export default function WhatsApp() {
           {/* Essential when the agent runs on a number that also carries
               personal chats — otherwise friends get answered by a bot. */}
           <div className="mt-2 rounded-xl border border-line bg-panel-2 px-3 py-2.5">
-            <p className="text-xs font-medium">Only reply to these numbers</p>
+            <div className="flex items-center justify-between">
+              <p className="text-xs font-medium">Only reply to these numbers</p>
+              {allowlistSaved && (
+                <span className="text-[10px] text-mint animate-pulse">Saved ✓</span>
+              )}
+            </div>
             <p className="mt-0.5 text-[11px] leading-tight text-dim">
               {allowlist.trim()
                 ? "Everyone else is stored but not answered."
@@ -264,8 +302,10 @@ export default function WhatsApp() {
             </p>
             <textarea
               value={allowlist}
-              onChange={(e) => setAllowlist(e.target.value)}
-              onBlur={() => put("/api/whatsapp/allowlist", { numbers: allowlist }).then(reloadAuto)}
+              onChange={(e) => {
+                setAllowlist(e.target.value);
+                saveAllowlist(e.target.value);
+              }}
               rows={2}
               placeholder={"919812345678\n919876543210"}
               className="mt-2 w-full resize-none rounded-lg border border-line bg-panel px-2.5 py-2 font-mono text-[11px] outline-none focus:border-violet/50"
