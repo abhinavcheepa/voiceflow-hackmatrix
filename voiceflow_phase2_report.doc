@@ -1,0 +1,36 @@
+VoiceFlow AI - Technical Development Report (Phase 2)
+
+This report outlines the Phase 2 development of the VoiceFlow AI project. It details the core Computer Science concepts applied across Computer Networks, DBMS, Software Engineering, DSA, and Web Development.
+
+---
+
+Phase 2: Advanced Capabilities & Optimizations
+
+Phase 2 focused on reducing latency, adding voice capabilities, and implementing intelligent fallbacks.
+
+1. Computer Networks
+- WebSockets (Full-Duplex Communication): Web calls are handled via ws:// connections. Unlike HTTP polling, WebSockets keep a persistent TCP connection open, allowing real-time, low-latency audio streaming between the browser and the backend.
+- Telephony & SIP: Integrated Vapi and Asterisk for PSTN phone network connectivity, bridging traditional telecom networks with our AI system.
+
+2. Data Structures & Algorithms (DSA)
+- Set Lookups for Language Detection: 
+  - Concept: Used Python set data structures.
+  - Problem Solved: Instead of asking an LLM to detect the language (which adds latency and cost), we use a fast O(1) set lookup against a predefined list of Romanized Hindi words.
+- Regex & String Matching (Hallucination Filtering):
+  - Concept: Applied Regular Expressions.
+  - Problem Solved: Whisper AI sometimes hallucinates repeated phrases when fed silence. This regex detects looping patterns and drops them.
+- Graph / Tree Traversal (LLM Tool Calling Loop):
+  - Concept: Iterative graph traversal.
+  - Problem Solved: The agent can recursively call external tools (like checking inventory, then booking a slot) in a for loop up to 4 depths before returning a final spoken response.
+
+3. Software Engineering
+- Graceful Degradation & Fallbacks: The system has a multi-tier fallback mechanism. If the primary Groq model rate-limits, it waits. If it hard-fails, it automatically falls back to a secondary model.
+- Adaptive Learning: Built a feedback loop where the owner can approve good Q&A pairs from past conversations, which are then injected as context into future prompts.
+
+4. Applied Algorithms
+- Exponential Backoff with Jitter:
+  - Problem Solved: API rate limits from Groq were causing dropped messages. 
+  - Implementation: The system intercepts HTTP 429 (Rate Limit) errors, reads the retry-after header, and pauses the async task for exactly that duration before retrying, ensuring we never drop a customer's message.
+- Heuristic Unicode Block Analysis:
+  - Problem Solved: Classifying native scripts quickly.
+  - Implementation: The algorithm checks if characters fall within specific Unicode ranges (e.g., Devanagari). If it's Devanagari, it further checks for specific Marathi markers to distinguish it from Hindi.

@@ -1,0 +1,28 @@
+VoiceFlow AI - Technical Development Report (Phase 1)
+
+This report outlines the Phase 1 development of the VoiceFlow AI project. It details the core Computer Science concepts applied across Computer Networks, DBMS, Software Engineering, DSA, and Web Development.
+
+---
+
+Phase 1: Core System & Infrastructure
+
+In Phase 1, the foundational architecture of the agent was established. This included setting up the database, building the basic API, integrating WhatsApp, and hooking up the LLM for intelligence.
+
+1. Database Management Systems (DBMS)
+- Relational Schema Design: We used SQLite for a lightweight, single-file database. The schema is highly normalized with tables for calls, conversations, messages, and agents. 
+- Integrity Constraints: UNIQUE, NOT NULL, and CHECK constraints enforce data integrity directly at the database layer.
+- Indices for Performance: Added specific indices like idx_msgs_conv to optimize querying the chat history.
+- No-ORM Approach: We opted for raw SQL over an ORM to keep the queries predictable and reduce overhead, ensuring fast reads/writes.
+
+2. Software Engineering
+- Modular Monolith Architecture: The backend is divided into domain-specific modules. This separation of concerns allows swapping out external providers by editing just one file.
+- Asynchronous Programming: Built using FastAPI's async/await and Starlette's BackgroundTasks. This allows the server to immediately acknowledge webhooks while processing the LLM reply in the background.
+
+3. Web Development
+- RESTful APIs: The backend exposes clear, resource-oriented endpoints.
+- Middleware & Error Handling: A custom HTTP middleware catches unhandled exceptions and surfaces them as readable JSON rather than breaking CORS policies.
+- React Dashboard: A React frontend was built to consume these APIs, providing a single pane of glass for analytics, CRM, and agent configuration.
+
+4. Computer Networks
+- Webhooks: Implemented webhook receivers for Meta's WhatsApp API to listen for incoming messages in real-time.
+- HTTP Connection Pooling: In brain.py, we use httpx.AsyncClient to maintain a persistent connection pool. This avoids the overhead of TCP handshakes and TLS negotiation on every single LLM call, reducing latency.
