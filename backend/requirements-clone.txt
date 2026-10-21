@@ -4,7 +4,7 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
 librosa
-imageio-ffmpeg          # bundled ffmpeg: decodes browser webm + Edge mp3, encodes mp3
+# imageio-ffmpeg comes from requirements.txt (also used for call recordings)
 # OpenVoice V2 (MIT). --no-deps is not expressible here; its own pins are old
 # and unneeded (we use only the converter), so install it separately:
 #   pip install --no-deps git+https://github.com/myshell-ai/OpenVoice.git

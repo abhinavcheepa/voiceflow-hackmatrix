@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { Phone, PhoneOff, Loader2, AlertTriangle } from "lucide-react";
 import { Card, Waveform } from "../ui.jsx";
 import { API, useApi } from "../api.js";
 
-const WS_BASE = `${API.replace(/^http/, "ws")}/api/web-call/ws`;
+// Same origin by default (Vite proxies it), which is what works from a phone.
+const WS_BASE = `${(API || window.location.origin).replace(/^http/, "ws")}/api/web-call/ws`;
 
 // Turn detection. The browser decides when the caller has finished speaking so
 // the backend never has to guess — it just receives one blob per turn.
@@ -26,6 +28,46 @@ const MAX_TURN_MS = 12_000; // never wait longer than this for a silence
 // so stop waiting for it and let the caller speak again.
 const TURN_TIMEOUT_MS = 20_000;
 
+// Barge-in. While the agent talks the mic also hears the agent (whatever echo
+// cancellation leaves). So each clip's first moments teach us how loud that
+// echo is, and only sound clearly above it, held for a moment, counts as the
+// caller cutting in.
+const ECHO_LEARN_MS = 400;
+const BARGE_OVER_ECHO = 2.5;
+const BARGE_MS = 300;
+
+/** localStorage that never throws (private mode, blocked storage). */
+const store = {
+  get: (k) => {
+    try {
+      return localStorage.getItem(k) ?? "";
+    } catch {
+      return "";
+    }
+  },
+  set: (k, v) => {
+    try {
+      localStorage.setItem(k, v);
+    } catch {
+      /* the value just won't be remembered */
+    }
+  },
+};
+
+/** Stable per-browser id, so the agent remembers this caller next time. */
+function callerKey() {
+  try {
+    let k = localStorage.getItem("vf_caller");
+    if (!k) {
+      k = crypto.randomUUID();
+      localStorage.setItem("vf_caller", k);
+    }
+    return k;
+  } catch {
+    return null; // private mode / blocked storage: the call works, just without memory
+  }
+}
+
 const STATUS_TEXT = {
   idle: "Ready",
   connecting: "Connecting…",
@@ -43,6 +85,17 @@ export default function WebCall() {
   const [callId, setCallId] = useState(null);
   const [agentId, setAgentId] = useState("");
   const [level, setLevel] = useState(null);
+  const [allowBarge, setAllowBarge] = useState(true);
+  // "customer": try your agent as a caller would. "assistant": you are the
+  // owner giving orders (bills, WhatsApp, stock) — Jarvis mode.
+  const [mode, setMode] = useState(() => store.get("vf_call_mode") || "customer");
+  const [pin, setPin] = useState(() => store.get("vf_owner_pin"));
+  const [typed, setTyped] = useState("");
+  const assistant = mode === "assistant";
+  const bargeOn = useRef(true);
+  useEffect(() => {
+    bargeOn.current = allowBarge;
+  }, [allowBarge]);
 
   const { data: agents } = useApi("/api/agents", [], 0);
 
@@ -72,6 +125,9 @@ export default function WebCall() {
   const turnAt = useRef(0);
   const raf = useRef(null);
   const pingTimer = useRef(null);
+  const playStartedAt = useRef(0);
+  const echoPeak = useRef(0);
+  const bargeMs = useRef(0);
 
   const cleanup = useCallback(() => {
     cancelAnimationFrame(raf.current);
@@ -137,7 +193,24 @@ export default function WebCall() {
     p.onended = null;
     p.onerror = null;
     p.pause();
+    URL.revokeObjectURL(p.src);
   }, []);
+
+  /** The caller talked over the agent: cut the agent off and listen. */
+  const bargeIn = useCallback(() => {
+    stopPlayback();
+    agentSpeaking.current = false;
+    turnInFlight.current = false;
+    if (ws.current?.readyState === WebSocket.OPEN) {
+      ws.current.send(JSON.stringify({ type: "barge" }));
+    }
+    // What the mic held so far is mostly the agent's own voice — drop it and
+    // record the caller fresh. Their speech is already under way, so count it.
+    discardTurn();
+    resetTurnDetection();
+    speechMs.current = BARGE_MS;
+    setStatus("listening");
+  }, [stopPlayback, discardTurn, resetTurnDetection]);
 
   /** Watch the mic level and call flushTurn once the caller goes quiet. */
   const watchLevel = useCallback(
@@ -151,17 +224,33 @@ export default function WebCall() {
         // Deaf while the agent talks. Without this the loop measures the
         // agent's own voice coming back through the speakers, decides the
         // caller spoke, and sends the agent its own words as a question.
-        if (agentSpeaking.current) {
-          speechMs.current = 0;
-          silenceMs.current = 0;
-          peakRms.current = 0;
-          return;
-        }
-
+        // Barge-in is the one exception: listen for a voice clearly louder
+        // than the agent's own echo, measured fresh for every clip.
         analyser.getFloatTimeDomainData(buffer);
         let sum = 0;
         for (const v of buffer) sum += v * v;
         const rms = Math.sqrt(sum / buffer.length);
+
+        if (agentSpeaking.current) {
+          speechMs.current = 0;
+          silenceMs.current = 0;
+          peakRms.current = 0;
+          if (!bargeOn.current || noiseFloor.current === null) return;
+          if (performance.now() - playStartedAt.current < ECHO_LEARN_MS) {
+            echoPeak.current = Math.max(echoPeak.current, rms);
+            return;
+          }
+          const bar = Math.max(
+            echoPeak.current * BARGE_OVER_ECHO,
+            noiseFloor.current * SPEECH_OVER_FLOOR * 1.5,
+          );
+          bargeMs.current = rms > bar ? bargeMs.current + 16 : 0;
+          if (bargeMs.current >= BARGE_MS) {
+            bargeMs.current = 0;
+            bargeIn();
+          }
+          return;
+        }
 
         // Learn how loud this room actually is. Sampling is counted in frames,
         // not wall-clock: the greeting arrives during this window and the loop
@@ -229,7 +318,7 @@ export default function WebCall() {
       };
       raf.current = requestAnimationFrame(tick);
     },
-    [flushTurn, discardTurn, resetTurnDetection],
+    [flushTurn, discardTurn, resetTurnDetection, bargeIn],
   );
 
   function startRecorder() {
@@ -276,7 +365,12 @@ export default function WebCall() {
     analyser.fftSize = 1024;
     source.connect(analyser);
 
-    const socket = new WebSocket(agentId ? `${WS_BASE}?agent=${agentId}` : WS_BASE);
+    const params = new URLSearchParams();
+    if (assistant) params.set("mode", "assistant");
+    else if (agentId) params.set("agent", agentId);
+    const key = callerKey();
+    if (key) params.set("caller", key);
+    const socket = new WebSocket(`${WS_BASE}?${params}`);
     socket.binaryType = "arraybuffer";
     ws.current = socket;
 
@@ -298,6 +392,9 @@ export default function WebCall() {
         const url = URL.createObjectURL(new Blob([e.data], { type: "audio/mpeg" }));
         const audio = new Audio(url);
         player.current = audio;
+        playStartedAt.current = performance.now();
+        echoPeak.current = 0;
+        bargeMs.current = 0;
 
         const finished = () => {
           URL.revokeObjectURL(url);
@@ -322,6 +419,8 @@ export default function WebCall() {
       if (msg.type === "connected") setCallId(msg.callId);
       else if (msg.type === "caller") setTurns((t) => [...t, { who: "caller", ...msg }]);
       else if (msg.type === "agent") setTurns((t) => [...t, { who: "agent", ...msg }]);
+      else if (msg.type === "handoff")
+        setTurns((t) => [...t, { who: "event", text: `Transferred to ${msg.agent}` }]);
       else if (msg.type === "thinking") setStatus("thinking");
       else if (msg.type === "idle") {
         // Nothing worth answering — release the turn so the caller can retry.
@@ -343,6 +442,9 @@ export default function WebCall() {
     };
 
     socket.onopen = () => {
+      // The PIN goes in the first message, not the URL, so it never lands in
+      // a proxy or server log. The backend only asks for it off this machine.
+      if (assistant && pin) socket.send(JSON.stringify({ type: "auth", pin }));
       setStatus("greeting");
       noiseFloor.current = null;
       // Open the mic now. It used to wait for the greeting audio to finish,
@@ -368,16 +470,75 @@ export default function WebCall() {
 
   const live = !["idle", "ended"].includes(status);
 
+  /** Typed instead of spoken — handy on a phone in a noisy place. */
+  function sendTyped(e) {
+    e.preventDefault();
+    const text = typed.trim();
+    if (!text || ws.current?.readyState !== WebSocket.OPEN) return;
+    stopPlayback();
+    agentSpeaking.current = false;
+    turnInFlight.current = true;
+    turnAt.current = Date.now();
+    discardTurn();
+    ws.current.send(JSON.stringify({ type: "say", text }));
+    setTyped("");
+    setStatus("thinking");
+  }
+
+  function chooseMode(m) {
+    setMode(m);
+    store.set("vf_call_mode", m);
+  }
+
   return (
     <div className="mx-auto max-w-3xl p-6 lg:p-8">
       <header>
         <h1 className="text-2xl font-semibold tracking-tight">Web call</h1>
         <p className="mt-1 text-sm text-dim">
-          Talk to your agent from the browser — same pipeline a real caller gets.
+          {assistant
+            ? "Your assistant: tell it what to do — make and send a bill, message a number, start a WhatsApp chat with an agent, check stock."
+            : "Talk to your agent from the browser — same pipeline a real caller gets."}
         </p>
       </header>
 
       <Card className="mt-7">
+        <div className="mb-4 flex gap-2">
+          {[
+            ["customer", "Customer call"],
+            ["assistant", "My assistant"],
+          ].map(([m, label]) => (
+            <button
+              key={m}
+              onClick={() => chooseMode(m)}
+              disabled={live}
+              className={`rounded-full px-3.5 py-2 text-xs transition disabled:opacity-50 ${
+                mode === m ? "bg-violet text-white" : "border border-line bg-panel text-dim hover:text-white"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {assistant ? (
+          <label className="block text-xs text-dim">
+            Owner PIN <span className="text-dim/70">(only asked when you use this from your phone)</span>
+            <input
+              type="password"
+              inputMode="numeric"
+              autoComplete="off"
+              value={pin}
+              onChange={(e) => {
+                setPin(e.target.value);
+                store.set("vf_owner_pin", e.target.value);
+              }}
+              disabled={live}
+              placeholder="ASSISTANT_PIN from backend/.env"
+              className="mt-1.5 w-full rounded-xl border border-line bg-panel-2 px-3.5 py-2.5 text-sm text-white outline-none focus:border-violet/50 disabled:opacity-50"
+            />
+          </label>
+        ) : (
+        <>
         {/* Which persona answers. Without this every call went to whichever
             agent happened to be default. */}
         <label className="block text-xs text-dim">
@@ -401,6 +562,17 @@ export default function WebCall() {
             Answers with: “{agent.greeting}”
           </p>
         )}
+        </>
+        )}
+        <label className="mt-3 flex items-center gap-2 text-xs text-dim">
+          <input
+            type="checkbox"
+            checked={allowBarge}
+            onChange={(e) => setAllowBarge(e.target.checked)}
+            className="accent-violet"
+          />
+          Let me interrupt the agent (barge-in) — turn off if speakers make it cut itself off
+        </label>
 
         <div className="flex flex-col items-center py-4">
           <button
@@ -452,6 +624,25 @@ export default function WebCall() {
           )}
         </div>
 
+        {live && (
+          <form onSubmit={sendTyped} className="mb-4 flex gap-2">
+            <input
+              value={typed}
+              onChange={(e) => setTyped(e.target.value)}
+              placeholder={assistant ? "Or type: bill banao, 2 cement bag 350 ke, Ravi ko bhej do" : "Or type a message…"}
+              aria-label="Type a message"
+              className="min-w-0 flex-1 rounded-xl border border-line bg-panel-2 px-3.5 py-2.5 text-sm outline-none focus:border-violet/50"
+            />
+            <button
+              type="submit"
+              disabled={!typed.trim()}
+              className="rounded-xl bg-violet px-4 py-2.5 text-sm font-medium text-white transition hover:bg-violet-soft disabled:opacity-40"
+            >
+              Send
+            </button>
+          </form>
+        )}
+
         {error && (
           <p className="flex items-start gap-2 rounded-xl border border-saffron/30 bg-saffron/5 px-4 py-3 text-xs text-saffron">
             <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
@@ -464,7 +655,10 @@ export default function WebCall() {
         <Card className="mt-4">
           <h2 className="text-[15px] font-semibold">Transcript</h2>
           <div className="mt-4 space-y-3">
-            {turns.map((t, i) => (
+            {turns.map((t, i) =>
+              t.who === "event" ? (
+                <p key={i} className="text-center text-[11px] text-dim">— {t.text} —</p>
+              ) : (
               <div key={i} className={`flex ${t.who === "agent" ? "justify-end" : "justify-start"}`}>
                 <div
                   className={`max-w-[80%] rounded-2xl px-3.5 py-2.5 text-sm ${
@@ -474,19 +668,27 @@ export default function WebCall() {
                   }`}
                 >
                   {t.text}
-                  {t.language && (
-                    <span className="mt-1 block text-[10px] text-dim">{t.language}</span>
+                  {(t.language || (t.who === "agent" && t.agent)) && (
+                    <span className="mt-1 block text-[10px] text-dim">{t.language ?? t.agent}</span>
                   )}
                 </div>
               </div>
-            ))}
+              ),
+            )}
           </div>
         </Card>
       )}
 
+      {status === "ended" && callId && (
+        <p className="mt-4 text-center text-xs text-dim">
+          This call is being saved — recording, summary and full transcript appear on the{" "}
+          <Link to="/app/calls" className="text-violet-soft underline">Calls</Link> page in a few seconds.
+        </p>
+      )}
+
       <p className="mt-4 text-center text-xs text-dim">
-        Half-duplex: the agent finishes speaking before it listens again.
-        Interrupting mid-sentence needs the streaming media loop.
+        Every web call is recorded and saved with a text summary. Speak over the agent to
+        interrupt it; it remembers you the next time you call from this browser.
       </p>
     </div>
   );

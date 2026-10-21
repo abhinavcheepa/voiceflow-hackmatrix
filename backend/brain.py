@@ -6,6 +6,7 @@ through here — Vapi runs that loop itself.
 """
 
 import asyncio
+import inspect
 import io
 import json
 import logging
@@ -175,7 +176,7 @@ async def analyse_call(transcript: str, language: str = "Hindi") -> dict:
                         json=body, timeout=60)
         data = _extract_json(r.json()["choices"][0]["message"]["content"])
     except Exception as e:  # noqa: BLE001 - analysis is best-effort, never fatal
-        log.warning("call analysis failed: %s", e)
+        log.warning("call analysis failed: %s: %s", type(e).__name__, e)
         return {}
 
     # Normalise to exactly the fields callers store, dropping anything spurious.
@@ -206,15 +207,17 @@ def facts_block(facts: str | None) -> str:
     return f"BUSINESS FACTS (the only prices, timings and items you may quote):\n{facts}"
 
 
-def system_prompt(customer: str | None = None) -> str:
+def system_prompt(customer: str | None = None, agent: dict | None = None,
+                  goal: str | None = None) -> str:
     """The brief for WhatsApp replies.
 
     Carries the selected agent's own instructions — its timings, prices and
     rules — because without them the model has no facts and cheerfully invents
-    slots and rates.
+    slots and rates. `agent`/`goal` come from a thread the owner handed to a
+    specific agent; otherwise the default agent answers.
     """
     style = db.get_setting(STYLE_KEY) or DEFAULT_STYLE
-    agent = db.get_agent() or {}
+    agent = agent or db.get_agent() or {}
     business = agent.get("name") or BUSINESS_NAME
     persona = agent.get("prompt", "").strip()
     facts = facts_block(agent.get("facts"))
@@ -226,6 +229,10 @@ def system_prompt(customer: str | None = None) -> str:
         if customer
         else "You do NOT know the customer's name. Never guess or make one up."
     )
+    if goal:
+        # The owner started this chat for a reason; keep steering toward it.
+        who += (f"\n\nYOUR GOAL in this conversation (set by {OWNER_NAME}): {goal}\n"
+                "Work toward it politely; don't drop it after the first reply.")
 
     return f"""You are replying to WhatsApp messages on behalf of {OWNER_NAME}, who runs {business}.
 
@@ -286,6 +293,12 @@ NO_SPEECH_LIMIT = float(os.getenv("STT_NO_SPEECH_LIMIT") or 0.6)
 def _clean(text: str) -> str:
     """Empty string for anything that looks like a hallucination, not speech."""
     stripped = text.strip()
+    if not stripped:
+        return ""
+    # Strip any stray underscores, hyphens, and weird symbols from transcription
+    stripped = re.sub(r"^[_\s\-—]+|[_\s\-—]+$", "", stripped)
+    stripped = re.sub(r"_+", " ", stripped)
+    stripped = re.sub(r"\s{2,}", " ", stripped).strip()
     if not stripped:
         return ""
     key = stripped.lower().strip(" .!?,")
@@ -413,26 +426,46 @@ def _local_stt_available() -> bool:
     return importlib.util.find_spec("faster_whisper") is not None
 
 
-async def transcribe(audio: bytes, filename: str = "note.ogg") -> str:
+async def transcribe(audio: bytes, filename: str = "note.ogg", vocab: str = "") -> str:
     """Speech-to-text. Language is auto-detected, so nothing to configure.
+
+    `vocab` primes Whisper with words it should expect — the product name and
+    people's names. Without it "VoiceFlow" came back as "Vice Flow" and a
+    contact's name as an unrelated phrase, so a name could never be matched.
 
     Hosted Groq Whisper is primary; if it fails and faster-whisper is installed,
     fall back to on-device transcription so a caller is still heard through a
     Groq outage. No local model installed means no fallback — Groq is reliable
     enough that we don't force the ~460 MB download on everyone.
     """
+    vocab = vocab[:VOCAB_CHARS]
     if stt_backend() == "local":
-        return await asyncio.to_thread(_transcribe_local, audio)
-    try:
-        return await _transcribe_groq(audio, filename)
-    except Exception as e:  # noqa: BLE001 - any Groq failure is worth a local retry
-        if _local_stt_available():
+        text = await asyncio.to_thread(_transcribe_local, audio, vocab)
+    else:
+        try:
+            text = await _transcribe_groq(audio, filename, vocab)
+        except Exception as e:  # noqa: BLE001 - any Groq failure is worth a local retry
+            if not _local_stt_available():
+                raise
             log.warning("Groq STT failed (%s) — falling back to local whisper", type(e).__name__)
-            return await asyncio.to_thread(_transcribe_local, audio)
-        raise
+            text = await asyncio.to_thread(_transcribe_local, audio, vocab)
+    return "" if vocab and _echoes_vocab(text, vocab) else text
 
 
-async def _transcribe_groq(audio: bytes, filename: str) -> str:
+# Whisper's prompt is capped at 224 tokens; names average a few tokens each.
+VOCAB_CHARS = 700
+
+
+def _echoes_vocab(text: str, vocab: str) -> bool:
+    """On silence, a primed Whisper may simply recite its prompt ("VoiceFlow AI,
+    WhatsApp, Kanishk…"). A transcript made almost entirely of vocab words is
+    that, not speech."""
+    words = set(re.findall(r"\w+", text.lower()))
+    known = set(re.findall(r"\w+", vocab.lower()))
+    return len(words) >= 3 and len(words & known) / len(words) >= 0.8
+
+
+async def _transcribe_groq(audio: bytes, filename: str, vocab: str = "") -> str:
     r = await _post(
         http(),
         f"{GROQ_URL}/audio/transcriptions",
@@ -440,7 +473,8 @@ async def _transcribe_groq(audio: bytes, filename: str) -> str:
         files={"file": (filename, audio, "application/octet-stream")},
         # verbose_json carries no_speech_prob per segment, which is the only
         # reliable signal that Whisper was handed silence.
-        data={"model": STT_MODEL, "response_format": "verbose_json"},
+        data={"model": STT_MODEL, "response_format": "verbose_json",
+              **({"prompt": vocab} if vocab else {})},
     )
     body = r.json()
 
@@ -468,11 +502,12 @@ def _load_local():
     return _local_model
 
 
-def _transcribe_local(audio: bytes) -> str:
+def _transcribe_local(audio: bytes, vocab: str = "") -> str:
     """Blocking — always call via asyncio.to_thread so the event loop keeps running."""
     # beam_size=1 is greedy decoding: noticeably faster on CPU, and voice notes
     # are short and clear enough that the accuracy difference doesn't show.
-    segments, _ = _load_local().transcribe(io.BytesIO(audio), beam_size=1)
+    segments, _ = _load_local().transcribe(io.BytesIO(audio), beam_size=1,
+                                           initial_prompt=vocab or None)
     kept = [s for s in segments if getattr(s, "no_speech_prob", 0) <= NO_SPEECH_LIMIT]
     return _clean(" ".join(s.text for s in kept))
 
@@ -584,7 +619,8 @@ def _tool_schemas() -> list[dict]:
     return tools.SCHEMAS
 
 
-def _chat_body(provider: dict, messages: list[dict], with_tools: bool) -> dict:
+def _chat_body(provider: dict, messages: list[dict], with_tools: bool | list[dict]) -> dict:
+    """`with_tools` is False, True (the standard set) or this turn's own list."""
     body = {
         "model": provider["model"],
         "messages": messages,
@@ -595,7 +631,7 @@ def _chat_body(provider: dict, messages: list[dict], with_tools: bool) -> dict:
         "max_tokens": MAX_REPLY_TOKENS,
     }
     if with_tools:
-        body["tools"] = _tool_schemas()
+        body["tools"] = with_tools if isinstance(with_tools, list) else _tool_schemas()
         body["tool_choice"] = "auto"
     # gpt-oss models think before answering, and that thinking is billed against
     # max_tokens; at default effort it consumed the whole budget and returned an
@@ -605,7 +641,7 @@ def _chat_body(provider: dict, messages: list[dict], with_tools: bool) -> dict:
     return body
 
 
-async def _chat_once(messages: list[dict], with_tools: bool) -> dict:
+async def _chat_once(messages: list[dict], with_tools: bool | list[dict]) -> dict:
     """One completion, with provider failover. Returns the raw assistant message
     (which may carry tool_calls).
 
@@ -628,6 +664,11 @@ async def _chat_once(messages: list[dict], with_tools: bool) -> dict:
             if r.status_code == 429:
                 # One provider-local wait for a transient limit before failing over.
                 await asyncio.sleep(_rate_limit_wait(r))
+                r = await http().post(url, headers=headers, json=body, timeout=60)
+            elif r.status_code == 400 and "tool call validation" in r.text.lower():
+                # gpt-oss sometimes emits a mangled tool name ("search_knowledge<|…")
+                # and Groq rejects the whole reply. It's sampling noise — a second
+                # try almost always comes back clean.
                 r = await http().post(url, headers=headers, json=body, timeout=60)
             if r.status_code == 200:
                 if i == 0:
@@ -696,11 +737,16 @@ async def reply(phone: str, message: str, history: list[dict] | None = None,
         {"role": "user", "content": message},
     ]
 
-    use_tools = tools_ctx is not None
+    # Per-turn list: the transfer tool exists only when there is a squad.
+    use_tools = tools_mod.schemas(tools_ctx) if tools_ctx is not None else False
     # Bill creation needs multiple tool rounds (create → add item → add item →
     # finalize), so allow up to 4 rounds instead of the original 2. Each round
     # is one LLM call, so this still bounds latency.
-    for _round in range(4):
+    # The owner chains actions in one breath ("bill banao, do item, bhej do"):
+    # create, add, add, finalize, send is five rounds. Customers rarely need more
+    # than a couple, and every round is a model call on the per-minute budget.
+    rounds = 8 if (tools_ctx or {}).get("owner") else 4
+    for _round in range(rounds):
         msg = await _chat_once(messages, with_tools=use_tools)
         calls = msg.get("tool_calls")
         if not calls:
@@ -722,10 +768,12 @@ async def reply(phone: str, message: str, history: list[dict] | None = None,
                 args = json.loads(fn.get("arguments") or "{}")
             except (ValueError, TypeError):
                 args = {}
-            result = tools_mod.run(fn.get("name", ""), args, tools_ctx or {})
+            result = tools_mod.run(fn.get("name", ""), args, tools_ctx if tools_ctx is not None else {})
+            if inspect.isawaitable(result):
+                result = await result
             messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": result})
-        # After 3 tool rounds, force a natural-language answer.
-        if _round >= 2:
+        # Leave the last round for a natural-language answer.
+        if _round >= rounds - 2:
             use_tools = False
 
     # Both rounds asked for tools without ever composing a reply — very rare.

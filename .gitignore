@@ -28,3 +28,6 @@ backend/voices/
 backend/mits_knowledge.md
 backend/load_mits_agent.py
 docs/MITS_FE_Faculty_Database.md
+
+# call recordings and text records — customers' voices and words
+backend/recordings/

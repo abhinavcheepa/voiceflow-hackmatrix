@@ -18,6 +18,7 @@ import Analytics from "./pages/Analytics.jsx";
 import Stock from "./pages/Stock.jsx";
 import Bills from "./pages/Bills.jsx";
 import Learning from "./pages/Learning.jsx";
+import Evals from "./pages/Evals.jsx";
 
 createRoot(document.getElementById("root")).render(
   <StrictMode>
@@ -38,6 +39,7 @@ createRoot(document.getElementById("root")).render(
           <Route path="stock" element={<Stock />} />
           <Route path="bills" element={<Bills />} />
           <Route path="learning" element={<Learning />} />
+          <Route path="tests" element={<Evals />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

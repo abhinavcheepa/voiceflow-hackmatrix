@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 
-export const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+// Empty = same origin: Vite proxies /api to the backend (vite.config.js). That
+// is what lets a phone on the Wi-Fi use the app — "localhost:8000" on a phone
+// is the phone. Set VITE_API_URL only to point at a backend elsewhere.
+export const API = import.meta.env.VITE_API_URL ?? "";
 
 async function request(path, options = {}) {
   const r = await fetch(`${API}${path}`, options);

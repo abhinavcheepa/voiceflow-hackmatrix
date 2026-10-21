@@ -150,6 +150,29 @@ CREATE TABLE IF NOT EXISTS learned_answers (
     created_at  TEXT NOT NULL,
     approved_at TEXT
 );
+-- Evals: scripted or simulated test conversations run against an agent, each
+-- judged against a rubric. Runs are dry — tools describe, never write.
+CREATE TABLE IF NOT EXISTS eval_cases (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    agent_id   INTEGER REFERENCES agents(id),
+    mode       TEXT NOT NULL DEFAULT 'script' CHECK (mode IN ('script', 'simulate')),
+    turns      TEXT,              -- script: caller lines, one per line
+    persona    TEXT,              -- simulate: who the AI caller is and what they want
+    max_turns  INTEGER NOT NULL DEFAULT 4,
+    rubric     TEXT NOT NULL,     -- what a pass looks like, judged by the model
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS eval_runs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id    INTEGER NOT NULL REFERENCES eval_cases(id),
+    passed     INTEGER NOT NULL,
+    reason     TEXT,
+    transcript TEXT,
+    tools      TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_eval_runs_case ON eval_runs(case_id, id);
 CREATE INDEX IF NOT EXISTS idx_learned_agent  ON learned_answers(agent_id, status);
 CREATE INDEX IF NOT EXISTS idx_learned_status ON learned_answers(status);
 
@@ -249,6 +272,14 @@ MIGRATIONS = [
     # chunks stored before embeddings were added — search falls back to BM25
     # for those, so nothing breaks during the transition.
     ("kb_chunks", "embedding", "BLOB"),
+    # Web-call memory: a browser-held caller id links one person's calls.
+    ("calls", "caller_key", "TEXT"),
+    # Download link for the plain-text record (recording_url holds the audio).
+    ("calls", "record_url", "TEXT"),
+    # A WhatsApp thread the owner started through the assistant: which agent
+    # answers it and what it is trying to achieve there.
+    ("conversations", "agent_id", "INTEGER"),
+    ("conversations", "goal", "TEXT"),
 ]
 
 
@@ -362,10 +393,25 @@ def get_calls(limit: int = 50) -> list[dict]:
             "outcome": r["outcome"],
             "summary": (r["summary"] if "summary" in r.keys() else None) or "",
             "success": (r["success"] if "success" in r.keys() else None),
+            "recordingUrl": r["recording_url"],
+            "recordUrl": r["record_url"],
             "time": _ago(r["started_at"]),
         }
         for r in rows
     ]
+
+
+def past_calls_for(caller_key: str, limit: int = 3) -> list[dict]:
+    """This caller's earlier calls that have a summary, newest first."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT name, summary, started_at FROM calls
+               WHERE caller_key = ? AND summary IS NOT NULL AND summary != ''
+               ORDER BY started_at DESC LIMIT ?""",
+            (caller_key, limit),
+        ).fetchall()
+    return [{"name": r["name"], "summary": r["summary"], "time": _ago(r["started_at"])}
+            for r in rows]
 
 
 def get_conversations() -> list[dict]:
@@ -532,7 +578,11 @@ ALLOWLIST_KEY = "auto_reply_allowlist"
 
 
 def _digits(s: str) -> str:
-    return "".join(ch for ch in s if ch.isdigit())
+    # unicodedata.digit, not the char itself: speech-to-text may write a Hindi
+    # number in Devanagari numerals (९८११...), which WhatsApp can't dial.
+    import unicodedata
+
+    return "".join(str(unicodedata.digit(ch)) for ch in s if ch.isdigit())
 
 
 def get_allowlist() -> list[str]:
@@ -1435,3 +1485,126 @@ def messages_for(phone: str, limit: int = 300) -> list[str]:
         ).fetchall()
     return [f"[{_ago(r['created_at'])}] {'Customer' if r['sender'] == 'them' else 'Us'}: {r['body']}"
             for r in rows]
+
+
+# --- evals ----------------------------------------------------------------
+
+def add_eval_case(name: str, agent_id: int | None, mode: str, turns: str, persona: str,
+                  max_turns: int, rubric: str) -> int:
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO eval_cases (name, agent_id, mode, turns, persona, max_turns,
+                                       rubric, created_at) VALUES (?,?,?,?,?,?,?,?)""",
+            (name, agent_id, mode, turns, persona, max_turns, rubric,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        return cur.lastrowid
+
+
+def _eval_run_row(r) -> dict:
+    import json
+
+    return {"id": r["id"], "passed": bool(r["passed"]), "reason": r["reason"] or "",
+            "transcript": r["transcript"] or "", "tools": json.loads(r["tools"] or "[]"),
+            "time": _ago(r["created_at"])}
+
+
+def get_eval_case(case_id: int) -> dict | None:
+    with connect() as conn:
+        r = conn.execute("SELECT * FROM eval_cases WHERE id = ?", (case_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def get_eval_cases() -> list[dict]:
+    with connect() as conn:
+        cases = conn.execute("SELECT * FROM eval_cases ORDER BY id DESC").fetchall()
+        out = []
+        for c in cases:
+            last = conn.execute(
+                "SELECT * FROM eval_runs WHERE case_id = ? ORDER BY id DESC LIMIT 1", (c["id"],)
+            ).fetchone()
+            out.append({
+                "id": c["id"], "name": c["name"], "agentId": c["agent_id"], "mode": c["mode"],
+                "turns": c["turns"] or "", "persona": c["persona"] or "",
+                "maxTurns": c["max_turns"], "rubric": c["rubric"],
+                "lastRun": _eval_run_row(last) if last else None,
+            })
+    return out
+
+
+def add_eval_run(case_id: int, passed: bool, reason: str, transcript: str,
+                 tools: list[dict]) -> dict:
+    import json
+
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO eval_runs (case_id, passed, reason, transcript, tools, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (case_id, int(passed), reason, transcript, json.dumps(tools, ensure_ascii=False),
+             datetime.now(timezone.utc).isoformat()),
+        )
+        r = conn.execute("SELECT * FROM eval_runs WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return _eval_run_row(r)
+
+
+def delete_eval_case(case_id: int) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM eval_runs WHERE case_id = ?", (case_id,))
+        conn.execute("DELETE FROM eval_cases WHERE id = ?", (case_id,))
+
+
+# --- owner-started WhatsApp threads ---------------------------------------
+
+def normalize_phone(raw: str) -> str:
+    """Spoken/typed number -> the digits WhatsApp uses ("98123 45678" -> 919812345678).
+
+    Incoming messages arrive keyed as country code + number, so an outgoing
+    thread must use the same form or the reply lands in a different thread.
+    """
+    d = _digits(raw or "")
+    if len(d) == 11 and d.startswith("0"):
+        d = d[1:]
+    if len(d) == 10:
+        d = "91" + d
+    return d
+
+
+def assign_conversation(phone: str, agent_id: int | None, goal: str, name: str | None = None) -> None:
+    """Hand a WhatsApp thread to an agent with a goal, and make sure it will
+    actually auto-reply there — an allowlist or a per-thread "off" would
+    otherwise silently stop the agent the owner just asked to talk."""
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO conversations (name, phone, updated_at) VALUES (?,?,?)
+               ON CONFLICT(phone) DO NOTHING""",
+            (name or phone, phone, now),
+        )
+        conn.execute(
+            "UPDATE conversations SET agent_id = ?, goal = ?, auto_reply = 1 WHERE phone = ?",
+            (agent_id, goal or None, phone),
+        )
+    if get_allowlist() and not allowed(phone):
+        set_allowlist([*get_allowlist(), phone])
+
+
+def conversation_brief(phone: str) -> dict:
+    """The agent and goal the owner set for this thread, if any."""
+    with connect() as conn:
+        r = conn.execute(
+            "SELECT agent_id, goal FROM conversations WHERE phone = ?", (phone,)
+        ).fetchone()
+    return {"agent_id": r["agent_id"], "goal": r["goal"]} if r else {"agent_id": None, "goal": None}
+
+
+def set_thread_auto_reply(phone: str, enabled: bool) -> None:
+    """Per-number auto-reply, creating the thread if this number never wrote yet
+    (set_auto_reply_for only touches existing threads)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO conversations (name, phone, updated_at) VALUES (?,?,?)
+               ON CONFLICT(phone) DO NOTHING""",
+            (phone, phone, now),
+        )
+        conn.execute("UPDATE conversations SET auto_reply = ? WHERE phone = ?", (int(enabled), phone))

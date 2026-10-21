@@ -22,7 +22,6 @@ Install once (CPU wheels, ~250 MB download):
 
 import logging
 import os
-import shutil
 import subprocess
 import threading
 import uuid
@@ -62,12 +61,9 @@ def available() -> bool:
 
 
 def _ffmpeg() -> str | None:
-    try:
-        import imageio_ffmpeg
+    from recording import ffmpeg_exe
 
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:  # noqa: BLE001 - fall back to a system ffmpeg
-        return shutil.which("ffmpeg")
+    return ffmpeg_exe()
 
 
 # ── audio in / out ──────────────────────────────────────────────────────

@@ -66,6 +66,10 @@ def embeddings_ready() -> bool:
 # Cosine below this on the top semantic hit means "weak" — the corrective step
 # reformulates the query and retries instead of trusting a poor match.
 WEAK_HIT = 0.45
+# Below this, with no keyword overlap either, the best chunk is unrelated —
+# measured: off-topic queries score 0.11-0.22, real ones ~0.40. Return nothing;
+# the agent's search_knowledge tool can still look again with a better query.
+MIN_SIM = float(os.getenv("KB_MIN_SIM") or 0.30)
 
 # Devanagari → Latin (Hunterian-ish) for the CORRECTIVE step. Proper names are
 # transliterations, not translations, so the embedding model never aligns
@@ -332,13 +336,19 @@ def search(agent_id: int | None, query: str, k: int = TOP_K) -> list[str]:
         # drift ("puja"≈"Pooja"); fused equally, a name that is strong in EITHER
         # wins over a wrong name strong in only one.
         alt_sem = _semantic_scored(agent_id, roman, max(k * 3, 8))
-        lists = [(_bm25_ranked(chunks, roman, k * 3), 1.0)]
+        keyword = _bm25_ranked(chunks, roman, k * 3)
+        if not keyword and (not alt_sem or alt_sem[0][1] < MIN_SIM) and top_score < MIN_SIM:
+            return []
+        lists = [(keyword, 1.0)]
         if alt_sem:
             lists.append(([t for t, _ in alt_sem], 1.0))
         return _rrf(lists, k)
 
     # Weak English/Hinglish hit: fuse semantic + keyword on the original query.
-    return _rrf([(sem_list, 1.0), (_bm25_ranked(chunks, query, k * 3), 1.0)], k)
+    keyword = _bm25_ranked(chunks, query, k * 3)
+    if not keyword and top_score < MIN_SIM:
+        return []  # nothing relevant — an off-topic chunk in the prompt invites a made-up answer
+    return _rrf([(sem_list, 1.0), (keyword, 1.0)], k)
 
 
 def context_block(agent_id: int | None, query: str) -> str:

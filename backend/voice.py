@@ -251,12 +251,48 @@ async def _cartesia_library() -> list[dict]:
 
 # ── speech ──────────────────────────────────────────────────────────────
 
+# Read-aloud clean-up. The text on screen stays as written; only what the voice
+# says changes. Each rule is a measured mis-reading (Edge Hindi voices,
+# re-transcribed with Whisper):
+#   "batayein.Ji"      -> "batayein DOT ji"   (a period with no space after it)
+#   "BILL-0001"        -> "bill bill 00001"
+#   "V-O-I-C-E"        -> letters spelled one by one
+#   "(Waiting for …)"  -> the model's own stage note, read out loud
+_ACRONYMS = {"AI", "GST", "UPI", "OTP", "PDF", "EMI", "SMS", "HOD", "CSE", "ID", "OK", "TV", "AC", "KYC", "PAN"}
+_SPEECH_RULES = [
+    (re.compile(r"\((?:waiting|note|pause|thinking|silence)[^)]*\)\.?", re.I), " "),
+    (re.compile(r"[*_#`~]+"), ""),                                   # markdown
+    (re.compile(r"[“”\"«»]"), ""),                                    # quote marks
+    (re.compile(r"\s*[—–]\s*"), ", "),                               # dashes -> pause
+    (re.compile(r"(?<=\w)[‑‐](?=\w)"), " "),                         # "10‑digit"
+    (re.compile(r"\b(?:[A-Za-z]-){2,}[A-Za-z]\b"), lambda m: m.group(0).replace("-", "")),
+    (re.compile(r"\b([A-Za-z]+)\s+\1-0*(\d+)\b", re.I), r"\1 \2"),   # "Bill BILL-0001" -> "Bill 1"
+    (re.compile(r"\b([A-Za-z]+)-0*(\d+)\b"), r"\1 \2"),              # BILL-0001 -> BILL 1
+    (re.compile(r"₹\s*(\d(?:[\d,]*\d)?(?:\.\d+)?)"), r"\1 rupaye"),
+    (re.compile(r"\bRs\.?\s*(\d(?:[\d,]*\d)?(?:\.\d+)?)", re.I), r"\1 rupaye"),
+    (re.compile(r"(?<=[^\s\d.])([.!?।])(?=[^\s\d.!?।)])"), r"\1 "),  # "hai.Ji" -> "hai. Ji"
+    (re.compile(r"[()\[\]]"), " "),
+]
+
+
+def speakable(text: str) -> str:
+    """`text` as it should be SAID — see the rules above."""
+    for pattern, repl in _SPEECH_RULES:
+        text = pattern.sub(repl, text)
+    # ALL-CAPS words are a shout or STT noise ("VICE FLOW"), not an acronym —
+    # say them as words. Real acronyms keep their letters.
+    text = re.sub(r"\b[A-Z]{3,}\b", lambda m: m.group(0) if m.group(0) in _ACRONYMS
+                  else m.group(0).capitalize(), text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
 async def synthesize(text: str, language: str | None = None,
                      as_voice: str | None = None) -> bytes:
     """Speak `text`. Returns mp3 bytes.
 
     `as_voice` auditions a specific voice without changing the saved one.
     """
+    text = speakable(text) or text
     vid = as_voice or voice_id()
     if not vid:
         raise RuntimeError("No voice selected — pick one in Voice Studio first")
@@ -304,9 +340,13 @@ async def _clone_speak(text: str, vid: str, locale: str) -> bytes:
     base_voice = by_language.get(locale) or by_language[DEFAULT_LANGUAGE]
     base = await _edge_speak(text, base_voice, locale)
     try:
-        return await asyncio.to_thread(cloning.convert, base, vid[len(CLONE_PREFIX):])
+        clone_timeout = float(os.getenv("CLONE_TIMEOUT_SECONDS", "4.0"))
+        return await asyncio.wait_for(
+            asyncio.to_thread(cloning.convert, base, vid[len(CLONE_PREFIX):]),
+            timeout=clone_timeout,
+        )
     except Exception as e:  # noqa: BLE001 - a stock voice beats a silent turn
-        log.warning("clone conversion failed, speaking the base voice: %s", e)
+        log.warning("clone conversion failed or timed out (%s), speaking the base voice: %s", type(e).__name__, e)
         return base
 
 

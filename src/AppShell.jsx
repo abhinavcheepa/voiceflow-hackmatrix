@@ -14,6 +14,7 @@ import {
   Package,
   Receipt,
   Brain,
+  FlaskConical,
 } from "lucide-react";
 import { Logo } from "./ui.jsx";
 import { useApi } from "./api.js";
@@ -49,6 +50,7 @@ const groups = [
       { to: "/app/contacts", icon: Users, label: "Contacts" },
       { to: "/app/campaigns", icon: Megaphone, label: "Campaigns" },
       { to: "/app/voice-studio", icon: Mic, label: "Voice Studio" },
+      { to: "/app/tests", icon: FlaskConical, label: "Tests" },
     ],
   },
 ];

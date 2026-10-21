@@ -227,10 +227,14 @@ async def reply_to(sender: str, name: str | None, incoming: str, is_voice: bool,
     # agent can greet them properly instead of guessing.
     # WhatsApp replies draw on the default agent's knowledge base, if any, and
     # can record a booking or escalation tied to this sender.
-    agent = db.get_agent() or {}
+    # A thread the owner handed to a specific agent (via the assistant) is
+    # answered by that agent, with the goal the owner gave it.
+    brief = db.conversation_brief(sender)
+    agent = (db.get_agent(brief["agent_id"]) if brief["agent_id"] else None) or db.get_agent() or {}
     kb_context = kb.context_block(agent.get("id"), incoming)
     answer = await brain.reply(
         sender, incoming, customer=name, kb_context=kb_context,
+        prompt=brain.system_prompt(name, agent, brief["goal"]),
         tools_ctx={"phone": sender, "name": name, "channel": "whatsapp",
                    "agent_id": agent.get("id")},
         agent_id=agent.get("id"),

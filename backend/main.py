@@ -44,12 +44,13 @@ from fastapi import (  # noqa: E402
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import JSONResponse  # noqa: E402
+from fastapi.responses import FileResponse, JSONResponse  # noqa: E402
 
 import asterisk_ari  # noqa: E402
 import brain  # noqa: E402
 import db  # noqa: E402
 import kb  # noqa: E402
+import recording  # noqa: E402
 import vapi  # noqa: E402
 import voice  # noqa: E402
 import webcall  # noqa: E402
@@ -143,6 +144,30 @@ def stats() -> dict:
 @app.get("/api/calls")
 def calls(limit: int = 50) -> list[dict]:
     return db.get_calls(limit)
+
+
+def _call_file(call_id: str, ext: str) -> str:
+    try:
+        p = recording.path(call_id, ext)
+    except ValueError:
+        raise HTTPException(400, "Bad call id")
+    if not os.path.exists(p):
+        raise HTTPException(404, "No such recording")
+    return p
+
+
+@app.get("/api/calls/{call_id}/recording")
+def call_recording(call_id: str) -> FileResponse:
+    """The whole call as one mp3 — caller and agent, in order."""
+    return FileResponse(_call_file(call_id, "mp3"), media_type="audio/mpeg",
+                        filename=f"{call_id}.mp3", content_disposition_type="inline")
+
+
+@app.get("/api/calls/{call_id}/record.txt")
+def call_record(call_id: str) -> FileResponse:
+    """Plain-text record: details, summary, timestamped transcript."""
+    return FileResponse(_call_file(call_id, "txt"), media_type="text/plain; charset=utf-8",
+                        filename=f"{call_id}.txt")
 
 
 @app.get("/api/calls-by-hour")
@@ -724,6 +749,53 @@ def learned_delete(learned_id: int) -> dict:
     return {"ok": True}
 
 
+# --- evals / simulations ------------------------------------------------
+
+@app.get("/api/evals")
+def evals_list() -> list[dict]:
+    return db.get_eval_cases()
+
+
+@app.post("/api/evals")
+def eval_create(
+    name: str = Body(...),
+    rubric: str = Body(...),
+    mode: str = Body("script"),
+    agent_id: int | None = Body(None),
+    turns: str = Body(""),
+    persona: str = Body(""),
+    max_turns: int = Body(4),
+) -> dict:
+    if mode not in ("script", "simulate"):
+        raise HTTPException(400, "mode must be 'script' or 'simulate'")
+    if mode == "script" and not turns.strip():
+        raise HTTPException(400, "A script test needs at least one caller line")
+    if mode == "simulate" and not persona.strip():
+        raise HTTPException(400, "A simulation needs a caller persona")
+    if not name.strip() or not rubric.strip():
+        raise HTTPException(400, "Name and pass criteria are required")
+    # Bounded: each simulated turn is two model calls on a per-minute budget.
+    max_turns = min(max(max_turns, 1), 8)
+    case_id = db.add_eval_case(name.strip(), agent_id, mode, turns, persona, max_turns, rubric)
+    return {"id": case_id}
+
+
+@app.post("/api/evals/{case_id}/run")
+async def eval_run(case_id: int) -> dict:
+    import evals
+
+    case = db.get_eval_case(case_id)
+    if not case:
+        raise HTTPException(404, "No such test")
+    return await evals.run_case(case)
+
+
+@app.delete("/api/evals/{case_id}")
+def eval_delete(case_id: int) -> dict:
+    db.delete_eval_case(case_id)
+    return {"ok": True}
+
+
 # --- web calling --------------------------------------------------------
 
 @app.websocket("/api/web-call/ws")
@@ -731,7 +803,14 @@ async def web_call(ws: WebSocket) -> None:
     """Talk to the agent from the browser. One socket per call."""
     await ws.accept()
     agent_id = ws.query_params.get("agent")
-    session = webcall.Session(int(agent_id) if agent_id else None)
+    assistant = ws.query_params.get("mode") == "assistant"
+    if assistant and not await _owner_ok(ws):
+        await ws.send_json({"type": "error", "text": "Assistant mode needs the owner PIN "
+                            "(ASSISTANT_PIN in backend/.env) when used from another device."})
+        await ws.close()
+        return
+    session = webcall.Session(int(agent_id) if agent_id else None,
+                              caller_key=ws.query_params.get("caller"), assistant=assistant)
     session.open_record()
     await ws.send_json(
         {"type": "connected", "callId": session.id, "agent": session.agent.get("name", "")}
@@ -746,10 +825,16 @@ async def web_call(ws: WebSocket) -> None:
             if "text" in message:
                 try:
                     import json
-                    if json.loads(message["text"]).get("type") == "ping":
-                        await ws.send_json({"type": "pong"})
+                    payload = json.loads(message["text"])
+                    kind = payload.get("type")
                 except Exception:
-                    pass
+                    payload, kind = {}, None
+                if kind == "ping":
+                    await ws.send_json({"type": "pong"})
+                elif kind == "barge":
+                    session.interrupted()
+                elif kind == "say" and isinstance(payload.get("text"), str):
+                    await webcall.respond(ws, session, payload["text"])
                 continue
             if (audio := message.get("bytes")) is not None:
                 await webcall.handle_turn(ws, session, audio)
@@ -757,12 +842,53 @@ async def web_call(ws: WebSocket) -> None:
         pass
     finally:
         session.close_record()
-        # Enrich with our own post-call analysis. Separate from close_record so a
-        # slow or failed analysis never costs us the basic call record.
-        try:
-            await webcall.analyse_and_store(session)
-        except Exception as e:  # noqa: BLE001
-            log.warning("post-call analysis skipped for %s: %s", session.id, e)
+        # Analysis, stitched recording and text record — as their own task, not
+        # awaited here. This handler can be cancelled the moment the socket
+        # goes, and an await in its `finally` died with it: the call kept its
+        # segments but never got a summary, an mp3 or a text record.
+        task = asyncio.create_task(_finalize(session))
+        _finalizing.add(task)  # a bare task can be garbage-collected mid-run
+        task.add_done_callback(_finalizing.discard)
+
+
+_finalizing: set[asyncio.Task] = set()
+
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+async def _owner_ok(ws: WebSocket) -> bool:
+    """May this socket drive the owner assistant? It can message any number,
+    so it is not open to whoever reaches the port.
+
+    On this machine (directly, or through the Vite proxy from this machine):
+    yes. From anywhere else — a phone on the Wi-Fi — the first message must
+    carry ASSISTANT_PIN; with no PIN configured, remote use is refused.
+    """
+    origin = ws.client.host if ws.client else ""
+    # X-Forwarded-For is only believed when the hop itself is local (our Vite
+    # proxy); from anyone else it's a header they could simply type.
+    fwd = ws.headers.get("x-forwarded-for", "")
+    if origin in _LOOPBACK and fwd:
+        origin = fwd.split(",")[0].strip()
+    if origin in _LOOPBACK:
+        return True
+    pin = os.getenv("ASSISTANT_PIN", "")
+    if not pin:
+        return False
+    try:
+        first = await asyncio.wait_for(ws.receive_json(), timeout=15)
+    except Exception:  # noqa: BLE001 - timeout, bad json, disconnect: all a no
+        return False
+    import hmac
+
+    return first.get("type") == "auth" and hmac.compare_digest(str(first.get("pin", "")), pin)
+
+
+async def _finalize(session) -> None:
+    try:
+        await webcall.finalize(session)
+    except Exception as e:  # noqa: BLE001
+        log.warning("post-call processing failed for %s: %s", session.id, e)
 
 
 # --- vapi webhook -------------------------------------------------------
