@@ -57,6 +57,7 @@ import webcall  # noqa: E402
 import whatsapp  # noqa: E402
 import whatsapp_web  # noqa: E402
 import adaptive  # noqa: E402
+import auth
 from auth import TokenAuthMiddleware  # noqa: E402
 import events  # noqa: E402
 import push  # noqa: E402
