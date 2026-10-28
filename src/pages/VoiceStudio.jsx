@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Mic, Square, Check, Play, Trash2, Loader2, Lock, ChevronDown } from "lucide-react";
 import { Card, Waveform } from "../ui.jsx";
-import { API, useApi, post, put } from "../api.js";
+import { API, getApiToken, useApi, post, put } from "../api.js";
 
 const PROMPTS = [
   "Namaste! VoiceFlow clinic mein aapka swagat hai. Main aapki kaise madad kar sakta hoon?",
@@ -27,9 +27,13 @@ function VoicePicker({ profile, onPicked }) {
     try {
       // Audition only — previewing must NOT change which voice the agent uses.
       // Listening to six voices should not leave you on the last one you played.
+      const token = getApiToken();
       const r = await fetch(`${API}/api/voice/preview`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({ text: PROMPTS[0], voice_id: v.id, language: v.language }),
       });
       if (!r.ok) throw new Error((await r.json()).detail);
@@ -194,7 +198,12 @@ function CloneYourVoice({ profile, onCloned }) {
     form.append("gender", gender);
     clips.forEach((c, i) => form.append("samples", c.blob, `sample-${i}.webm`));
     try {
-      const r = await fetch(`${API}/api/voice/clone`, { method: "POST", body: form });
+      const token = getApiToken();
+      const r = await fetch(`${API}/api/voice/clone`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: form,
+      });
       const body = await r.json();
       if (!r.ok) throw new Error(body.detail ?? r.statusText);
       onCloned();
@@ -320,9 +329,13 @@ function Preview() {
     setBusy(true);
     setError(null);
     try {
+      const token = getApiToken();
       const r = await fetch(`${API}/api/voice/preview`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({ text }),
       });
       if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);

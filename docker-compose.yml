@@ -1,0 +1,78 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - ENV=production
+      - DB_PATH=/data/voiceflow.db
+      - WA_BRIDGE_URL=http://wa-bridge:8100
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:5174,http://localhost:5173,https://${DOMAIN:-localhost}}
+    volumes:
+      # Persistent SQLite database volume - survives container upgrades & restarts
+      - voiceflow_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  wa-bridge:
+    build:
+      context: ./wa-bridge
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8100:8100"
+    env_file:
+      - .env
+    environment:
+      - BACKEND_URL=http://backend:8000
+    volumes:
+      # Persistent WhatsApp Web session - scan QR code once, stays authenticated
+      - wa_session:/app/.session
+    depends_on:
+      - backend
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./dist:/srv/voiceflow:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+
+  # --- Asterisk (Optional Telephony) ---
+  # Asterisk PBX requires network_mode: host so RTP UDP audio ports (10000-20000)
+  # pass through without Docker NAT overhead.
+  # If using a separate bare-metal or cloud Asterisk install, set ASTERISK_ARI_URL
+  # and ASTERISK_SIP_TRUNK in your .env pointing at that machine.
+  #
+  # asterisk:
+  #   image: andrius/asterisk:latest
+  #   network_mode: host
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./asterisk/etc:/etc/asterisk
+
+volumes:
+  voiceflow_data:
+    name: voiceflow_data
+  wa_session:
+    name: voiceflow_wa_session
+  caddy_data:
+  caddy_config:

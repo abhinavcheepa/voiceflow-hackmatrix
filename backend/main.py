@@ -57,6 +57,10 @@ import webcall  # noqa: E402
 import whatsapp  # noqa: E402
 import whatsapp_web  # noqa: E402
 import adaptive  # noqa: E402
+from auth import TokenAuthMiddleware  # noqa: E402
+import events  # noqa: E402
+import push  # noqa: E402
+import worker  # noqa: E402
 
 app = FastAPI(title="VoiceFlow AI", version="0.1.0")
 
@@ -89,9 +93,10 @@ async def surface_errors(request: Request, call_next):
         return JSONResponse({"detail": f"{type(e).__name__}: {e}"}, status_code=500)
 
 
+app.add_middleware(TokenAuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5174").split(","),
+    allow_origins=[o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5174,http://localhost:5173").split(",") if o.strip()],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -99,6 +104,8 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup() -> None:
+    if auth.IS_PROD and not auth.API_TOKEN:
+        raise RuntimeError("FATAL: API_TOKEN must be configured when ENV=production")
     db.init()
     # Anything that arrived while we were down, or whose reply threw, still
     # deserves an answer — once now, then on a timer.
@@ -108,6 +115,7 @@ async def startup() -> None:
     if asterisk_ari.configured():
         asyncio.create_task(asterisk_ari.listen())
     asyncio.create_task(voice.warm_up())
+    asyncio.create_task(worker.run_forever())
 
 
 @app.on_event("shutdown")
@@ -131,8 +139,87 @@ def health() -> dict:
         # Empty until the first reply. The per-minute token cap is the ceiling
         # a live call actually runs into, and it is invisible otherwise.
         "budget": brain.budget,
+        "worker": worker.state(),
+        "push": push.configured(),
+        "sseClients": events.client_count(),
+        "pendingJobs": db.get_pending_jobs_count(),
+        "automation": worker.automation_enabled(),
     }
 
+
+
+
+# --- events, push & system controls -------------------------------------
+
+@app.post("/api/events/ticket")
+def sse_ticket() -> dict:
+    """Issue a 60-second single-use ticket to connect to the SSE stream.
+
+    Protected by TokenAuthMiddleware (requires Bearer API_TOKEN).
+    The real API token never appears in the EventSource URL or proxy logs.
+    """
+    return {"ticket": events.create_ticket()}
+
+
+@app.get("/api/events")
+async def sse_events(request: Request):
+    """Server-Sent Events stream for real-time dashboard updates."""
+    return await events.sse_endpoint(request)
+
+
+@app.get("/api/push/vapid-key")
+def push_vapid_key() -> dict:
+    return {"publicKey": push.VAPID_PUBLIC_KEY}
+
+
+@app.post("/api/push/subscribe")
+def push_subscribe(subscription: dict = Body(...)) -> dict:
+    try:
+        push.subscribe(subscription)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/push/unsubscribe")
+def push_unsubscribe(payload: dict = Body(...)) -> dict:
+    endpoint = payload.get("endpoint", "")
+    if endpoint:
+        push.unsubscribe(endpoint)
+    return {"ok": True}
+
+
+@app.post("/api/push/test")
+def push_test() -> dict:
+    sent = push.notify("VoiceFlow AI Test", "Push notifications are working!", {"url": "/app"})
+    return {"ok": True, "sent": sent}
+
+
+@app.get("/api/system/status")
+def system_status() -> dict:
+    return {
+        "automation": worker.automation_enabled(),
+        "whatsappAutoReply": db.auto_reply_global(),
+        "worker": worker.state(),
+        "pendingJobs": db.get_pending_jobs_count(),
+        "recentJobs": db.get_recent_jobs(10),
+    }
+
+
+@app.post("/api/system/controls")
+def system_controls(
+    automation: bool | None = Body(None),
+    whatsapp_auto_reply: bool | None = Body(None),
+) -> dict:
+    if automation is not None:
+        worker.set_automation_enabled(automation)
+    if whatsapp_auto_reply is not None:
+        db.set_auto_reply_global(whatsapp_auto_reply)
+        events.broadcast("status_change", {"whatsappAutoReply": whatsapp_auto_reply})
+    return {
+        "automation": worker.automation_enabled(),
+        "whatsappAutoReply": db.auto_reply_global(),
+    }
 
 # --- dashboard ----------------------------------------------------------
 
@@ -226,7 +313,16 @@ async def whatsapp_receive(request: Request, tasks: BackgroundTasks) -> dict:
     Meta retries anything it doesn't get a 200 for within seconds, and a full
     reply (transcribe -> LLM -> synthesise -> upload) takes longer than that.
     """
-    for message in whatsapp.parse(await request.json()):
+    raw_body = await request.body()
+    sig = request.headers.get("x-hub-signature-256")
+    if not whatsapp.verify_signature(raw_body, sig):
+        raise HTTPException(401, "invalid webhook signature")
+    import json
+    try:
+        payload = json.loads(raw_body)
+    except Exception:
+        raise HTTPException(400, "invalid json payload")
+    for message in whatsapp.parse(payload):
         tasks.add_task(whatsapp.handle, message)
     return {"ok": True}
 
@@ -236,8 +332,9 @@ async def whatsapp_web_incoming(
     request: Request, tasks: BackgroundTasks, x_bridge_token: str | None = Header(default=None)
 ) -> dict:
     """Inbound from the local wa-bridge. Same pipeline as the Meta webhook."""
-    if whatsapp_web.TOKEN and x_bridge_token != whatsapp_web.TOKEN:
-        raise HTTPException(401, "bad bridge token")
+    import hmac
+    if not whatsapp_web.TOKEN or not x_bridge_token or not hmac.compare_digest(x_bridge_token, whatsapp_web.TOKEN):
+        raise HTTPException(401, "bad or missing bridge token")
     tasks.add_task(whatsapp.handle, whatsapp_web.parse(await request.json()))
     return {"ok": True}
 
@@ -345,6 +442,7 @@ async def whatsapp_send(to: str = Body(...), text: str = Body(...)) -> dict:
     except RuntimeError as e:
         raise HTTPException(503, str(e))
     db.add_message(to, "us", "text", text)
+    events.broadcast("message_update", {"phone": to, "direction": "us"})
     return result
 
 
@@ -610,6 +708,11 @@ async def _run_campaign(campaign_id: int) -> None:
     get rate-limited or flagged for spam on the first run.
     """
     while (target := db.next_pending_target(campaign_id)):
+        if not worker.automation_enabled():
+            log.info("campaign %d paused: automation disabled globally", campaign_id)
+            db.set_campaign_status(campaign_id, "paused")
+            events.broadcast("status_change", {"campaign_paused": campaign_id})
+            return
         if db.get_campaigns() and next(
             (c for c in db.get_campaigns() if c["id"] == campaign_id), {}
         ).get("status") != "running":
@@ -887,6 +990,7 @@ async def _owner_ok(ws: WebSocket) -> bool:
 async def _finalize(session) -> None:
     try:
         await webcall.finalize(session)
+        events.broadcast("call_update", {"callId": session.id, "status": "ended"})
     except Exception as e:  # noqa: BLE001
         log.warning("post-call processing failed for %s: %s", session.id, e)
 
@@ -905,8 +1009,9 @@ OUTCOME_BY_REASON = {
 
 @app.post("/api/vapi/webhook")
 async def webhook(request: Request, x_vapi_secret: str | None = Header(default=None)) -> dict:
-    if vapi.WEBHOOK_SECRET and x_vapi_secret != vapi.WEBHOOK_SECRET:
-        raise HTTPException(401, "bad webhook secret")
+    import hmac
+    if not vapi.WEBHOOK_SECRET or not x_vapi_secret or not hmac.compare_digest(x_vapi_secret, vapi.WEBHOOK_SECRET):
+        raise HTTPException(401, "bad or missing webhook secret")
 
     msg = (await request.json()).get("message", {})
     kind = msg.get("type")
@@ -971,6 +1076,10 @@ def _save_report(msg: dict) -> None:
         recording_url=artifact.get("recordingUrl") or msg.get("recordingUrl"),
         started_at=call.get("startedAt") or datetime.now().astimezone().isoformat(),
     )
+    caller_phone = _caller(call)
+    call_outcome = structured.get("outcome") or OUTCOME_BY_REASON.get(msg.get("endedReason", ""), "Answered")
+    events.broadcast("call_update", {"callId": call.get("id", ""), "phone": caller_phone, "status": "ended", "outcome": call_outcome})
+    push.notify("Call Completed", f"Call with {caller_phone} ({call_outcome})", {"url": "/app/calls"}, tag="call")
 
 
 def _run_tools(msg: dict) -> list[dict]:

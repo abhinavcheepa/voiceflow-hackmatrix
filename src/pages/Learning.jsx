@@ -1,6 +1,6 @@
 import { Brain, Check, X, Trash2, Sparkles, MessageSquare, Bot } from "lucide-react";
 import { Card, EmptyState } from "../ui.jsx";
-import { API, useApi, put } from "../api.js";
+import { del, useApi, put } from "../api.js";
 
 const SOURCE_STYLE = {
   conversation: { icon: MessageSquare, label: "From call", color: "text-violet-soft" },
@@ -27,7 +27,7 @@ export default function Learning() {
   }
 
   async function remove(id) {
-    await fetch(`${API}/api/learned/${id}`, { method: "DELETE" });
+    await del(`/api/learned/${id}`);
     reload();
   }
 

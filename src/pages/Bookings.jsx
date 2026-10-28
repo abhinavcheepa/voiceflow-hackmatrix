@@ -1,6 +1,6 @@
 import { CalendarCheck, Trash2, AlertTriangle, Phone, MessageSquare } from "lucide-react";
 import { Card, EmptyState } from "../ui.jsx";
-import { API, useApi } from "../api.js";
+import { del, useApi } from "../api.js";
 
 const CHANNEL = {
   call: { icon: Phone, label: "Web call" },
@@ -11,7 +11,7 @@ export default function Bookings() {
   const { data: rows, reload } = useApi("/api/bookings", [], 8000);
 
   async function remove(id) {
-    await fetch(`${API}/api/bookings/${id}`, { method: "DELETE" });
+    await del(`/api/bookings/${id}`);
     reload();
   }
 

@@ -26,7 +26,7 @@ const { Client, LocalAuth, MessageMedia } = pkg;
 
 const PORT = Number(process.env.BRIDGE_PORT || 8100);
 const BACKEND = (process.env.BACKEND_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
-const TOKEN = process.env.BRIDGE_TOKEN || "";
+const TOKEN = process.env.BRIDGE_SECRET || process.env.BRIDGE_TOKEN || "";
 
 // Everything the backend needs to know about the link, in one place.
 const state = {
@@ -71,6 +71,7 @@ function findChrome() {
     `${process.env.LOCALAPPDATA}/Google/Chrome/Application/chrome.exe`,
     "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
     "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
   ];
