@@ -15,7 +15,7 @@ import os
 import httpx
 
 BRIDGE_URL = (os.getenv("WA_BRIDGE_URL") or "http://127.0.0.1:8100").rstrip("/")
-TOKEN = os.getenv("WA_BRIDGE_TOKEN") or ""
+TOKEN = os.getenv("BRIDGE_SECRET") or os.getenv("WA_BRIDGE_TOKEN") or ""
 
 
 def configured() -> bool:

@@ -9,7 +9,9 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
-DB_PATH = os.getenv("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "voiceflow.db"))
+DB_PATH = os.getenv("DB_PATH") or os.getenv("DATABASE_PATH") or os.path.join(os.path.dirname(__file__), "voiceflow.db")
+if os.path.dirname(DB_PATH):
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls (
@@ -232,6 +234,30 @@ CREATE TABLE IF NOT EXISTS bill_items (
     amount      REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_bill_items_bill ON bill_items(bill_id);
+
+-- Web Push subscriptions — the browser sends its PushSubscription object.
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    endpoint         TEXT PRIMARY KEY,
+    subscription_json TEXT NOT NULL,
+    created_at       TEXT NOT NULL
+);
+
+-- Scheduled / queued background jobs. Atomic claiming:
+--   UPDATE ... WHERE status='pending' AND run_at<=now LIMIT 1
+-- makes this safe even if two processes read the table at the same moment.
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_type   TEXT NOT NULL,
+    payload    TEXT NOT NULL DEFAULT '{}',
+    status     TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','done','failed')),
+    run_at     TEXT NOT NULL,
+    claimed_at TEXT,
+    finished_at TEXT,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    error      TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_pending ON scheduled_jobs(status, run_at);
 """
 
 # Outcomes that count toward the success rate on the dashboard.
@@ -240,7 +266,7 @@ SUCCESS_OUTCOMES = ("Booked", "Lead captured", "Answered")
 
 @contextmanager
 def connect():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -280,6 +306,7 @@ MIGRATIONS = [
     # answers it and what it is trying to achieve there.
     ("conversations", "agent_id", "INTEGER"),
     ("conversations", "goal", "TEXT"),
+    ("scheduled_jobs", "attempts", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -294,6 +321,10 @@ def _migrate(conn) -> None:
 
 def init() -> None:
     with connect() as conn:
+        # WAL mode: allows concurrent readers while a writer holds the lock.
+        # Critical for a single-worker uvicorn serving both API reads and the
+        # background worker writing jobs — without it, readers block on writes.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
         _migrate(conn)
     ensure_default_agent()
@@ -638,6 +669,8 @@ def auto_reply_block(phone: str) -> str | None:
     An unknown number defaults to on: a first-time customer should get an
     answer, not silence.
     """
+    if get_setting("automation_enabled", "on") != "on":
+        return "automation is disabled globally"
     if not auto_reply_global():
         return "auto-reply is switched off globally"
     if not allowed(phone):
@@ -1608,3 +1641,127 @@ def set_thread_auto_reply(phone: str, enabled: bool) -> None:
             (phone, phone, now),
         )
         conn.execute("UPDATE conversations SET auto_reply = ? WHERE phone = ?", (int(enabled), phone))
+
+# --- push subscriptions ---------------------------------------------------
+
+def upsert_push_subscription(endpoint: str, subscription_json: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO push_subscriptions (endpoint, subscription_json, created_at)
+               VALUES (?,?,?) ON CONFLICT(endpoint) DO UPDATE SET subscription_json = excluded.subscription_json""",
+            (endpoint, subscription_json, now),
+        )
+
+
+def delete_push_subscription(endpoint: str) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM push_subscriptions WHERE endpoint = ?", (endpoint,))
+
+
+def get_push_subscriptions() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute("SELECT endpoint, subscription_json FROM push_subscriptions").fetchall()
+    return [dict(r) for r in rows]
+
+
+# --- scheduled jobs -------------------------------------------------------
+
+def add_job(job_type: str, payload: dict, run_at: str) -> int:
+    import json
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO scheduled_jobs (job_type, payload, run_at, created_at)
+               VALUES (?,?,?,?)""",
+            (job_type, json.dumps(payload), run_at, now),
+        )
+        return cur.lastrowid
+
+
+def claim_next_job() -> dict | None:
+    """Atomically claim one pending job whose run_at has passed.
+
+    Uses UPDATE ... WHERE status='pending' and verifies rowcount == 1 — only one
+    caller gets the row even if multiple processes/workers race on the same table.
+    """
+    import json
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT id FROM scheduled_jobs
+               WHERE status = 'pending' AND run_at <= ?
+               ORDER BY run_at LIMIT 1""",
+            (now,),
+        ).fetchone()
+        if not row:
+            return None
+        cur = conn.execute(
+            """UPDATE scheduled_jobs
+               SET status = 'running', claimed_at = ?, attempts = attempts + 1
+               WHERE id = ? AND status = 'pending'""",
+            (now, row["id"]),
+        )
+        if cur.rowcount != 1:
+            return None  # another worker claimed it, safe concurrency guard
+        job = conn.execute("SELECT * FROM scheduled_jobs WHERE id = ?", (row["id"],)).fetchone()
+    if not job or job["status"] != "running":
+        return None
+    result = dict(job)
+    result["payload"] = json.loads(result["payload"])
+    return result
+
+
+def recover_stuck_jobs(max_attempts: int = 3, timeout_minutes: int = 5) -> int:
+    """Crash recovery: jobs stuck in 'running' for >5 minutes go back to 'pending'.
+
+    If attempts >= max_attempts, they are marked as 'failed' with an error message.
+    """
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        conn.execute(
+            """UPDATE scheduled_jobs
+               SET status = 'failed', finished_at = ?, error = 'Max retry attempts exceeded (worker timed out)'
+               WHERE status = 'running' AND claimed_at <= ? AND attempts >= ?""",
+            (now, cutoff, max_attempts),
+        )
+        cur = conn.execute(
+            """UPDATE scheduled_jobs
+               SET status = 'pending', claimed_at = NULL
+               WHERE status = 'running' AND claimed_at <= ?""",
+            (cutoff,),
+        )
+        return cur.rowcount
+
+
+def complete_job(job_id: int, status: str, error: str | None = None) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE scheduled_jobs SET status = ?, finished_at = ?, error = ? WHERE id = ?",
+            (status, now, error, job_id),
+        )
+
+
+def get_pending_jobs_count() -> int:
+    with connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM scheduled_jobs WHERE status = 'pending'").fetchone()[0]
+
+
+def get_recent_jobs(limit: int = 20) -> list[dict]:
+    import json
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM scheduled_jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["payload"] = json.loads(d["payload"])
+        except Exception:
+            pass
+        out.append(d)
+    return out

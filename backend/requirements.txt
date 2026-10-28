@@ -11,3 +11,4 @@ rank-bm25==0.2.2   # knowledge-base retrieval fallback, pure-python, no torch
 pypdf==6.15.0      # extract text from uploaded PDF knowledge files
 fastembed==0.8.0   # multilingual semantic KB search (ONNX runtime, no torch)
 imageio-ffmpeg>=0.6   # bundled ffmpeg: stitches call recordings, decodes audio
+pywebpush>=2.0.0      # Web Push notifications (VAPID)

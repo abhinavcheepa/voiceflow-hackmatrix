@@ -4,7 +4,7 @@ import {
   ArrowUpCircle, RefreshCw, Search, X,
 } from "lucide-react";
 import { Card, EmptyState } from "../ui.jsx";
-import { API, useApi, post } from "../api.js";
+import { del, useApi, post } from "../api.js";
 
 export default function Stock() {
   const { data: items, reload } = useApi("/api/stock", [], 8000);
@@ -19,7 +19,7 @@ export default function Stock() {
   const lowCount = items.filter((i) => i.lowStock).length;
 
   async function remove(id) {
-    await fetch(`${API}/api/stock/${id}`, { method: "DELETE" });
+    await del(`/api/stock/${id}`);
     reload();
   }
 

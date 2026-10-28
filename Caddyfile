@@ -1,0 +1,48 @@
+# VoiceFlow AI Caddy Reverse Proxy & HTTPS Configuration
+
+{$DOMAIN:localhost} {
+    encode gzip zstd
+
+    # Root for static frontend files built by Vite
+    root * /srv/voiceflow
+
+    # 1. Server-Sent Events (SSE) live updates:
+    # Disable reverse proxy buffering with flush_interval -1 so heartbeats and
+    # live event pushes reach mobile devices instantly.
+    @sse path /api/events*
+    handle @sse {
+        reverse_proxy backend:8000 {
+            flush_interval -1
+            header_down X-Accel-Buffering no
+        }
+    }
+
+    # 2. REST API & Health endpoints:
+    # Proxy all backend routes without caching
+    @api path /api/* /health
+    handle @api {
+        header Cache-Control "no-store, no-cache, must-revalidate"
+        reverse_proxy backend:8000
+    }
+
+    # 3. Progressive Web App (PWA) App Shell & Assets
+    # Never cache service worker or app manifest so updates take effect immediately
+    @nocache path /sw.js /manifest.json /index.html
+    handle @nocache {
+        header Cache-Control "no-cache, must-revalidate"
+        file_server
+    }
+
+    # Fingerprinted static assets (safe to cache indefinitely)
+    @static path /assets/*
+    handle @static {
+        header Cache-Control "public, max-age=31536000, immutable"
+        file_server
+    }
+
+    # Single Page Application fallback for all other routes
+    handle {
+        try_files {path} /index.html
+        file_server
+    }
+}

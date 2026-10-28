@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Bot, FileText, Plus, Star, Trash2, Upload, X } from "lucide-react";
 import { Card, EmptyState, ErrorNote } from "../ui.jsx";
-import { API, useApi, post, put } from "../api.js";
+import { del, request, useApi, post, put } from "../api.js";
 
 const BLANK = {
   name: "",
@@ -144,8 +144,7 @@ function KnowledgeBase() {
     const body = new FormData();
     body.append("file", file);
     try {
-      const r = await fetch(`${API}/api/kb`, { method: "POST", body });
-      if (!r.ok) throw new Error((await r.json()).detail || "Upload failed");
+      await request("/api/kb", { method: "POST", body });
       reload();
     } catch (e) {
       setError(e.message);
@@ -155,7 +154,7 @@ function KnowledgeBase() {
   }
 
   async function remove(id) {
-    await fetch(`${API}/api/kb/${id}`, { method: "DELETE" });
+    await del(`/api/kb/${id}`);
     reload();
   }
 
@@ -230,9 +229,12 @@ export default function Agents() {
 
   async function remove(agent) {
     if (!confirm(`Delete "${agent.name}"?`)) return;
-    const r = await fetch(`${API}/api/agents/${agent.id}`, { method: "DELETE" });
-    if (!r.ok) alert((await r.json()).detail);
-    reload();
+    try {
+      await del(`/api/agents/${agent.id}`);
+      reload();
+    } catch (e) {
+      alert(e.message);
+    }
   }
 
   return (

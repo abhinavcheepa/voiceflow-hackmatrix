@@ -264,14 +264,58 @@ Deliberate, with the upgrade path:
 - **WhatsApp Web is against WhatsApp's terms.** Numbers can be banned — use a
   dedicated SIM, never a personal one. Chat import is broken by library drift;
   live messages work.
-- **No auth on the dashboard API.** Add a token before exposing it publicly.
-- **SQLite, single file.** Fine for one business; move to Postgres for
-  concurrent writers — only `db.py` changes.
+- **Single-worker server architecture.** Uvicorn must run with a single worker process (`--workers 1`) because the SSE broadcaster and background job queues are held in-memory.
 - **Half-duplex conversation.** No barge-in.
 
 ---
 
-## Live demo
+## Deployment (Docker & Production)
 
-_Coming soon._ Until then the web call at `/app/web-call` runs the full pipeline
-locally.
+VoiceFlow AI is fully containerized with persistent storage for SQLite database and WhatsApp sessions:
+
+### 1. Configure Environment
+```bash
+cp .env.example .env
+```
+Ensure the following are set in `.env`:
+- `ENV=production`
+- `API_TOKEN=<your-secret-token>`
+- `BRIDGE_SECRET=<shared-secret-for-bridge>`
+- `VAPID_PUBLIC_KEY` & `VAPID_PRIVATE_KEY` (generate via `python -m push generate-keys`)
+- `DOMAIN=voiceflow.yourdomain.com`
+
+### 2. Start Services
+```bash
+docker compose up -d --build
+```
+This starts:
+- **`backend`**: FastAPI running on Python 3.11 with SQLite WAL mode, background job worker, and single-worker uvicorn. Persists database to `voiceflow_data`.
+- **`wa-bridge`**: WhatsApp Web Puppeteer bridge with Chromium. Persists session authentication to `voiceflow_wa_session` (scan QR code once, stays authenticated).
+- **`caddy`**: Automated HTTPS reverse proxy with SSL certificate management. Configured with unbuffered SSE streaming (`flush_interval -1`).
+
+### 3. Asterisk (Telephony)
+Asterisk PBX requires direct UDP RTP port access (10000–20000). For containerized setups, run with `network_mode: host` or point `ASTERISK_ARI_URL` in `.env` to your bare-metal / cloud Asterisk server.
+
+---
+
+## Install on Mobile Phone (PWA Remote Control)
+
+The phone acts as your mobile dashboard and remote control. All business logic (calls, background jobs, WhatsApp auto-replies) runs on the server 24/7 even when your phone tab is closed or locked.
+
+### Android (Chrome)
+1. Navigate to your HTTPS domain in Google Chrome.
+2. Tap the browser menu (**⋮**) and select **Install app** (or **Add to Home screen**).
+3. The app installs as a native standalone PWA with its own icon and window.
+4. Tap the **Token** icon (key) in the top bar to save your `API_TOKEN`.
+
+### iPhone / iPad (iOS Safari)
+1. Open your domain in Safari.
+2. Tap the **Share** button (**⎋**) at the bottom.
+3. Scroll down and tap **Add to Home Screen**.
+4. Open VoiceFlow from your Home Screen to run in standalone full-screen mode.
+5. In the top bar, enter your `API_TOKEN`.
+
+### Remote Controls from Phone
+- **Automation Switch**: Tap **Automation Active / Paused** in the top navigation bar to instantly freeze or resume all automated auto-replies, sweeps, and scheduled worker jobs server-wide.
+- **Live SSE Status**: The green pulsing badge indicates a live Server-Sent Events connection. When waking up your phone, the app automatically verifies connection and fetches fresh updates.
+

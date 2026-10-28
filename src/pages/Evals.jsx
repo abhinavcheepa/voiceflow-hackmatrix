@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { FlaskConical, Play, Trash2, Loader2, Plus, X, Check } from "lucide-react";
 import { Card, EmptyState, ErrorNote } from "../ui.jsx";
-import { API, useApi, post } from "../api.js";
+import { del, useApi, post } from "../api.js";
 
 const field =
   "mt-1.5 w-full rounded-xl border border-line bg-panel-2 px-3.5 py-2.5 text-sm text-white outline-none focus:border-violet/50";
@@ -166,7 +166,7 @@ export default function Evals() {
   }
 
   async function remove(id) {
-    await fetch(`${API}/api/evals/${id}`, { method: "DELETE" });
+    await del(`/api/evals/${id}`);
     reload();
   }
 

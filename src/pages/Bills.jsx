@@ -1,14 +1,14 @@
 import { Receipt, Trash2, Eye } from "lucide-react";
 import { useState } from "react";
 import { Card, EmptyState } from "../ui.jsx";
-import { API, useApi } from "../api.js";
+import { del, useApi } from "../api.js";
 
 export default function Bills() {
   const { data: bills, reload } = useApi("/api/bills", [], 8000);
   const [detail, setDetail] = useState(null);
 
   async function remove(id) {
-    await fetch(`${API}/api/bills/${id}`, { method: "DELETE" });
+    await del(`/api/bills/${id}`);
     reload();
   }
 

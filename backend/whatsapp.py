@@ -17,7 +17,9 @@ import httpx
 
 import brain
 import db
+import events
 import kb
+import push
 import voice
 import whatsapp_web
 
@@ -51,9 +53,23 @@ def _headers() -> dict:
 
 def verify(mode: str, token: str, challenge: str) -> str:
     """Meta's one-time webhook handshake. Must echo the challenge verbatim."""
-    if mode == "subscribe" and token and token == VERIFY_TOKEN:
+    import hmac
+    if mode == "subscribe" and token and VERIFY_TOKEN and hmac.compare_digest(token, VERIFY_TOKEN):
         return challenge
     raise PermissionError("verify token mismatch")
+
+
+def verify_signature(raw_body: bytes, signature_header: str | None) -> bool:
+    """Validate Meta's X-Hub-Signature-256 header when WHATSAPP_APP_SECRET is set."""
+    app_secret = os.getenv("WHATSAPP_APP_SECRET", "")
+    if not app_secret:
+        return True  # open in dev when no secret is configured
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    import hashlib
+    import hmac
+    expected = hmac.new(app_secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature_header[7:], expected)
 
 
 # --- outbound -----------------------------------------------------------
@@ -189,6 +205,9 @@ async def handle(message: dict) -> None:
             name=name, language=language, needs_reply=blocked is None,
         )
 
+        events.broadcast("message_update", {"phone": sender, "direction": "them", "name": name})
+        push.notify(f"WhatsApp from {name or sender}", incoming[:100], {"url": f"/app/whatsapp?phone={sender}"}, tag=f"wa-{sender}")
+
         if blocked:
             # Name the switch. "Not replying" with three possible causes and no
             # log line is the single most time-wasting failure this thing has.
@@ -251,6 +270,8 @@ async def reply_to(sender: str, name: str | None, incoming: str, is_voice: bool,
         await send_text(sender, answer)
         db.add_message(sender, "us", "text", answer, name=name, language=language)
 
+    events.broadcast("message_update", {"phone": sender, "direction": "us", "name": name})
+
     # Answered — nothing left to pick up on the next startup.
     if message_id:
         db.clear_needs_reply(message_id)
@@ -266,6 +287,9 @@ async def answer_pending() -> None:
     "reply sent" (a deploy, a crash), or the reply throws — a provider timeout,
     a rate limit. Both leave needs_reply set, and both are picked up here.
     """
+    if not db.auto_reply_global() or db.get_setting("automation_enabled", "on") != "on":
+        return
+
     pending = db.pending_replies()
     if not pending:
         return
@@ -291,6 +315,8 @@ async def sweep_forever() -> None:
     while True:
         await asyncio.sleep(SWEEP_SECONDS)
         try:
+            if not db.auto_reply_global() or db.get_setting("automation_enabled", "on") != "on":
+                continue
             await answer_pending()
         except Exception as e:  # noqa: BLE001 - the sweep must never die
             log.warning("reply sweep failed: %s", describe(e))
