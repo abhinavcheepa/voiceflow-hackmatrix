@@ -24,9 +24,9 @@ Nothing below is a mock. Every row was measured on a real run.
 | **Campaigns** — bulk outbound list | ✅ built | needs telephony to dial |
 | **Analytics** — volume, outcomes, per-agent | ✅ working | |
 | **Phone calls** — real PSTN | ⚠️ partial | Asterisk answers and logs; live audio is not wired yet |
-| **Voice cloning** — the owner's own voice | ⚠️ blocked | Cartesia charges for cloning; ready voices used instead |
+| **Voice cloning** — the owner's own voice | ✅ working | Free local OpenVoice v2 tone-cloning + Cartesia clone API |
 
-The honest summary: **web call and WhatsApp are demoable right now.** Phone
+The honest summary: **web call, WhatsApp auto-reply, and voice cloning are demoable right now.** Phone
 calls need hardware that isn't set up yet — see [Telephony](#telephony).
 
 ---
@@ -170,6 +170,8 @@ Each conversation also has its own toggle, for taking one chat over by hand.
 ### Voice Studio
 Pick the voice for every call and voice note. 55 voices, filtered to Hindi,
 Tamil, Telugu and English. Preview auditions a voice without switching to it.
+
+Includes **Voice Cloning** — record or upload a 30s+ sample of the owner's voice to generate a custom voice clone profile using local OpenVoice v2 tone-conversion (completely free, zero API charges) or Cartesia. The agent speaks in the owner's exact voice across web calls and WhatsApp voice notes.
 
 Also where you describe the **writing style** for WhatsApp text replies.
 
