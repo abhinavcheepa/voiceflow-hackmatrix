@@ -9,6 +9,7 @@ A voice note gets a voice note back, in the owner's cloned voice. A text gets
 text back, written in the owner's style. Both are logged to the dashboard.
 """
 
+import asyncio
 import logging
 import os
 
@@ -16,6 +17,7 @@ import httpx
 
 import brain
 import db
+import kb
 import voice
 import whatsapp_web
 
@@ -174,35 +176,124 @@ async def handle(message: dict) -> None:
             return
 
         language = brain.detect_language(incoming)
-        db.add_message(sender, "them", "voice" if is_voice else "text", incoming,
-                       name=name, language=language)
 
-        # The message is now recorded whatever happens next. Only the *reply*
-        # is switchable — turning auto-reply off must never lose a customer's
+        # The message is recorded whatever happens next. Only the *reply* is
+        # switchable — turning auto-reply off must never lose a customer's
         # message, just leave it for the owner to answer.
-        if not db.should_auto_reply(sender):
-            log.info("auto-reply off for %s — message stored, not answered", sender)
+        #
+        # needs_reply survives a crash or restart between here and the send,
+        # which used to drop the reply with no trace at all.
+        blocked = db.auto_reply_block(sender)
+        message_id = db.add_message(
+            sender, "them", "voice" if is_voice else "text", incoming,
+            name=name, language=language, needs_reply=blocked is None,
+        )
+
+        if blocked:
+            # Name the switch. "Not replying" with three possible causes and no
+            # log line is the single most time-wasting failure this thing has.
+            log.warning("no auto-reply to %s — %s (message stored)", sender, blocked)
             return
 
-        # WhatsApp gives us the sender's profile name; pass it through so the
-        # agent can greet them properly instead of guessing.
-        answer = await brain.reply(sender, incoming, customer=name)
-
-        if is_voice:
-            audio_out = await voice.synthesize(answer, language)
-            await send_voice(sender, audio_out)
-            # Store the words, not the bytes — the dashboard shows the text
-            # under the voice-note bubble.
-            db.add_message(sender, "us", "voice", answer,
-                           seconds=_estimate_seconds(answer), name=name, language=language)
-        else:
-            await send_text(sender, answer)
-            db.add_message(sender, "us", "text", answer, name=name, language=language)
+        await reply_to(sender, name, incoming, is_voice, language, message_id)
 
     except Exception as e:  # noqa: BLE001 - never let a webhook crash the worker
         # Logged on the thread so the owner sees the gap, but flagged so it
-        # doesn't count as a reply in the response-rate metric.
-        db.add_message(sender, "us", "text", f"[auto-reply failed: {e}]", name=name, failed=True)
+        # doesn't count as a reply in the response-rate metric. needs_reply stays
+        # set, so the sweep retries it rather than leaving the customer hanging.
+        log.warning("auto-reply failed for %s: %s", sender, describe(e))
+        db.add_message(sender, "us", "text", f"[auto-reply failed: {describe(e)}]",
+                       name=name, failed=True)
+
+
+def describe(e: Exception) -> str:
+    """Never produce an empty error string.
+
+    httpx timeout exceptions stringify to "", which produced the useless
+    "[auto-reply failed: ]" on the thread — an error that told nobody anything.
+    """
+    text = str(e).strip()
+    return f"{type(e).__name__}: {text}" if text else type(e).__name__
+
+
+async def reply_to(sender: str, name: str | None, incoming: str, is_voice: bool,
+                   language: str, message_id: int | None = None) -> None:
+    """Generate, send and record one reply.
+
+    Separate from handle() so the startup catch-up can reuse it without storing
+    the customer's message a second time.
+    """
+    # WhatsApp gives us the sender's profile name; pass it through so the
+    # agent can greet them properly instead of guessing.
+    # WhatsApp replies draw on the default agent's knowledge base, if any, and
+    # can record a booking or escalation tied to this sender.
+    # A thread the owner handed to a specific agent (via the assistant) is
+    # answered by that agent, with the goal the owner gave it.
+    brief = db.conversation_brief(sender)
+    agent = (db.get_agent(brief["agent_id"]) if brief["agent_id"] else None) or db.get_agent() or {}
+    kb_context = kb.context_block(agent.get("id"), incoming)
+    answer = await brain.reply(
+        sender, incoming, customer=name, kb_context=kb_context,
+        prompt=brain.system_prompt(name, agent, brief["goal"]),
+        tools_ctx={"phone": sender, "name": name, "channel": "whatsapp",
+                   "agent_id": agent.get("id")},
+        agent_id=agent.get("id"),
+    )
+
+    if is_voice:
+        audio_out = await voice.synthesize(answer, language)
+        await send_voice(sender, audio_out)
+        # Store the words, not the bytes — the dashboard shows the text
+        # under the voice-note bubble.
+        db.add_message(sender, "us", "voice", answer,
+                       seconds=_estimate_seconds(answer), name=name, language=language)
+    else:
+        await send_text(sender, answer)
+        db.add_message(sender, "us", "text", answer, name=name, language=language)
+
+    # Answered — nothing left to pick up on the next startup.
+    if message_id:
+        db.clear_needs_reply(message_id)
+
+
+SWEEP_SECONDS = int(os.getenv("REPLY_SWEEP_SECONDS") or 120)
+
+
+async def answer_pending() -> None:
+    """Reply to anything accepted but never answered.
+
+    Two ways a reply goes missing: the process dies between "message stored" and
+    "reply sent" (a deploy, a crash), or the reply throws — a provider timeout,
+    a rate limit. Both leave needs_reply set, and both are picked up here.
+    """
+    pending = db.pending_replies()
+    if not pending:
+        return
+
+    log.info("picking up %d unanswered message(s)", len(pending))
+    for row in pending:
+        try:
+            await reply_to(
+                row["phone"], row["name"], row["body"],
+                row["kind"] == "voice", brain.detect_language(row["body"]), row["id"],
+            )
+        except Exception as e:  # noqa: BLE001 - one bad row must not stop the rest
+            log.warning("catch-up failed for %s: %s", row["phone"], describe(e))
+            # Left set on purpose — the next sweep tries again, and
+            # pending_replies() ages rows out so this can't loop forever.
+
+
+async def sweep_forever() -> None:
+    """Retry unanswered messages on a timer, not only at startup.
+
+    A provider timeout at 3am shouldn't wait for the next deploy to be retried.
+    """
+    while True:
+        await asyncio.sleep(SWEEP_SECONDS)
+        try:
+            await answer_pending()
+        except Exception as e:  # noqa: BLE001 - the sweep must never die
+            log.warning("reply sweep failed: %s", describe(e))
 
 
 def _estimate_seconds(text: str) -> int:

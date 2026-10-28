@@ -175,11 +175,14 @@ function useRecorder() {
   };
 }
 
-/** Cloning needs a paid Cartesia plan, so it's the secondary path, folded away. */
-function CloneYourVoice({ onCloned }) {
+/** Cloning runs locally (OpenVoice) on top of Edge — free, but an optional install. */
+function CloneYourVoice({ profile, onCloned }) {
   const [open, setOpen] = useState(false);
   const { recording, seconds, clips, start, stop, remove, total } = useRecorder();
   const [name, setName] = useState("My voice");
+  // Hindi verbs follow the speaker's gender ("sakti/sakta hoon"), so replies
+  // must know who the cloned voice belongs to.
+  const [gender, setGender] = useState("female");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
 
@@ -188,6 +191,7 @@ function CloneYourVoice({ onCloned }) {
     setError(null);
     const form = new FormData();
     form.append("name", name);
+    form.append("gender", gender);
     clips.forEach((c, i) => form.append("samples", c.blob, `sample-${i}.webm`));
     try {
       const r = await fetch(`${API}/api/voice/clone`, { method: "POST", body: form });
@@ -212,14 +216,22 @@ function CloneYourVoice({ onCloned }) {
             <Lock className="size-3.5 text-dim" /> Clone your own voice
           </h2>
           <p className="mt-1 text-xs text-dim">
-            Record yourself and the agent speaks in your voice — needs a paid Cartesia plan.
+            Record yourself and the agent speaks in your voice — runs on this machine, free.
           </p>
+          {profile?.cloned && (
+            <p className="mt-1 text-xs text-mint">Active: {profile.name}</p>
+          )}
         </div>
         <ChevronDown className={`size-4 shrink-0 text-dim transition ${open ? "rotate-180" : ""}`} />
       </button>
 
       {open && (
         <>
+          {profile?.cloneMissing && (
+            <p className="mt-4 rounded-xl border border-saffron/30 bg-saffron/5 px-4 py-3 text-xs text-saffron">
+              Cloning isn't installed yet: {profile.cloneMissing}
+            </p>
+          )}
           <div className="mt-6 flex flex-col items-center">
             <button
               onClick={recording ? stop : start}
@@ -265,6 +277,15 @@ function CloneYourVoice({ onCloned }) {
                   onChange={(e) => setName(e.target.value)}
                   className="flex-1 rounded-xl border border-line bg-panel-2 px-3.5 py-2.5 text-sm outline-none focus:border-violet/50"
                 />
+                <select
+                  value={gender}
+                  onChange={(e) => setGender(e.target.value)}
+                  aria-label="Voice gender"
+                  className="rounded-xl border border-line bg-panel-2 px-3 py-2.5 text-sm outline-none focus:border-violet/50"
+                >
+                  <option value="female">Female</option>
+                  <option value="male">Male</option>
+                </select>
                 <button
                   onClick={upload}
                   disabled={busy || total < 25}
@@ -339,6 +360,68 @@ function Preview() {
   );
 }
 
+/** Speaking speed and pitch. Applies to calls and WhatsApp voice notes alike. */
+function SpeakingVoice({ profile, onSaved }) {
+  const [rate, setRate] = useState(15);
+  const [pitch, setPitch] = useState(0);
+
+  useEffect(() => {
+    if (!profile) return;
+    setRate(parseInt(profile.rate ?? "+15%", 10) || 0);
+    setPitch(parseInt(profile.pitch ?? "+0Hz", 10) || 0);
+  }, [profile?.rate, profile?.pitch]);
+
+  // Save when the slider is released, not on every pixel of the drag — a PUT
+  // per frame would hammer the backend for no benefit.
+  async function save() {
+    await put("/api/voice/tuning", {
+      rate: `${rate >= 0 ? "+" : ""}${rate}%`,
+      pitch: `${pitch >= 0 ? "+" : ""}${pitch}Hz`,
+    });
+    onSaved?.();
+  }
+
+  return (
+    <Card>
+      <h2 className="text-[15px] font-semibold">Speaking voice</h2>
+      <p className="mt-1 text-xs text-dim">
+        Edge ships one female and one male voice per Indian language, so pitch is what
+        makes two agents sound like different people.
+      </p>
+
+      <label className="mt-4 block text-xs text-dim">
+        <span className="flex justify-between">
+          Speed <span className="font-mono text-white">{rate > 0 ? "+" : ""}{rate}%</span>
+        </span>
+        <input
+          type="range" min={-30} max={50} step={5} value={rate}
+          onChange={(e) => setRate(Number(e.target.value))}
+          onPointerUp={save}
+          onKeyUp={save}
+          className="mt-2 w-full accent-violet"
+        />
+      </label>
+
+      <label className="mt-4 block text-xs text-dim">
+        <span className="flex justify-between">
+          Pitch <span className="font-mono text-white">{pitch > 0 ? "+" : ""}{pitch}Hz</span>
+        </span>
+        <input
+          type="range" min={-40} max={40} step={5} value={pitch}
+          onChange={(e) => setPitch(Number(e.target.value))}
+          onPointerUp={save}
+          onKeyUp={save}
+          className="mt-2 w-full accent-violet"
+        />
+      </label>
+
+      <p className="mt-3 text-[11px] text-dim">
+        Use “Hear it” below to check a change before a real call.
+      </p>
+    </Card>
+  );
+}
+
 export default function VoiceStudio() {
   const { data: profile, reload } = useApi("/api/voice/profile", null, 0);
   const [style, setStyle] = useState("");
@@ -363,7 +446,7 @@ export default function VoiceStudio() {
         </p>
       </header>
 
-      {!profile?.configured && (
+      {profile && !profile.configured && (
         <p className="mt-5 rounded-xl border border-saffron/30 bg-saffron/5 px-4 py-3 text-xs text-saffron">
           Add <code className="font-mono">CARTESIA_API_KEY</code> to{" "}
           <code className="font-mono">backend/.env</code> to enable voices.
@@ -383,7 +466,10 @@ export default function VoiceStudio() {
           <VoicePicker profile={profile} onPicked={reload} />
         </div>
 
-        <Card>
+        <div className="space-y-4">
+          <SpeakingVoice profile={profile} onSaved={reload} />
+
+          <Card>
           <h2 className="text-[15px] font-semibold">Writing style</h2>
           <p className="mt-1 text-xs text-dim">
             How WhatsApp text replies should sound. Describe it the way you'd brief a new
@@ -401,11 +487,12 @@ export default function VoiceStudio() {
           >
             {saved ? "Saved ✓" : "Save style"}
           </button>
-        </Card>
+          </Card>
+        </div>
       </div>
 
       <Preview />
-      <CloneYourVoice onCloned={reload} />
+      <CloneYourVoice profile={profile} onCloned={reload} />
     </div>
   );
 }

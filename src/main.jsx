@@ -13,7 +13,12 @@ import WebCall from "./pages/WebCall.jsx";
 import Agents from "./pages/Agents.jsx";
 import Contacts from "./pages/Contacts.jsx";
 import Campaigns from "./pages/Campaigns.jsx";
+import Bookings from "./pages/Bookings.jsx";
 import Analytics from "./pages/Analytics.jsx";
+import Stock from "./pages/Stock.jsx";
+import Bills from "./pages/Bills.jsx";
+import Learning from "./pages/Learning.jsx";
+import Evals from "./pages/Evals.jsx";
 
 createRoot(document.getElementById("root")).render(
   <StrictMode>
@@ -25,14 +30,20 @@ createRoot(document.getElementById("root")).render(
           <Route path="calls" element={<Calls />} />
           <Route path="web-call" element={<WebCall />} />
           <Route path="whatsapp" element={<WhatsApp />} />
+          <Route path="bookings" element={<Bookings />} />
           <Route path="agents" element={<Agents />} />
           <Route path="contacts" element={<Contacts />} />
           <Route path="campaigns" element={<Campaigns />} />
           <Route path="analytics" element={<Analytics />} />
           <Route path="voice-studio" element={<VoiceStudio />} />
+          <Route path="stock" element={<Stock />} />
+          <Route path="bills" element={<Bills />} />
+          <Route path="learning" element={<Learning />} />
+          <Route path="tests" element={<Evals />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>
   </StrictMode>,
 );
+

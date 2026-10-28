@@ -1,11 +1,12 @@
 import { useState } from "react";
-import { Bot, Plus, Star, Trash2, X } from "lucide-react";
+import { Bot, FileText, Plus, Star, Trash2, Upload, X } from "lucide-react";
 import { Card, EmptyState, ErrorNote } from "../ui.jsx";
 import { API, useApi, post, put } from "../api.js";
 
 const BLANK = {
   name: "",
   prompt: "",
+  facts: "",
   greeting: "Namaste! Main aapki kya madad kar sakti hoon?",
   language: "Hindi",
   is_default: false,
@@ -25,6 +26,7 @@ function AgentForm({ agent, onSaved, onCancel }) {
     const body = {
       name: form.name,
       prompt: form.prompt,
+      facts: form.facts,
       greeting: form.greeting,
       language: form.language,
       is_default: form.is_default,
@@ -82,14 +84,29 @@ function AgentForm({ agent, onSaved, onCancel }) {
       </label>
 
       <label className="mt-3 block text-xs text-dim">
-        Instructions — what this agent knows and does
+        Instructions — how this agent behaves
         <textarea
           value={form.prompt}
           onChange={set("prompt")}
-          rows={6}
-          placeholder="You book dental appointments. Slots are 10am-7pm, Mon-Sat. Confirm the patient's name and preferred time."
+          rows={5}
+          placeholder="You book dental appointments. Be warm and brief. Confirm the patient's name and preferred time."
           className="mt-1.5 w-full resize-none rounded-xl border border-line bg-panel-2 p-3.5 text-sm text-white outline-none focus:border-violet/50"
         />
+      </label>
+
+      <label className="mt-3 block text-xs text-dim">
+        Business facts — the only prices, timings and items it may quote
+        <textarea
+          value={form.facts}
+          onChange={set("facts")}
+          rows={5}
+          placeholder={"Study table: ₹4,800\nOffice chair: ₹1,200\nOpen: Mon-Sat, 10am-7pm\nAddress: MG Road, Indore\nDelivery: free within city, 3-4 days"}
+          className="mt-1.5 w-full resize-none rounded-xl border border-line bg-panel-2 p-3.5 text-sm text-white outline-none focus:border-violet/50"
+        />
+        <span className="mt-1 block text-[11px] text-dim/70">
+          Leave blank and the agent will refuse to quote any price instead of
+          inventing one. Anything here is the only pricing it will state.
+        </span>
       </label>
 
       <label className="mt-3 flex items-center gap-2 text-xs text-dim">
@@ -111,6 +128,98 @@ function AgentForm({ agent, onSaved, onCancel }) {
       >
         {busy ? "Saving…" : "Save agent"}
       </button>
+    </Card>
+  );
+}
+
+function KnowledgeBase() {
+  const { data: docs, reload } = useApi("/api/kb", [], 0);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  async function upload(file) {
+    if (!file) return;
+    setBusy(true);
+    setError(null);
+    const body = new FormData();
+    body.append("file", file);
+    try {
+      const r = await fetch(`${API}/api/kb`, { method: "POST", body });
+      if (!r.ok) throw new Error((await r.json()).detail || "Upload failed");
+      reload();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(id) {
+    await fetch(`${API}/api/kb/${id}`, { method: "DELETE" });
+    reload();
+  }
+
+  return (
+    <Card className="mt-6">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-[15px] font-semibold">Knowledge base</h2>
+          <p className="mt-1 text-xs text-dim">
+            Upload a price list, catalogue or FAQ. Every agent answers customer
+            questions from these files — and quotes their figures instead of
+            guessing.
+          </p>
+        </div>
+        <label className="flex shrink-0 cursor-pointer items-center gap-2 rounded-xl bg-violet px-4 py-2.5 text-sm font-medium text-white transition hover:bg-violet-soft">
+          <Upload className="size-4" />
+          {busy ? "Uploading…" : "Upload file"}
+          <input
+            type="file"
+            className="hidden"
+            accept=".pdf,.txt,.md,.csv,.tsv,.json,.yaml,.yml"
+            disabled={busy}
+            onChange={(e) => {
+              upload(e.target.files[0]);
+              e.target.value = "";
+            }}
+          />
+        </label>
+      </div>
+
+      {error && (
+        <p className="mt-3 rounded-xl border border-rose/30 bg-rose/5 px-4 py-3 text-xs text-rose">
+          {error}
+        </p>
+      )}
+
+      <div className="mt-4 space-y-2">
+        {docs.length === 0 && (
+          <p className="text-xs text-dim/70">
+            No documents yet. PDF, TXT, MD, CSV, JSON or YAML — up to 2 MB.
+          </p>
+        )}
+        {docs.map((d) => (
+          <div
+            key={d.id}
+            className="flex items-center justify-between gap-3 rounded-xl border border-line bg-panel-2 px-3.5 py-2.5"
+          >
+            <div className="flex min-w-0 items-center gap-2.5">
+              <FileText className="size-4 shrink-0 text-violet-soft" />
+              <span className="truncate text-sm">{d.filename}</span>
+              <span className="shrink-0 rounded-full bg-panel px-2 py-0.5 text-[10px] text-dim ring-1 ring-line">
+                {d.chunks} chunk{d.chunks === 1 ? "" : "s"}
+              </span>
+            </div>
+            <button
+              onClick={() => remove(d.id)}
+              className="shrink-0 rounded-lg border border-line px-2 py-1.5 text-dim transition hover:text-rose"
+              aria-label={`Delete ${d.filename}`}
+            >
+              <Trash2 className="size-3.5" />
+            </button>
+          </div>
+        ))}
+      </div>
     </Card>
   );
 }
@@ -202,6 +311,8 @@ export default function Agents() {
           </Card>
         ))}
       </div>
+
+      <KnowledgeBase />
     </div>
   );
 }

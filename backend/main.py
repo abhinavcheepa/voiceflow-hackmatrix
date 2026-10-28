@@ -24,6 +24,7 @@ import asyncio  # noqa: E402
 import logging  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
+import time  # noqa: E402
 from datetime import datetime  # noqa: E402
 
 import httpx  # noqa: E402
@@ -43,16 +44,19 @@ from fastapi import (  # noqa: E402
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import JSONResponse  # noqa: E402
+from fastapi.responses import FileResponse, JSONResponse  # noqa: E402
 
 import asterisk_ari  # noqa: E402
 import brain  # noqa: E402
 import db  # noqa: E402
+import kb  # noqa: E402
+import recording  # noqa: E402
 import vapi  # noqa: E402
 import voice  # noqa: E402
 import webcall  # noqa: E402
 import whatsapp  # noqa: E402
 import whatsapp_web  # noqa: E402
+import adaptive  # noqa: E402
 
 app = FastAPI(title="VoiceFlow AI", version="0.1.0")
 
@@ -96,9 +100,19 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup() -> None:
     db.init()
+    # Anything that arrived while we were down, or whose reply threw, still
+    # deserves an answer — once now, then on a timer.
+    asyncio.create_task(whatsapp.answer_pending())
+    asyncio.create_task(whatsapp.sweep_forever())
     # Only when Asterisk is configured — a machine without it starts normally.
     if asterisk_ari.configured():
         asyncio.create_task(asterisk_ari.listen())
+    asyncio.create_task(voice.warm_up())
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await brain.close_http()
 
 
 @app.get("/health")
@@ -113,6 +127,10 @@ def health() -> dict:
         "voiceReady": bool(voice.voice_id()),
         "stt": brain.stt_backend(),
         "asterisk": asterisk_ari.configured(),
+        "model": brain.CHAT_MODEL,
+        # Empty until the first reply. The per-minute token cap is the ceiling
+        # a live call actually runs into, and it is invisible otherwise.
+        "budget": brain.budget,
     }
 
 
@@ -126,6 +144,30 @@ def stats() -> dict:
 @app.get("/api/calls")
 def calls(limit: int = 50) -> list[dict]:
     return db.get_calls(limit)
+
+
+def _call_file(call_id: str, ext: str) -> str:
+    try:
+        p = recording.path(call_id, ext)
+    except ValueError:
+        raise HTTPException(400, "Bad call id")
+    if not os.path.exists(p):
+        raise HTTPException(404, "No such recording")
+    return p
+
+
+@app.get("/api/calls/{call_id}/recording")
+def call_recording(call_id: str) -> FileResponse:
+    """The whole call as one mp3 — caller and agent, in order."""
+    return FileResponse(_call_file(call_id, "mp3"), media_type="audio/mpeg",
+                        filename=f"{call_id}.mp3", content_disposition_type="inline")
+
+
+@app.get("/api/calls/{call_id}/record.txt")
+def call_record(call_id: str) -> FileResponse:
+    """Plain-text record: details, summary, timestamped transcript."""
+    return FileResponse(_call_file(call_id, "txt"), media_type="text/plain; charset=utf-8",
+                        filename=f"{call_id}.txt")
 
 
 @app.get("/api/calls-by-hour")
@@ -206,12 +248,19 @@ async def whatsapp_link() -> dict:
     if whatsapp.PROVIDER != "web":
         return {"provider": "meta", "status": "connected" if whatsapp.configured() else "offline"}
     state = await whatsapp_web.status()
+    # "connected" alone has been wrong before — the bridge once sat healthy for
+    # three hours without receiving anything. Surface how long it has been
+    # quiet so the dashboard can say so.
+    last = state.get("lastEventAt") or state.get("lastCheckAt")
+    quiet_minutes = round((time.time() * 1000 - last) / 60000) if last else None
     return {
         "provider": "web",
         "status": state.get("status", "offline"),
         "number": state.get("me"),
         "qr": state.get("qr"),
         "error": state.get("error"),
+        "quietMinutes": quiet_minutes,
+        "recoveries": state.get("recoveries", 0),
     }
 
 
@@ -315,6 +364,16 @@ async def voice_library(refresh: bool = False) -> list[dict]:
         raise HTTPException(503, str(e))
 
 
+@app.put("/api/voice/tuning")
+def voice_tuning(rate: str = Body(None), pitch: str = Body(None)) -> dict:
+    """Speaking speed and pitch.
+
+    Edge ships one female voice per Indian language, so pitch is the only way
+    to make two agents sound different.
+    """
+    return voice.set_tuning(rate, pitch)
+
+
 @app.post("/api/voice/select")
 def voice_select(voice_id: str = Body(...), name: str = Body(...)) -> dict:
     voice.select(voice_id, name)
@@ -322,12 +381,14 @@ def voice_select(voice_id: str = Body(...), name: str = Body(...)) -> dict:
 
 
 @app.post("/api/voice/clone")
-async def voice_clone(name: str = Form(...), samples: list[UploadFile] = File(...)) -> dict:
-    """Upload 30s+ of the owner's speech to create the cloned voice."""
+async def voice_clone(name: str = Form(...), samples: list[UploadFile] = File(...),
+                      gender: str = Form("female")) -> dict:
+    """Upload 30s+ of the owner's speech to create the cloned voice. `gender`
+    ("female"/"male") makes the reply grammar match the cloned speaker."""
     payload = [(f.filename or "sample.wav", await f.read(), f.content_type or "audio/wav")
                for f in samples]
     try:
-        voice_id = await voice.clone(name, payload)
+        voice_id = await voice.clone(name, payload, gender_=gender)
     except RuntimeError as e:
         raise HTTPException(503, str(e))
     return {"voiceId": voice_id, **voice.profile()}
@@ -340,6 +401,47 @@ async def voice_clone_delete() -> dict:
     except RuntimeError as e:
         raise HTTPException(503, str(e))
     return voice.profile()
+
+
+# --- knowledge base -----------------------------------------------------
+
+@app.get("/api/kb")
+def kb_list(agent_id: int | None = None) -> list[dict]:
+    """Reference documents. Pass ?agent_id= to include an agent's own files."""
+    return db.list_kb_docs(agent_id)
+
+
+@app.post("/api/kb")
+async def kb_upload(
+    file: UploadFile = File(...), agent_id: int | None = Form(None)
+) -> dict:
+    """Upload one reference file the agent will answer from. agent_id blank = all
+    agents."""
+    data = await file.read()
+    try:
+        return kb.add_document(agent_id, file.filename or "document", data)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/api/kb/{doc_id}")
+def kb_delete(doc_id: int) -> dict:
+    db.delete_kb_doc(doc_id)
+    return {"ok": True}
+
+
+# --- bookings (recorded by agent tool calls) ----------------------------
+
+@app.get("/api/bookings")
+def bookings() -> list[dict]:
+    """Bookings and escalations the agent recorded during conversations."""
+    return db.get_bookings()
+
+
+@app.delete("/api/bookings/{booking_id}")
+def booking_delete(booking_id: int) -> dict:
+    db.delete_booking(booking_id)
+    return {"ok": True}
 
 
 @app.post("/api/voice/preview")
@@ -374,10 +476,11 @@ def agent_create(
     prompt: str = Body(...),
     greeting: str = Body(...),
     language: str = Body("Hindi"),
+    facts: str = Body(""),
     is_default: bool = Body(False),
 ) -> dict:
     return db.save_agent(None, name=name, prompt=prompt, greeting=greeting,
-                         language=language, is_default=is_default)
+                         language=language, facts=facts, is_default=is_default)
 
 
 @app.put("/api/agents/{agent_id}")
@@ -387,10 +490,11 @@ def agent_update(
     prompt: str = Body(...),
     greeting: str = Body(...),
     language: str = Body("Hindi"),
+    facts: str = Body(""),
     is_default: bool = Body(False),
 ) -> dict:
     return db.save_agent(agent_id, name=name, prompt=prompt, greeting=greeting,
-                         language=language, is_default=is_default)
+                         language=language, facts=facts, is_default=is_default)
 
 
 @app.delete("/api/agents/{agent_id}")
@@ -415,6 +519,12 @@ def contact(contact_id: int) -> dict:
     if not found:
         raise HTTPException(404, "No such contact")
     return found
+
+
+@app.delete("/api/contacts/{contact_id}")
+def contact_delete(contact_id: int) -> dict:
+    db.delete_contact(contact_id)
+    return {"ok": True}
 
 
 @app.put("/api/contacts/{contact_id}")
@@ -461,7 +571,7 @@ def campaign_create(
 
 @app.post("/api/campaigns/{campaign_id}/start")
 async def campaign_start(campaign_id: int, tasks: BackgroundTasks) -> dict:
-    if not vapi.configured():
+    if not vapi.configured() and not asterisk_ari.configured():
         raise HTTPException(503, "No telephony configured — set VAPI_PRIVATE_KEY or Asterisk")
     db.set_campaign_status(campaign_id, "running")
     tasks.add_task(_run_campaign, campaign_id)
@@ -505,8 +615,15 @@ async def _run_campaign(campaign_id: int) -> None:
         ).get("status") != "running":
             return  # stopped from the dashboard
         try:
-            result = await vapi.create_call(target["phone"])
-            db.set_target_status(target["id"], "called", call_id=result.get("id", ""))
+            if vapi.configured():
+                result = await vapi.create_call(target["phone"])
+                db.set_target_status(target["id"], "called", call_id=result.get("id", ""))
+            elif asterisk_ari.configured():
+                endpoint = f"PJSIP/{target['phone']}@trunk"
+                res = await asterisk_ari._rest("POST", "/channels", endpoint=endpoint, app=asterisk_ari.APP_NAME)
+                db.set_target_status(target["id"], "called", call_id=(res or {}).get("id", ""))
+            else:
+                db.set_target_status(target["id"], "failed", error="No telephony configured")
         except Exception as e:  # noqa: BLE001
             db.set_target_status(target["id"], "failed", error=str(e)[:200])
         await asyncio.sleep(float(os.getenv("CAMPAIGN_GAP_SECONDS", "5")))
@@ -520,6 +637,165 @@ def analytics(days: int = 30) -> dict:
     return db.get_analytics(days)
 
 
+# --- stock management ---------------------------------------------------
+
+@app.get("/api/stock")
+def stock_list(agent_id: int | None = None) -> list[dict]:
+    return db.get_stock_items(agent_id)
+
+
+@app.post("/api/stock")
+def stock_create(
+    name: str = Body(...),
+    category: str = Body(None),
+    quantity: float = Body(0),
+    unit: str = Body("pcs"),
+    rate: float = Body(0),
+    gst_percent: float = Body(0),
+    min_stock: float = Body(0),
+    agent_id: int = Body(None),
+) -> dict:
+    return db.add_stock_item(name=name, category=category, quantity=quantity,
+                             unit=unit, rate=rate, gst_percent=gst_percent,
+                             min_stock=min_stock, agent_id=agent_id)
+
+
+@app.put("/api/stock/{stock_id}")
+def stock_update(
+    stock_id: int,
+    name: str = Body(None),
+    category: str = Body(None),
+    quantity: float = Body(None),
+    unit: str = Body(None),
+    rate: float = Body(None),
+    gst_percent: float = Body(None),
+    min_stock: float = Body(None),
+) -> dict:
+    fields = {k: v for k, v in
+              {"name": name, "category": category, "quantity": quantity,
+               "unit": unit, "rate": rate, "gst_percent": gst_percent,
+               "min_stock": min_stock}.items()
+              if v is not None}
+    updated = db.update_stock_item(stock_id, **fields)
+    if not updated:
+        raise HTTPException(404, "No such stock item")
+    return updated
+
+
+@app.delete("/api/stock/{stock_id}")
+def stock_delete(stock_id: int) -> dict:
+    db.delete_stock_item(stock_id)
+    return {"ok": True}
+
+
+@app.get("/api/stock/{stock_id}/entries")
+def stock_entries(stock_id: int) -> list[dict]:
+    return db.get_stock_entries(stock_id)
+
+
+@app.post("/api/stock/{stock_id}/entries")
+def stock_entry_create(
+    stock_id: int,
+    entry_type: str = Body(...),
+    quantity: float = Body(...),
+    notes: str = Body(None),
+) -> dict:
+    if entry_type not in ("in", "out", "adjust"):
+        raise HTTPException(400, "entry_type must be 'in', 'out', or 'adjust'")
+    return db.add_stock_entry(stock_id, entry_type, quantity, notes)
+
+
+# --- bills --------------------------------------------------------------
+
+@app.get("/api/bills")
+def bills_list() -> list[dict]:
+    return db.get_bills()
+
+
+@app.get("/api/bills/{bill_id}")
+def bill_detail(bill_id: int) -> dict:
+    found = db.get_bill(bill_id)
+    if not found:
+        raise HTTPException(404, "No such bill")
+    return found
+
+
+@app.delete("/api/bills/{bill_id}")
+def bill_delete(bill_id: int) -> dict:
+    db.delete_bill(bill_id)
+    return {"ok": True}
+
+
+# --- adaptive learning --------------------------------------------------
+
+@app.get("/api/learned")
+def learned_list(agent_id: int | None = None, status: str | None = None) -> list[dict]:
+    return db.get_learned_answers(agent_id, status)
+
+
+@app.put("/api/learned/{learned_id}")
+def learned_update(learned_id: int, status: str = Body(..., embed=True)) -> dict:
+    if status not in ("approved", "rejected"):
+        raise HTTPException(400, "status must be 'approved' or 'rejected'")
+    result = db.update_learned_status(learned_id, status)
+    if not result:
+        raise HTTPException(404, "No such learned answer")
+    return result
+
+
+@app.delete("/api/learned/{learned_id}")
+def learned_delete(learned_id: int) -> dict:
+    db.delete_learned(learned_id)
+    return {"ok": True}
+
+
+# --- evals / simulations ------------------------------------------------
+
+@app.get("/api/evals")
+def evals_list() -> list[dict]:
+    return db.get_eval_cases()
+
+
+@app.post("/api/evals")
+def eval_create(
+    name: str = Body(...),
+    rubric: str = Body(...),
+    mode: str = Body("script"),
+    agent_id: int | None = Body(None),
+    turns: str = Body(""),
+    persona: str = Body(""),
+    max_turns: int = Body(4),
+) -> dict:
+    if mode not in ("script", "simulate"):
+        raise HTTPException(400, "mode must be 'script' or 'simulate'")
+    if mode == "script" and not turns.strip():
+        raise HTTPException(400, "A script test needs at least one caller line")
+    if mode == "simulate" and not persona.strip():
+        raise HTTPException(400, "A simulation needs a caller persona")
+    if not name.strip() or not rubric.strip():
+        raise HTTPException(400, "Name and pass criteria are required")
+    # Bounded: each simulated turn is two model calls on a per-minute budget.
+    max_turns = min(max(max_turns, 1), 8)
+    case_id = db.add_eval_case(name.strip(), agent_id, mode, turns, persona, max_turns, rubric)
+    return {"id": case_id}
+
+
+@app.post("/api/evals/{case_id}/run")
+async def eval_run(case_id: int) -> dict:
+    import evals
+
+    case = db.get_eval_case(case_id)
+    if not case:
+        raise HTTPException(404, "No such test")
+    return await evals.run_case(case)
+
+
+@app.delete("/api/evals/{case_id}")
+def eval_delete(case_id: int) -> dict:
+    db.delete_eval_case(case_id)
+    return {"ok": True}
+
+
 # --- web calling --------------------------------------------------------
 
 @app.websocket("/api/web-call/ws")
@@ -527,7 +803,14 @@ async def web_call(ws: WebSocket) -> None:
     """Talk to the agent from the browser. One socket per call."""
     await ws.accept()
     agent_id = ws.query_params.get("agent")
-    session = webcall.Session(int(agent_id) if agent_id else None)
+    assistant = ws.query_params.get("mode") == "assistant"
+    if assistant and not await _owner_ok(ws):
+        await ws.send_json({"type": "error", "text": "Assistant mode needs the owner PIN "
+                            "(ASSISTANT_PIN in backend/.env) when used from another device."})
+        await ws.close()
+        return
+    session = webcall.Session(int(agent_id) if agent_id else None,
+                              caller_key=ws.query_params.get("caller"), assistant=assistant)
     session.open_record()
     await ws.send_json(
         {"type": "connected", "callId": session.id, "agent": session.agent.get("name", "")}
@@ -539,12 +822,73 @@ async def web_call(ws: WebSocket) -> None:
             message = await ws.receive()
             if message.get("type") == "websocket.disconnect":
                 break
+            if "text" in message:
+                try:
+                    import json
+                    payload = json.loads(message["text"])
+                    kind = payload.get("type")
+                except Exception:
+                    payload, kind = {}, None
+                if kind == "ping":
+                    await ws.send_json({"type": "pong"})
+                elif kind == "barge":
+                    session.interrupted()
+                elif kind == "say" and isinstance(payload.get("text"), str):
+                    await webcall.respond(ws, session, payload["text"])
+                continue
             if (audio := message.get("bytes")) is not None:
                 await webcall.handle_turn(ws, session, audio)
     except WebSocketDisconnect:
         pass
     finally:
         session.close_record()
+        # Analysis, stitched recording and text record — as their own task, not
+        # awaited here. This handler can be cancelled the moment the socket
+        # goes, and an await in its `finally` died with it: the call kept its
+        # segments but never got a summary, an mp3 or a text record.
+        task = asyncio.create_task(_finalize(session))
+        _finalizing.add(task)  # a bare task can be garbage-collected mid-run
+        task.add_done_callback(_finalizing.discard)
+
+
+_finalizing: set[asyncio.Task] = set()
+
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+async def _owner_ok(ws: WebSocket) -> bool:
+    """May this socket drive the owner assistant? It can message any number,
+    so it is not open to whoever reaches the port.
+
+    On this machine (directly, or through the Vite proxy from this machine):
+    yes. From anywhere else — a phone on the Wi-Fi — the first message must
+    carry ASSISTANT_PIN; with no PIN configured, remote use is refused.
+    """
+    origin = ws.client.host if ws.client else ""
+    # X-Forwarded-For is only believed when the hop itself is local (our Vite
+    # proxy); from anyone else it's a header they could simply type.
+    fwd = ws.headers.get("x-forwarded-for", "")
+    if origin in _LOOPBACK and fwd:
+        origin = fwd.split(",")[0].strip()
+    if origin in _LOOPBACK:
+        return True
+    pin = os.getenv("ASSISTANT_PIN", "")
+    if not pin:
+        return False
+    try:
+        first = await asyncio.wait_for(ws.receive_json(), timeout=15)
+    except Exception:  # noqa: BLE001 - timeout, bad json, disconnect: all a no
+        return False
+    import hmac
+
+    return first.get("type") == "auth" and hmac.compare_digest(str(first.get("pin", "")), pin)
+
+
+async def _finalize(session) -> None:
+    try:
+        await webcall.finalize(session)
+    except Exception as e:  # noqa: BLE001
+        log.warning("post-call processing failed for %s: %s", session.id, e)
 
 
 # --- vapi webhook -------------------------------------------------------

@@ -111,30 +111,47 @@ function SetupStatus({ health }) {
   const parts = [
     ["Calls", health.vapi],
     ["WhatsApp", health.whatsapp],
-    ["Voice", health.voiceReady],
+    ["Voice", health.voice],
     ["Replies", health.brain],
   ];
-  if (parts.every(([, on]) => on)) return null;
+  const allKeysPresent = parts.every(([, on]) => on);
+
+  // Voice key is set but no voice selected yet — different from a missing key.
+  const needsVoiceSelection = health.voice && !health.voiceReady;
+
+  if (allKeysPresent && !needsVoiceSelection) return null;
 
   return (
-    <Card className="mt-4 border-saffron/25 bg-saffron/5">
-      <p className="text-[13px] font-medium text-saffron">Setup incomplete</p>
-      <p className="mt-1 text-xs text-dim">
-        Add the missing keys to <code className="font-mono">backend/.env</code> — see the README.
-      </p>
-      <div className="mt-3 flex flex-wrap gap-2">
-        {parts.map(([label, on]) => (
-          <span
-            key={label}
-            className={`rounded-full px-2.5 py-1 text-xs ring-1 ${
-              on ? "bg-mint/10 text-mint ring-mint/25" : "bg-panel-2 text-dim ring-line"
-            }`}
-          >
-            {on ? "✓" : "○"} {label}
-          </span>
-        ))}
-      </div>
-    </Card>
+    <>
+      {!allKeysPresent && (
+        <Card className="mt-4 border-saffron/25 bg-saffron/5">
+          <p className="text-[13px] font-medium text-saffron">Setup incomplete</p>
+          <p className="mt-1 text-xs text-dim">
+            Add the missing keys to <code className="font-mono">backend/.env</code> — see the README.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {parts.map(([label, on]) => (
+              <span
+                key={label}
+                className={`rounded-full px-2.5 py-1 text-xs ring-1 ${
+                  on ? "bg-mint/10 text-mint ring-mint/25" : "bg-panel-2 text-dim ring-line"
+                }`}
+              >
+                {on ? "✓" : "○"} {label}
+              </span>
+            ))}
+          </div>
+        </Card>
+      )}
+      {needsVoiceSelection && (
+        <Card className="mt-4 border-violet/25 bg-violet/5">
+          <p className="text-[13px] font-medium text-violet-soft">Voice not selected</p>
+          <p className="mt-1 text-xs text-dim">
+            Pick a voice in <span className="font-medium text-text">Voice Studio</span> so the agent can speak.
+          </p>
+        </Card>
+      )}
+    </>
   );
 }
 

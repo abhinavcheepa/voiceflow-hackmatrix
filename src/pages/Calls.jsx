@@ -1,8 +1,8 @@
-import { useState } from "react";
-import { Search, PhoneIncoming, PhoneOutgoing, Loader2, X } from "lucide-react";
+import { Fragment, useState } from "react";
+import { Search, PhoneIncoming, PhoneOutgoing, Loader2, X, FileText, ChevronDown } from "lucide-react";
 import { Card, EmptyState, ErrorNote } from "../ui.jsx";
 import { OutcomeBadge } from "./Dashboard.jsx";
-import { useApi, post } from "../api.js";
+import { API, useApi, post } from "../api.js";
 
 const filters = ["All", "Booked", "Lead captured", "Answered", "Escalated", "Missed"];
 
@@ -82,10 +82,42 @@ function NewCall({ onPlaced }) {
   );
 }
 
+/** Expanded row: the summary, the recording and the text record. */
+function CallDetail({ call }) {
+  return (
+    <tr className="border-b border-line/50 bg-panel-2/60">
+      <td colSpan={6} className="px-5 py-4 whitespace-normal">
+        <p className="text-xs text-dim">Summary</p>
+        <p className="mt-1 max-w-3xl text-sm">
+          {call.summary || "No summary yet — it appears a few seconds after the call ends."}
+        </p>
+        <div className="mt-4 flex flex-wrap items-center gap-4">
+          {call.recordingUrl ? (
+            <audio controls preload="none" src={`${API}${call.recordingUrl}`} className="h-9 w-full max-w-md" />
+          ) : (
+            <p className="text-xs text-dim">No recording for this call.</p>
+          )}
+          {call.recordUrl && (
+            <a
+              href={`${API}${call.recordUrl}`}
+              target="_blank"
+              rel="noreferrer"
+              className="flex items-center gap-2 rounded-xl border border-line px-3.5 py-2 text-xs transition hover:border-violet/50"
+            >
+              <FileText className="size-3.5" /> Text record (summary + transcript)
+            </a>
+          )}
+        </div>
+      </td>
+    </tr>
+  );
+}
+
 export default function Calls() {
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState("All");
   const { data: calls, error, reload } = useApi("/api/calls?limit=200", []);
+  const [openId, setOpenId] = useState(null);
 
   const needle = q.trim().toLowerCase();
   const rows = calls.filter(
@@ -153,7 +185,11 @@ export default function Calls() {
           </thead>
           <tbody>
             {rows.map((c) => (
-              <tr key={c.id} className="border-b border-line/50 last:border-0 hover:bg-panel-2">
+              <Fragment key={c.id}>
+              <tr
+                onClick={() => setOpenId(openId === c.id ? null : c.id)}
+                className="cursor-pointer border-b border-line/50 last:border-0 hover:bg-panel-2"
+              >
                 <td className="px-5 py-4">
                   <div className="flex items-center gap-3">
                     <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-violet/10 ring-1 ring-violet/25">
@@ -166,13 +202,25 @@ export default function Calls() {
                   </div>
                 </td>
                 <td className="px-5 py-4 text-dim">{c.language}</td>
-                <td className="px-5 py-4">{c.intent}</td>
+                <td className="px-5 py-4">
+                  <p>{c.intent}</p>
+                  {c.summary && (
+                    <p className="mt-0.5 max-w-xs text-xs text-dim/80">{c.summary}</p>
+                  )}
+                </td>
                 <td className="px-5 py-4 text-dim">{c.duration}</td>
                 <td className="px-5 py-4">
                   <OutcomeBadge outcome={c.outcome} />
                 </td>
-                <td className="px-5 py-4 text-dim">{c.time}</td>
+                <td className="px-5 py-4 text-dim">
+                  <span className="flex items-center gap-2">
+                    {c.time}
+                    <ChevronDown className={`size-3.5 transition ${openId === c.id ? "rotate-180" : ""}`} />
+                  </span>
+                </td>
               </tr>
+              {openId === c.id && <CallDetail call={c} />}
+              </Fragment>
             ))}
             {rows.length === 0 && (
               <tr>
