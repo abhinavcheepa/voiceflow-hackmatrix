@@ -264,3 +264,11 @@ def _wav_to_mp3(wav_bytes: bytes) -> bytes:
     except Exception as e:
         logger.debug("pydub mp3 export fallback: %s", e)
         return wav_bytes
+
+
+def warm():
+    """Pre-warm models on server startup."""
+    try:
+        _init_models()
+    except Exception as e:
+        logger.debug("Warmup error: %s", e)

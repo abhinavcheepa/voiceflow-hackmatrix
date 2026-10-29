@@ -1,4 +1,6 @@
-﻿# Starts every part of VoiceFlow AI and reports what is actually live.
+param([switch]$Stop, [switch]$NoBridge, [switch]$Watch)
+
+# Starts every part of VoiceFlow AI and reports what is actually live.
 #
 #   .\start.ps1              start everything
 #   .\start.ps1 -Stop        stop everything
@@ -7,10 +9,10 @@
 # Each service runs detached, so closing this window leaves them running.
 # Use -Stop to shut them down.
 
-param([switch]$Stop, [switch]$NoBridge, [switch]$Watch)
 
 $ErrorActionPreference = "Continue"
-$root = $PSScriptRoot
+$root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+Write-Host "VoiceFlow AI initializing from: $root" -ForegroundColor DarkGray
 $envFile = Join-Path $root "backend\.env"
 
 function Get-EnvValue($key) {
@@ -86,9 +88,8 @@ if (-not $NoBridge -and $provider -eq "web") {
         $env:BRIDGE_TOKEN = Get-EnvValue "WA_BRIDGE_TOKEN"
         Start-Process -FilePath "node.exe" -ArgumentList "index.js" -WorkingDirectory $bridgeDir `
             -WindowStyle Hidden -RedirectStandardOutput "$bridgeDir\bridge.log" -RedirectStandardError "$bridgeDir\bridge.err"
-        $bridgeUp = Wait-For "http://127.0.0.1:8100/qr" @{} 60
-        # /qr 404s until a QR exists, which still proves the port is listening.
-        if (-not $bridgeUp) { $bridgeUp = Wait-For "http://127.0.0.1:8100/status" @{ "X-Bridge-Token" = $env:BRIDGE_TOKEN } 5 }
+        # Fast check: /status answers immediately once port 8100 listens
+        $bridgeUp = Wait-For "http://127.0.0.1:8100/status" @{ "X-Bridge-Token" = $env:BRIDGE_TOKEN } 15
     }
     else {
         Write-Host "wa-bridge not installed - run: cd wa-bridge; npm install" -ForegroundColor Yellow
