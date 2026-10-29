@@ -258,7 +258,11 @@ async def _cartesia_library() -> list[dict]:
 #   "BILL-0001"        -> "bill bill 00001"
 #   "V-O-I-C-E"        -> letters spelled one by one
 #   "(Waiting for …)"  -> the model's own stage note, read out loud
-_ACRONYMS = {"AI", "GST", "UPI", "OTP", "PDF", "EMI", "SMS", "HOD", "CSE", "ID", "OK", "TV", "AC", "KYC", "PAN"}
+_ACRONYMS = {
+    "AI", "GST", "UPI", "OTP", "PDF", "EMI", "SMS", "HOD", "CSE", "ECE", "IT",
+    "ID", "OK", "TV", "AC", "KYC", "PAN", "HTML", "CSS", "JS", "URL", "HTTP",
+    "SIM", "GSM", "PBX", "SIP", "CRM", "CEO", "CTO", "HR", "FAQ", "MB", "GB", "KB",
+}
 _SPEECH_RULES = [
     (re.compile(r"\((?:waiting|note|pause|thinking|silence)[^)]*\)\.?", re.I), " "),
     (re.compile(r"[*_#`~]+"), ""),                                   # markdown
@@ -270,6 +274,12 @@ _SPEECH_RULES = [
     (re.compile(r"\b([A-Za-z]+)-0*(\d+)\b"), r"\1 \2"),              # BILL-0001 -> BILL 1
     (re.compile(r"₹\s*(\d(?:[\d,]*\d)?(?:\.\d+)?)"), r"\1 rupaye"),
     (re.compile(r"\bRs\.?\s*(\d(?:[\d,]*\d)?(?:\.\d+)?)", re.I), r"\1 rupaye"),
+    (re.compile(r"(\d+)%"), r"\1 percent"),                           # percentages
+    # Spacing 10-digit phone numbers for clean digit-by-digit pronunciation
+    (re.compile(r"\b(\d{5})(\d{5})\b"), r"\1 \2"),
+    (re.compile(r"\b(\d)(\d)(\d)(\d)(\d)\b"), r"\1 \2 \3 \4 \5"),
+    # Natural breathing pause after common Indian discourse markers
+    (re.compile(r"\b(haanji|ji|bilkul|namaste|shukriya|dhanyawad|ji haan)\b[,.]?", re.I), r"\1, "),
     (re.compile(r"(?<=[^\s\d.])([.!?।])(?=[^\s\d.!?।)])"), r"\1 "),  # "hai.Ji" -> "hai. Ji"
     (re.compile(r"[()\[\]]"), " "),
 ]
@@ -340,9 +350,9 @@ async def _clone_speak(text: str, vid: str, locale: str) -> bytes:
     base_voice = by_language.get(locale) or by_language[DEFAULT_LANGUAGE]
     base = await _edge_speak(text, base_voice, locale)
     try:
-        clone_timeout = float(os.getenv("CLONE_TIMEOUT_SECONDS", "4.0"))
+        clone_timeout = float(os.getenv("CLONE_TIMEOUT_SECONDS", "8.0"))
         return await asyncio.wait_for(
-            asyncio.to_thread(cloning.convert, base, vid[len(CLONE_PREFIX):]),
+            asyncio.to_thread(cloning.convert, base, vid[len(CLONE_PREFIX):], 0.20, text, True),
             timeout=clone_timeout,
         )
     except Exception as e:  # noqa: BLE001 - a stock voice beats a silent turn

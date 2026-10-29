@@ -53,6 +53,17 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at      TEXT NOT NULL
 );
 
+
+CREATE TABLE IF NOT EXISTS cloned_audios (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    clone_id    TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    filename    TEXT NOT NULL,
+    filepath    TEXT NOT NULL,
+    size_bytes  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -1765,3 +1776,34 @@ def get_recent_jobs(limit: int = 20) -> list[dict]:
             pass
         out.append(d)
     return out
+
+
+# ── Cloned Audios ────────────────────────────────────────────────────────
+
+def save_cloned_audio(clone_id: str, text: str, filename: str, filepath: str, size_bytes: int = 0) -> int:
+    with connect() as db:
+        cur = db.execute(
+            """INSERT INTO cloned_audios (clone_id, text, filename, filepath, size_bytes, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (clone_id, text, filename, filepath, size_bytes, datetime.now(timezone.utc).isoformat()),
+        )
+        return cur.lastrowid
+
+
+def list_cloned_audios(limit: int = 50) -> list[dict]:
+    with connect() as db:
+        rows = db.execute(
+            """SELECT id, clone_id, text, filename, filepath, size_bytes, created_at
+               FROM cloned_audios ORDER BY id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_cloned_audio(audio_id: int) -> str | None:
+    with connect() as db:
+        row = db.execute("""SELECT filepath FROM cloned_audios WHERE id = ?""", (audio_id,)).fetchone()
+        if not row:
+            return None
+        db.execute("""DELETE FROM cloned_audios WHERE id = ?""", (audio_id,))
+        return row["filepath"]

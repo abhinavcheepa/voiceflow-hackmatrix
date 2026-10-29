@@ -562,6 +562,33 @@ def voice_style(style: str = Body(..., embed=True)) -> dict:
     return {"style": style}
 
 
+@app.get("/api/voice/cloned-audios")
+def list_cloned_audios(limit: int = 50) -> list[dict]:
+    """List all saved cloned audio files."""
+    return db.list_cloned_audios(limit=limit)
+
+
+@app.get("/api/voice/cloned-audios/play/{filename}")
+def play_cloned_audio(filename: str):
+    """Serve saved cloned audio file."""
+    import cloning
+    from fastapi.responses import FileResponse
+    safe_name = os.path.basename(filename)
+    path = cloning.CLONED_AUDIO_DIR / safe_name
+    if not path.exists():
+        raise HTTPException(404, "Audio file not found")
+    return FileResponse(str(path), media_type="audio/mpeg")
+
+
+@app.delete("/api/voice/cloned-audios/{audio_id}")
+def delete_cloned_audio(audio_id: str):
+    """Delete a saved cloned audio entry and file."""
+    deleted = db.delete_cloned_audio(audio_id)
+    if not deleted:
+        raise HTTPException(404, "Cloned audio not found")
+    return {"ok": True, "id": audio_id}
+
+
 # --- agents -------------------------------------------------------------
 
 @app.get("/api/agents")
