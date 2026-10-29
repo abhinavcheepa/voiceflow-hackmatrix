@@ -14,12 +14,13 @@ import os
 
 import httpx
 
-BRIDGE_URL = (os.getenv("WA_BRIDGE_URL") or "http://127.0.0.1:8100").rstrip("/")
+def get_bridge_url() -> str:
+    return (os.getenv("WA_BRIDGE_URL") or "http://127.0.0.1:8100").rstrip("/")
 TOKEN = os.getenv("BRIDGE_SECRET") or os.getenv("WA_BRIDGE_TOKEN") or ""
 
 
 def configured() -> bool:
-    return bool(BRIDGE_URL)
+    return bool(get_bridge_url())
 
 
 def _headers() -> dict:
@@ -30,7 +31,7 @@ async def status() -> dict:
     """Link state: starting | qr | connected | disconnected | auth_failure."""
     try:
         async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(f"{BRIDGE_URL}/status", headers=_headers())
+            r = await client.get(f"{get_bridge_url()}/status", headers=_headers())
             r.raise_for_status()
             return r.json()
     except httpx.HTTPError as e:
@@ -42,7 +43,7 @@ async def status() -> dict:
 async def send_text(to: str, body: str) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
-            f"{BRIDGE_URL}/send/text", headers=_headers(), json={"to": to, "text": body}
+            f"{get_bridge_url()}/send/text", headers=_headers(), json={"to": to, "text": body}
         )
         r.raise_for_status()
         return r.json()
@@ -51,7 +52,7 @@ async def send_text(to: str, body: str) -> dict:
 async def send_voice(to: str, audio: bytes, mime: str = "audio/mpeg") -> dict:
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
-            f"{BRIDGE_URL}/send/audio",
+            f"{get_bridge_url()}/send/audio",
             headers=_headers(),
             json={
                 "to": to,
@@ -67,7 +68,7 @@ async def sync(chats: int = 20, messages: int = 10) -> list[dict]:
     """Recent one-to-one chats with their latest messages, newest chats first."""
     async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(
-            f"{BRIDGE_URL}/sync", headers=_headers(), json={"chats": chats, "messages": messages}
+            f"{get_bridge_url()}/sync", headers=_headers(), json={"chats": chats, "messages": messages}
         )
         r.raise_for_status()
         return r.json().get("threads", [])
@@ -75,7 +76,7 @@ async def sync(chats: int = 20, messages: int = 10) -> list[dict]:
 
 async def logout() -> None:
     async with httpx.AsyncClient(timeout=15) as client:
-        await client.post(f"{BRIDGE_URL}/logout", headers=_headers())
+        await client.post(f"{get_bridge_url()}/logout", headers=_headers())
 
 
 def parse(payload: dict) -> dict:

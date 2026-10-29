@@ -25,7 +25,9 @@ import pkg from "whatsapp-web.js";
 const { Client, LocalAuth, MessageMedia } = pkg;
 
 const PORT = Number(process.env.BRIDGE_PORT || 8100);
-const BACKEND = (process.env.BACKEND_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
+function getBackendUrl() {
+  return (process.env.BACKEND_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
+}
 const TOKEN = process.env.BRIDGE_SECRET || process.env.BRIDGE_TOKEN || "";
 
 // Everything the backend needs to know about the link, in one place.
@@ -445,7 +447,7 @@ async function onIncoming(msg, source) {
 async function forward(payload, attempt = 1) {
   const MAX = 5;
   try {
-    const r = await fetch(`${BACKEND}/api/whatsapp/web/incoming`, {
+    const r = await fetch(`${getBackendUrl()}/api/whatsapp/web/incoming`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Bridge-Token": TOKEN },
       body: JSON.stringify(payload),
