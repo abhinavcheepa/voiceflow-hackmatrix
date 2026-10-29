@@ -19,15 +19,7 @@
     },
     "wa-bridge": {
       "root": "wa-bridge",
-      "framework": "express",
-      "bindings": [
-        {
-          "type": "service",
-          "service": "backend",
-          "format": "url",
-          "env": "BACKEND_URL"
-        }
-      ]
+      "framework": "express"
     }
   },
   "rewrites": [
