@@ -31,3 +31,5 @@ docs/MITS_FE_Faculty_Database.md
 
 # call recordings and text records — customers' voices and words
 backend/recordings/
+screenshots/
+*.bak

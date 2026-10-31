@@ -580,7 +580,7 @@ export default function WebCall() {
             className={`grid size-20 place-items-center rounded-full transition ${
               live
                 ? "bg-rose text-white"
-                : "bg-mint text-ink ring-8 ring-mint/15 hover:brightness-110"
+                : "bg-aqua text-ink ring-8 ring-aqua/15 hover:brightness-110"
             }`}
           >
             {status === "connecting" ? (
@@ -609,7 +609,7 @@ export default function WebCall() {
               <div className="relative h-2 overflow-hidden rounded-full bg-panel-2">
                 <div
                   className={`h-full rounded-full transition-[width] duration-100 ${
-                    level.rms >= level.speechBar ? "bg-mint" : "bg-line"
+                    level.rms >= level.speechBar ? "bg-aqua" : "bg-line"
                   }`}
                   style={{
                     width: `${Math.min(100, (level.rms / (level.speechBar * 2)) * 100)}%`,

@@ -6,9 +6,9 @@ import { useApi } from "../api.js";
 const RANGES = [7, 30, 90];
 
 const outcomeColor = {
-  Booked: "#2ee6a8",
-  "Lead captured": "#7c5cff",
-  Answered: "#8e8ea8",
+  Booked: "#40e5e1",
+  "Lead captured": "#7055dd",
+  Answered: "#8a96b2",
   Escalated: "#ff8a3d",
   Missed: "#ff5c7a",
 };
@@ -17,7 +17,7 @@ const shortDay = (iso) =>
   new Date(iso).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
 
 /** Bar chart with a shared scale, so two series stay comparable. */
-function Bars({ data, valueOf, labelOf, color = "#7c5cff", title, sub }) {
+function Bars({ data, valueOf, labelOf, color = "#7055dd", title, sub }) {
   const peak = Math.max(...data.map(valueOf), 1);
   return (
     <Card>
@@ -123,7 +123,7 @@ export default function Analytics() {
           data={whatsapp}
           valueOf={(d) => d.inbound}
           labelOf={(d) => shortDay(d.day)}
-          color="#2ee6a8"
+          color="#40e5e1"
           title="WhatsApp messages per day"
           sub="Incoming from customers"
         />
@@ -150,7 +150,7 @@ export default function Analytics() {
                       className="h-full rounded-full"
                       style={{
                         width: `${(o.count / totalOutcomes) * 100}%`,
-                        background: outcomeColor[o.outcome] ?? "#8e8ea8",
+                        background: outcomeColor[o.outcome] ?? "#8a96b2",
                       }}
                     />
                   </div>

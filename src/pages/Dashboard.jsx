@@ -17,7 +17,7 @@ const tilesFor = (s) => [
 ];
 
 const outcomeStyles = {
-  Booked: "bg-mint/10 text-mint ring-mint/25",
+  Booked: "bg-aqua/10 text-aqua ring-aqua/25",
   "Lead captured": "bg-violet/15 text-violet-soft ring-violet/30",
   Answered: "bg-panel-2 text-dim ring-line",
   Escalated: "bg-saffron/10 text-saffron ring-saffron/25",
@@ -58,7 +58,7 @@ function CallVolume({ callsByHour }) {
               <div
                 key={h.hour}
                 title={`${h.calls} calls at ${h.hour}:00`}
-                className="flex-1 rounded-t-md bg-gradient-to-t from-violet/30 to-violet transition hover:to-violet-soft"
+                className="flex-1 rounded-t-md bg-gradient-to-t from-violet/30 to-azure transition hover:to-aqua"
                 style={{ height: `${(h.calls / peak) * 100}%` }}
               />
             ))}
@@ -134,7 +134,7 @@ function SetupStatus({ health }) {
               <span
                 key={label}
                 className={`rounded-full px-2.5 py-1 text-xs ring-1 ${
-                  on ? "bg-mint/10 text-mint ring-mint/25" : "bg-panel-2 text-dim ring-line"
+                  on ? "bg-aqua/10 text-aqua ring-aqua/25" : "bg-panel-2 text-dim ring-line"
                 }`}
               >
                 {on ? "✓" : "○"} {label}

@@ -284,7 +284,7 @@ export default function Agents() {
                 <div className="flex items-center gap-2">
                   <p className="text-sm font-medium">{a.name}</p>
                   {a.isDefault && (
-                    <span className="flex items-center gap-1 rounded-full bg-mint/10 px-2 py-0.5 text-[10px] text-mint ring-1 ring-mint/25">
+                    <span className="flex items-center gap-1 rounded-full bg-aqua/10 px-2 py-0.5 text-[10px] text-aqua ring-1 ring-aqua/25">
                       <Star className="size-2.5" /> default
                     </span>
                   )}

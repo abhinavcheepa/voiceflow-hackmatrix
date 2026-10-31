@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 400" fill="none">
+  <defs>
+    <linearGradient id="vf-mark-gradient" x1="20" y1="200" x2="475" y2="200" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3a58cf" />
+      <stop offset="38%" stop-color="#40e5e1" />
+      <stop offset="68%" stop-color="#3990df" />
+      <stop offset="100%" stop-color="#7055dd" />
+    </linearGradient>
+  </defs>
+
+  <!-- Waveform flowing into bubble wall -->
+  <path
+    d="M 22 192 L 60 192 C 80 192 92 120 108 120 C 122 120 138 260 153 260 C 168 260 186 52 201 52 C 216 52 234 300 249 300 C 264 300 279 120 293 120 C 307 120 323 250 338 250 C 353 250 365 192 380 192 L 428 192 C 448 192 462 185 466 168"
+    stroke="url(#vf-mark-gradient)"
+    stroke-width="22"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <!-- Bubble upper arc -->
+  <path
+    d="M 240 52 C 265 38 296 28 335 28 C 408 28 466 85 466 168"
+    stroke="url(#vf-mark-gradient)"
+    stroke-width="22"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <!-- Bubble lower side with tail (separated by small gap on right side) -->
+  <path
+    d="M 470 218 C 466 250 456 280 448 300 L 462 366 L 434 316 C 395 348 320 348 236 328"
+    stroke="url(#vf-mark-gradient)"
+    stroke-width="22"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

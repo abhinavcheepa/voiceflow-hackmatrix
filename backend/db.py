@@ -394,11 +394,11 @@ def get_calls_by_hour() -> list[dict]:
 
 # Fixed colours so a language keeps the same swatch across renders.
 LANG_COLORS = {
-    "Hindi": "#7c5cff",
-    "English": "#2ee6a8",
+    "Hindi": "#7055dd",
+    "English": "#40e5e1",
     "Hinglish": "#ff8a3d",
-    "Marathi": "#4fa8ff",
-    "Tamil": "#ff5c8a",
+    "Marathi": "#3990df",
+    "Tamil": "#ff5c7a",
 }
 
 
@@ -413,7 +413,7 @@ def get_languages() -> list[dict]:
         {
             "name": r["language"],
             "share": round(r["n"] / total * 100),
-            "color": LANG_COLORS.get(r["language"], "#8b8b9e"),
+            "color": LANG_COLORS.get(r["language"], "#8a96b2"),
         }
         for r in rows
     ]

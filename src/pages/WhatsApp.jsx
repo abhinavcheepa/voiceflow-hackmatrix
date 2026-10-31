@@ -23,7 +23,7 @@ function Toggle({ on, onChange, disabled, title }) {
       disabled={disabled}
       onClick={() => onChange(!on)}
       className={`relative h-5 w-9 shrink-0 rounded-full transition disabled:opacity-40 ${
-        on ? "bg-mint" : "bg-panel-2 ring-1 ring-line"
+        on ? "bg-aqua" : "bg-panel-2 ring-1 ring-line"
       }`}
     >
       <span
@@ -255,7 +255,7 @@ export default function WhatsApp() {
           {imported && (
             <div
               className={`mt-2 flex items-start gap-2 text-[11px] leading-relaxed ${
-                imported.ok ? "text-mint" : "text-saffron"
+                imported.ok ? "text-aqua" : "text-saffron"
               }`}
             >
               <span className="min-w-0 flex-1">{imported.text}</span>
@@ -292,7 +292,7 @@ export default function WhatsApp() {
             <div className="flex items-center justify-between">
               <p className="text-xs font-medium">Only reply to these numbers</p>
               {allowlistSaved && (
-                <span className="text-[10px] text-mint animate-pulse">Saved ✓</span>
+                <span className="text-[10px] text-aqua animate-pulse">Saved ✓</span>
               )}
             </div>
             <p className="mt-0.5 text-[11px] leading-tight text-dim">
@@ -335,7 +335,7 @@ export default function WhatsApp() {
               </span>
             </div>
             {c.unread > 0 && (
-              <span className="mt-1 grid size-5 shrink-0 place-items-center rounded-full bg-mint text-[10px] font-semibold text-ink">
+              <span className="mt-1 grid size-5 shrink-0 place-items-center rounded-full bg-aqua text-[10px] font-semibold text-ink">
                 {c.unread}
               </span>
             )}
@@ -370,7 +370,7 @@ export default function WhatsApp() {
               <div className="flex shrink-0 items-center gap-2.5">
                 <span
                   className={`text-xs ${
-                    autoReply?.enabled && active.autoReply ? "text-mint" : "text-dim"
+                    autoReply?.enabled && active.autoReply ? "text-aqua" : "text-dim"
                   }`}
                 >
                   {!autoReply?.enabled

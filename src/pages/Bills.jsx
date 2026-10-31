@@ -14,7 +14,7 @@ export default function Bills() {
 
   const statusStyle = {
     draft: "bg-saffron/10 text-saffron ring-saffron/25",
-    final: "bg-mint/10 text-mint ring-mint/25",
+    final: "bg-aqua/10 text-aqua ring-aqua/25",
   };
 
   return (
@@ -117,7 +117,7 @@ function BillDetailModal({ billId, onClose }) {
             </p>
           </div>
           <span className={`rounded-full px-2 py-0.5 text-xs ring-1 ${
-            bill.status === "final" ? "bg-mint/10 text-mint ring-mint/25" : "bg-saffron/10 text-saffron ring-saffron/25"
+            bill.status === "final" ? "bg-aqua/10 text-aqua ring-aqua/25" : "bg-saffron/10 text-saffron ring-saffron/25"
           }`}>
             {bill.status}
           </span>
@@ -154,7 +154,7 @@ function BillDetailModal({ billId, onClose }) {
           <p className="text-dim">Subtotal: <span className="text-white">₹{bill.subtotal?.toFixed(2)}</span></p>
           <p className="text-dim">GST: <span className="text-white">₹{bill.gstTotal?.toFixed(2)}</span></p>
           <p className="text-base font-semibold">
-            Total: <span className="text-mint">₹{bill.total?.toFixed(2)}</span>
+            Total: <span className="text-aqua">₹{bill.total?.toFixed(2)}</span>
           </p>
         </div>
 

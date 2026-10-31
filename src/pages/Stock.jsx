@@ -102,7 +102,7 @@ export default function Stock() {
                         <AlertTriangle className="size-3" /> Low
                       </span>
                     ) : (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-mint/10 px-2 py-0.5 text-xs text-mint ring-1 ring-mint/25">
+                      <span className="inline-flex items-center gap-1 rounded-full bg-aqua/10 px-2 py-0.5 text-xs text-aqua ring-1 ring-aqua/25">
                         ✓ OK
                       </span>
                     )}
@@ -227,7 +227,7 @@ function StockDetailModal({ item, onClose }) {
   }
 
   const typeIcons = {
-    in: <ArrowDownCircle className="size-4 text-mint" />,
+    in: <ArrowDownCircle className="size-4 text-aqua" />,
     out: <ArrowUpCircle className="size-4 text-saffron" />,
     adjust: <RefreshCw className="size-4 text-violet-soft" />,
   };
