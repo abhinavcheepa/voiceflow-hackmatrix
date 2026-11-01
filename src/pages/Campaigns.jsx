@@ -5,14 +5,14 @@ import { useApi, post } from "../api.js";
 
 const statusStyle = {
   draft: "bg-panel-2 text-dim ring-line",
-  running: "bg-mint/10 text-mint ring-mint/25",
+  running: "bg-aqua/10 text-aqua ring-aqua/25",
   paused: "bg-saffron/10 text-saffron ring-saffron/25",
   done: "bg-violet/15 text-violet-soft ring-violet/30",
 };
 
 const targetStyle = {
   pending: "text-dim",
-  called: "text-mint",
+  called: "text-aqua",
   failed: "text-rose",
 };
 
@@ -224,7 +224,7 @@ export default function Campaigns() {
                   c.status !== "done" && (
                     <button
                       onClick={() => control(c.id, "start")}
-                      className="flex items-center gap-1.5 rounded-lg bg-mint px-3 py-1.5 text-xs font-medium text-ink transition hover:brightness-110"
+                      className="flex items-center gap-1.5 rounded-lg bg-aqua px-3 py-1.5 text-xs font-medium text-ink transition hover:brightness-110"
                     >
                       <Play className="size-3" /> Start
                     </button>
@@ -244,7 +244,7 @@ export default function Campaigns() {
             {c.total > 0 && (
               <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-panel-2">
                 <div
-                  className="h-full rounded-full bg-mint transition-all"
+                  className="h-full rounded-full bg-aqua transition-all"
                   style={{ width: `${((c.called + c.failed) / c.total) * 100}%` }}
                 />
               </div>

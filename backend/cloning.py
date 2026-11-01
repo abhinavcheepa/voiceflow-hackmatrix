@@ -74,9 +74,40 @@ def _init_models():
         logger.error("Failed to initialize OpenVoice v2: %s", e, exc_info=True)
 
 
-def is_available() -> bool:
+def missing() -> str | None:
+    """Returns None if cloning dependencies and model weights are ready, else reason string."""
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        return "torch is not installed"
+
     ckpt = _CHECKPOINTS_DIR / "converter" / "checkpoint.pth"
-    return ckpt.exists()
+    if not ckpt.exists():
+        return f"OpenVoice v2 checkpoint not found at {ckpt}"
+    return None
+
+
+def is_available() -> bool:
+    return missing() is None
+
+
+def enroll(clips: list[bytes]) -> str:
+    """Enrol one or more audio clips as a new cloned voice profile."""
+    if not clips:
+        raise ValueError("No audio clips provided for voice cloning")
+    cid = hashlib.sha256(b"".join(clips)).hexdigest()[:16]
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp.write(clips[0])
+        tmp_path = tmp.name
+    try:
+        enroll_sample(tmp_path, cid)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    return cid
 
 
 def list_clones() -> list[dict]:
@@ -92,6 +123,28 @@ def list_clones() -> list[dict]:
     return sorted(out, key=lambda x: x["created_at"], reverse=True)
 
 
+_SAFE_CLONE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _path(clone_id: str) -> Path:
+    """Safe resolution of a clone profile path.
+
+    Validates clone_id format, resolves the final path, and ensures it stays
+    strictly inside _CLONES_DIR. Raises ValueError on any traversal or invalid character.
+    """
+    if not isinstance(clone_id, str) or not _SAFE_CLONE_ID.match(clone_id):
+        raise ValueError(f"Invalid clone ID: {clone_id!r}")
+
+    base_dir = _CLONES_DIR.resolve()
+    target = (base_dir / f"{clone_id}.pt").resolve()
+    try:
+        target.relative_to(base_dir)
+    except ValueError:
+        raise ValueError(f"Path traversal detected for clone ID: {clone_id!r}")
+
+    return target
+
+
 def enroll_sample(sample_path: str, clone_id: str) -> dict:
     """Extract speaker embedding from sample audio and save to disk + cache."""
     _init_models()
@@ -99,7 +152,7 @@ def enroll_sample(sample_path: str, clone_id: str) -> dict:
         raise RuntimeError("OpenVoice v2 models not available")
 
     import torch
-    out_pt = _CLONES_DIR / f"{clone_id}.pt"
+    out_pt = _path(clone_id)
     se, audio_name = _EXTRACTOR(sample_path, _CONVERTER, target_dir=str(_CLONES_DIR), vad=True)
     torch.save(se, str(out_pt))
 
@@ -115,11 +168,14 @@ def enroll_sample(sample_path: str, clone_id: str) -> dict:
 
 def delete_clone(clone_id: str) -> bool:
     _target_cache.pop(clone_id, None)
-    out_pt = _CLONES_DIR / f"{clone_id}.pt"
+    out_pt = _path(clone_id)
     if out_pt.exists():
         out_pt.unlink()
         return True
     return False
+
+
+delete = delete_clone
 
 
 def _get_target_se(clone_id: str):
@@ -128,7 +184,7 @@ def _get_target_se(clone_id: str):
         return _target_cache[clone_id]
 
     import torch
-    pt_path = _CLONES_DIR / f"{clone_id}.pt"
+    pt_path = _path(clone_id)
     if not pt_path.exists():
         raise FileNotFoundError(f"Clone profile not found: {clone_id}")
 

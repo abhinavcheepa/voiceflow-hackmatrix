@@ -1,16 +1,18 @@
 @import "tailwindcss";
 
 @theme {
-  --color-ink: #07070c;
-  --color-panel: #101019;
-  --color-panel-2: #161623;
-  --color-line: #24243a;
-  --color-violet: #7c5cff;
-  --color-violet-soft: #a48bff;
-  --color-mint: #2ee6a8;
+  --color-ink: #080c14;
+  --color-panel: #0e1523;
+  --color-panel-2: #141d2f;
+  --color-line: #222d45;
+  --color-royal: #3a58cf;
+  --color-aqua: #40e5e1;
+  --color-azure: #3990df;
+  --color-violet: #7055dd;
+  --color-violet-soft: #9d8bf2;
   --color-saffron: #ff8a3d;
   --color-rose: #ff5c7a;
-  --color-dim: #8e8ea8;
+  --color-dim: #8a96b2;
   --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
@@ -20,16 +22,34 @@ html {
 
 body {
   background: var(--color-ink);
-  color: #ededf2;
+  color: #e8eef9;
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
 }
 
-/* Radial glow used behind the hero and section headings. */
+/* Radial glow used behind the hero and section headings:
+   three soft radial glows, violet at top centre, royal on left, aqua on right. */
 .glow {
   background:
-    radial-gradient(60% 50% at 50% 0%, rgba(124, 92, 255, 0.22), transparent 70%),
-    radial-gradient(40% 40% at 85% 30%, rgba(46, 230, 168, 0.1), transparent 70%);
+    radial-gradient(60% 50% at 50% 0%, rgba(112, 85, 221, 0.20), transparent 70%),
+    radial-gradient(40% 40% at 15% 25%, rgba(58, 88, 207, 0.14), transparent 70%),
+    radial-gradient(40% 40% at 85% 25%, rgba(64, 229, 225, 0.10), transparent 70%);
+}
+
+.brand-gradient {
+  background: linear-gradient(to right, #3a58cf, #40e5e1, #3990df, #7055dd);
+}
+
+.brand-text {
+  background: linear-gradient(to right, #3a58cf, #40e5e1, #3990df, #7055dd);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+.brand-glow {
+  filter: drop-shadow(0 0 16px rgba(64, 229, 225, 0.35)) drop-shadow(0 0 28px rgba(112, 85, 221, 0.25));
 }
 
 /* Waveform bars on the hero + voice studio. */

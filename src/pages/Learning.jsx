@@ -4,13 +4,13 @@ import { del, useApi, put } from "../api.js";
 
 const SOURCE_STYLE = {
   conversation: { icon: MessageSquare, label: "From call", color: "text-violet-soft" },
-  manual: { icon: Bot, label: "Manual", color: "text-mint" },
+  manual: { icon: Bot, label: "Manual", color: "text-aqua" },
   ai_generated: { icon: Sparkles, label: "AI generated", color: "text-saffron" },
 };
 
 const STATUS_STYLE = {
   pending: "bg-saffron/10 text-saffron ring-saffron/25",
-  approved: "bg-mint/10 text-mint ring-mint/25",
+  approved: "bg-aqua/10 text-aqua ring-aqua/25",
   rejected: "bg-rose/10 text-rose ring-rose/25",
 };
 
@@ -55,7 +55,7 @@ export default function Learning() {
           <p className="mt-1 text-xs text-dim">Pending Review</p>
         </Card>
         <Card className="text-center">
-          <p className="text-2xl font-semibold text-mint">{approved.length}</p>
+          <p className="text-2xl font-semibold text-aqua">{approved.length}</p>
           <p className="mt-1 text-xs text-dim">Approved</p>
         </Card>
         <Card className="text-center">
@@ -132,7 +132,7 @@ export default function Learning() {
                         {item.status === "pending" && (
                           <>
                             <button onClick={() => setStatus(item.id, "approved")}
-                              className="rounded-lg border border-line px-2 py-1 text-dim hover:text-mint" title="Approve">
+                              className="rounded-lg border border-line px-2 py-1 text-dim hover:text-aqua" title="Approve">
                               <Check className="size-3.5" />
                             </button>
                             <button onClick={() => setStatus(item.id, "rejected")}
@@ -186,7 +186,7 @@ function LearningCard({ item, onApprove, onReject, onDelete }) {
         </div>
         <div className="flex gap-1.5 shrink-0">
           <button onClick={onApprove}
-            className="flex items-center gap-1.5 rounded-lg bg-mint/10 px-3 py-1.5 text-xs text-mint ring-1 ring-mint/25 transition hover:bg-mint/20">
+            className="flex items-center gap-1.5 rounded-lg bg-aqua/10 px-3 py-1.5 text-xs text-aqua ring-1 ring-aqua/25 transition hover:bg-aqua/20">
             <Check className="size-3.5" /> Approve
           </button>
           <button onClick={onReject}

@@ -108,7 +108,7 @@ function VoicePicker({ profile, onPicked }) {
                 )}
               </div>
               {active ? (
-                <span className="flex shrink-0 items-center gap-1 rounded-full bg-mint/10 px-2.5 py-1 text-xs text-mint ring-1 ring-mint/25">
+                <span className="flex shrink-0 items-center gap-1 rounded-full bg-aqua/10 px-2.5 py-1 text-xs text-aqua ring-1 ring-aqua/25">
                   <Check className="size-3" /> in use
                 </span>
               ) : (
@@ -228,7 +228,7 @@ function CloneYourVoice({ profile, onCloned }) {
             Record yourself and the agent speaks in your voice — runs on this machine, free.
           </p>
           {profile?.cloned && (
-            <p className="mt-1 text-xs text-mint">Active: {profile.name}</p>
+            <p className="mt-1 text-xs text-aqua">Active: {profile.name}</p>
           )}
         </div>
         <ChevronDown className={`size-4 shrink-0 text-dim transition ${open ? "rotate-180" : ""}`} />
@@ -576,7 +576,7 @@ export default function VoiceStudio() {
       )}
 
       {profile?.ready && (
-        <p className="mt-5 flex items-center gap-2 rounded-xl border border-mint/25 bg-mint/5 px-4 py-3 text-xs text-mint">
+        <p className="mt-5 flex items-center gap-2 rounded-xl border border-aqua/25 bg-aqua/5 px-4 py-3 text-xs text-aqua">
           <Check className="size-3.5 shrink-0" />
           Using <span className="font-medium">{profile.name}</span>
           {profile.source === "library" && " · ready-made voice"}

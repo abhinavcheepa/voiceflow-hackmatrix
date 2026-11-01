@@ -54,6 +54,31 @@ const store = {
   },
 };
 
+/** sessionStorage for ephemeral sensitive auth credentials (cleared on tab close). */
+const sessionStore = {
+  get: (k) => {
+    try {
+      return sessionStorage.getItem(k) ?? "";
+    } catch {
+      return "";
+    }
+  },
+  set: (k, v) => {
+    try {
+      sessionStorage.setItem(k, v);
+    } catch {
+      /* ignored */
+    }
+  },
+  remove: (k) => {
+    try {
+      sessionStorage.removeItem(k);
+    } catch {
+      /* ignored */
+    }
+  },
+};
+
 /** Stable per-browser id, so the agent remembers this caller next time. */
 function callerKey() {
   try {
@@ -370,7 +395,44 @@ export default function WebCall() {
     else if (agentId) params.set("agent", agentId);
     const key = callerKey();
     if (key) params.set("caller", key);
-    const socket = new WebSocket(`${WS_BASE}?${params}`);
+
+    let sessionToken = sessionStore.get("vf_owner_token") || "";
+    if (assistant && pin) {
+      try {
+        const authRes = await fetch(`${API || ""}/api/assistant/auth`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pin }),
+        });
+        if (authRes.ok) {
+          const authData = await authRes.json();
+          sessionToken = authData.token || "";
+          sessionStore.set("vf_owner_token", sessionToken);
+        } else {
+          const errData = await authRes.json().catch(() => ({}));
+          setError(errData.detail || "Authentication failed. Invalid PIN or rate limited.");
+          setStatus("idle");
+          return;
+        }
+      } catch (_) {}
+    }
+
+    let ticket = "";
+    try {
+      const ticketRes = await fetch(`${API || ""}/api/web-call/ticket?${params}`);
+      if (ticketRes.ok) {
+        const ticketData = await ticketRes.json();
+        ticket = ticketData.ticket || "";
+      }
+    } catch (_) {
+      // ticket fetch fallback
+    }
+
+    // Ticket is sent via subprotocol ONLY, never in the URL query string
+    const subprotocols = ticket ? ["vf-ticket." + ticket] : [];
+    const socket = subprotocols.length
+      ? new WebSocket(`${WS_BASE}?${params}`, subprotocols)
+      : new WebSocket(`${WS_BASE}?${params}`);
     socket.binaryType = "arraybuffer";
     ws.current = socket;
 
@@ -442,9 +504,8 @@ export default function WebCall() {
     };
 
     socket.onopen = () => {
-      // The PIN goes in the first message, not the URL, so it never lands in
-      // a proxy or server log. The backend only asks for it off this machine.
-      if (assistant && pin) socket.send(JSON.stringify({ type: "auth", pin }));
+      // Session token goes in the first message (never URL query, and never raw PIN).
+      if (assistant && sessionToken) socket.send(JSON.stringify({ type: "auth", token: sessionToken }));
       setStatus("greeting");
       noiseFloor.current = null;
       // Open the mic now. It used to wait for the greeting audio to finish,
@@ -459,7 +520,25 @@ export default function WebCall() {
       }, 10000);
     };
     socket.onerror = () => setError("Could not reach the backend. Is it running on port 8000?");
-    socket.onclose = () => setStatus((s) => (s === "idle" ? s : "ended"));
+    socket.onclose = (e) => {
+      setStatus((s) => (s === "idle" ? s : "ended"));
+      const code = e.code;
+      if (code === 4001 || code === 4401) {
+        setError("Session expired or invalid ticket. Please click Start call again.");
+      } else if (code === 4002 || code === 4402) {
+        setError("Daily web-call budget reached. Please try again tomorrow.");
+      } else if (code === 4003 || code === 4403) {
+        setError("Access from this domain is forbidden (Origin not allowed).");
+      } else if (code === 4008 || code === 4408) {
+        setError("Too many calls from your connection. Please wait a few minutes.");
+      } else if (code === 4009 || code === 4409) {
+        setError("All call lines are busy right now. Please try again in a moment.");
+      } else if (code === 4010 || code === 4410) {
+        setError("Call ended: maximum call duration reached (5 minutes).");
+      } else if (code === 1009 || code === 4011) {
+        setError("Audio frame exceeded maximum allowed size or rate limit.");
+      }
+    };
   }
 
   function hangUp() {
@@ -533,7 +612,7 @@ export default function WebCall() {
                 store.set("vf_owner_pin", e.target.value);
               }}
               disabled={live}
-              placeholder="ASSISTANT_PIN from backend/.env"
+              placeholder="ASSISTANT_PIN (minimum 8 characters)"
               className="mt-1.5 w-full rounded-xl border border-line bg-panel-2 px-3.5 py-2.5 text-sm text-white outline-none focus:border-violet/50 disabled:opacity-50"
             />
           </label>
@@ -580,7 +659,7 @@ export default function WebCall() {
             className={`grid size-20 place-items-center rounded-full transition ${
               live
                 ? "bg-rose text-white"
-                : "bg-mint text-ink ring-8 ring-mint/15 hover:brightness-110"
+                : "bg-aqua text-ink ring-8 ring-aqua/15 hover:brightness-110"
             }`}
           >
             {status === "connecting" ? (
@@ -609,7 +688,7 @@ export default function WebCall() {
               <div className="relative h-2 overflow-hidden rounded-full bg-panel-2">
                 <div
                   className={`h-full rounded-full transition-[width] duration-100 ${
-                    level.rms >= level.speechBar ? "bg-mint" : "bg-line"
+                    level.rms >= level.speechBar ? "bg-aqua" : "bg-line"
                   }`}
                   style={{
                     width: `${Math.min(100, (level.rms / (level.speechBar * 2)) * 100)}%`,

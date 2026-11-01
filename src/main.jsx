@@ -35,7 +35,7 @@ createRoot(document.getElementById("root")).render(
           <Route path="contacts" element={<Contacts />} />
           <Route path="campaigns" element={<Campaigns />} />
           <Route path="analytics" element={<Analytics />} />
-          <Route path="voice-studio" element={<VoiceStudio />} />
+          <Route path="voice-studio" element={<VoiceStudio />} />`r`n          <Route path="voice" element={<Navigate to="/app/voice-studio" replace />} />
           <Route path="stock" element={<Stock />} />
           <Route path="bills" element={<Bills />} />
           <Route path="learning" element={<Learning />} />

@@ -87,6 +87,7 @@ def parse(payload: dict) -> dict:
     """
     audio_b64 = payload.get("audio_base64")
     return {
+        "id": payload.get("id"),
         "from": payload.get("from", ""),
         "name": payload.get("name"),
         "type": payload.get("type", "text"),

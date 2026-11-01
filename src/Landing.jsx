@@ -50,14 +50,14 @@ function Hero() {
     <section className="glow relative overflow-hidden">
       <div className="mx-auto max-w-6xl px-5 pt-20 pb-24 text-center">
         <span className="inline-flex items-center gap-2 rounded-full border border-line bg-panel px-3.5 py-1.5 text-xs text-dim">
-          <span className="size-1.5 rounded-full bg-mint" />
+          <span className="size-1.5 rounded-full bg-aqua" />
           Self-hosted · Built for Indian SMBs
         </span>
 
         <h1 className="mx-auto mt-7 max-w-4xl text-4xl font-semibold leading-[1.1] tracking-tight sm:text-6xl">
           Your voice. Your accent.
           <br />
-          <span className="bg-gradient-to-r from-violet-soft via-white to-mint bg-clip-text text-transparent">
+          <span className="brand-text">
             Answering every customer.
           </span>
         </h1>
@@ -96,8 +96,8 @@ function Hero() {
 function LiveCallCard() {
   return (
     <div className="rounded-2xl border border-line bg-panel p-5">
-      <div className="flex items-center gap-2 text-xs text-mint">
-        <span className="size-1.5 animate-pulse rounded-full bg-mint" />
+      <div className="flex items-center gap-2 text-xs text-aqua">
+        <span className="size-1.5 animate-pulse rounded-full bg-aqua" />
         LIVE CALL · 00:42
       </div>
       <p className="mt-4 text-sm text-dim">Customer · Hindi</p>
@@ -143,9 +143,9 @@ function CloneCard() {
         voice note afterwards sounds like you.
       </p>
       <div className="mt-5 h-1.5 overflow-hidden rounded-full bg-panel-2">
-        <div className="h-full w-full rounded-full bg-gradient-to-r from-violet to-mint" />
+        <div className="h-full w-full rounded-full brand-gradient" />
       </div>
-      <p className="mt-2 text-xs text-mint">Voice profile trained · 100%</p>
+      <p className="mt-2 text-xs text-aqua">Voice profile trained · 100%</p>
     </div>
   );
 }
@@ -184,7 +184,7 @@ function Solution() {
         <div className="mt-14 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
           {solutions.map((s, i) => (
             <div key={s.title} className="rounded-2xl border border-line bg-panel p-6">
-              <span className="grid size-9 place-items-center rounded-xl bg-mint/10 text-sm font-semibold text-mint ring-1 ring-mint/25">
+              <span className="grid size-9 place-items-center rounded-xl bg-aqua/10 text-sm font-semibold text-aqua ring-1 ring-aqua/25">
                 {i + 1}
               </span>
               <h3 className="mt-4 text-[15px] font-semibold">{s.title}</h3>
@@ -227,7 +227,7 @@ const flow = [
     icon: Languages,
     title: "Multilingual STT + language detection",
     body: "Faster-Whisper transcribes and detects the language. Text messages skip this step entirely.",
-    tint: "text-mint",
+    tint: "text-aqua",
   },
   {
     icon: BrainCircuit,
@@ -245,7 +245,7 @@ const flow = [
     icon: MessageSquare,
     title: "Reply on the same channel",
     body: "Voice-call reply · WhatsApp voice note in your cloned voice · WhatsApp text in your style.",
-    tint: "text-mint",
+    tint: "text-aqua",
   },
   {
     icon: Database,

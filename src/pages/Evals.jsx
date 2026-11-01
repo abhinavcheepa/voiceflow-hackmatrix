@@ -130,7 +130,7 @@ function Verdict({ run }) {
   return (
     <span
       className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] ring-1 ${
-        run.passed ? "bg-mint/10 text-mint ring-mint/25" : "bg-rose/10 text-rose ring-rose/25"
+        run.passed ? "bg-aqua/10 text-aqua ring-aqua/25" : "bg-rose/10 text-rose ring-rose/25"
       }`}
     >
       {run.passed ? <Check className="size-3" /> : <X className="size-3" />}

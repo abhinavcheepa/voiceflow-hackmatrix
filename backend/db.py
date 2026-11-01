@@ -4,8 +4,11 @@ Plain sqlite3 — no ORM. One file on disk, one connection per request.
 Swap the DSN for Postgres when there's a reason to; nothing here needs it yet.
 """
 
+import logging
 import os
 import sqlite3
+
+log = logging.getLogger("voiceflow.db")
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -279,6 +282,10 @@ SUCCESS_OUTCOMES = ("Booked", "Lead captured", "Answered")
 def connect():
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
     try:
         yield conn
         conn.commit()
@@ -321,23 +328,109 @@ MIGRATIONS = [
 ]
 
 
+def check_foreign_keys_safe() -> list:
+    """Run PRAGMA foreign_key_check at startup; log any violations without crashing."""
+    try:
+        with connect() as conn:
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                log.warning("Database foreign key integrity warning: %d violation(s) detected: %s",
+                            len(violations), [tuple(v) for v in violations])
+            return violations
+    except Exception as e:
+        log.warning("Could not run foreign_key_check: %s", e)
+        return []
+
+
 def _migrate(conn) -> None:
-    for table, column, coltype in MIGRATIONS:
-        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-        if column not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
-    # UNIQUE can't be added by ALTER, so the dedupe index is created here.
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msgs_wa_id ON messages(wa_id)")
+    # 1. Ensure schema_version table exists
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL,
+            description TEXT NOT NULL
+        )
+    """)
+
+    # 2. Check current version
+    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    current_version = row[0] if row and row[0] is not None else 0
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Baseline version 1: Legacy columns and unique wa_id index
+    if current_version < 1:
+        for table, column, coltype in MIGRATIONS:
+            existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msgs_wa_id ON messages(wa_id)")
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at, description) VALUES (1, ?, ?)",
+            (now, "Baseline schema with legacy columns and unique wa_id index")
+        )
+        current_version = 1
+
+    # Version 2: High-performance lookup indexes
+    if current_version < 2:
+        # Calls indexes
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_phone ON calls(phone)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_started ON calls(started_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_caller_key ON calls(caller_key)")
+
+        # Messages indexes
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv_id ON messages(conversation_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_needs_reply ON messages(created_at) WHERE needs_reply = 1")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)")
+
+        # Contacts index
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_last_seen ON contacts(last_seen_at)")
+
+        # Campaign targets index
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_campaign_targets_lookup ON campaign_targets(campaign_id, status)")
+
+        # KB chunks index
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_kb_chunks_agent_doc ON kb_chunks(agent_id, doc_id)")
+
+        # Bills index
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bills_customer_phone ON bills(customer_phone)")
+
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at, description) VALUES (2, ?, ?)",
+            (now, "High-performance lookup indexes on calls, messages, contacts, campaigns, kb, bills")
+        )
+        current_version = 2
+
+    if current_version < 3:
+        # Step 3: Phone normalization unique indexes on contacts and conversations
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_phone_unique ON contacts(phone)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_phone_unique ON conversations(phone)")
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at, description) VALUES (3, ?, ?)",
+            (now, "Phone normalization unique indexes on contacts and conversations")
+        )
+        current_version = 3
 
 
 def init() -> None:
-    with connect() as conn:
-        # WAL mode: allows concurrent readers while a writer holds the lock.
-        # Critical for a single-worker uvicorn serving both API reads and the
-        # background worker writing jobs — without it, readers block on writes.
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript(SCHEMA)
-        _migrate(conn)
+    # Use isolation_level=None with BEGIN IMMEDIATE to serialize concurrent startup
+    raw_conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    raw_conn.execute("PRAGMA busy_timeout = 5000")
+    raw_conn.execute("PRAGMA journal_mode = WAL")
+    raw_conn.execute("PRAGMA synchronous = NORMAL")
+    raw_conn.execute("PRAGMA foreign_keys = ON")
+    raw_conn.executescript(SCHEMA)
+    raw_conn.execute("BEGIN IMMEDIATE")
+    try:
+        _migrate(raw_conn)
+        raw_conn.execute("COMMIT")
+    except Exception:
+        raw_conn.execute("ROLLBACK")
+        raise
+    finally:
+        raw_conn.close()
+
+    check_foreign_keys_safe()
     ensure_default_agent()
 
 
@@ -394,11 +487,11 @@ def get_calls_by_hour() -> list[dict]:
 
 # Fixed colours so a language keeps the same swatch across renders.
 LANG_COLORS = {
-    "Hindi": "#7c5cff",
-    "English": "#2ee6a8",
+    "Hindi": "#7055dd",
+    "English": "#40e5e1",
     "Hinglish": "#ff8a3d",
-    "Marathi": "#4fa8ff",
-    "Tamil": "#ff5c8a",
+    "Marathi": "#3990df",
+    "Tamil": "#ff5c7a",
 }
 
 
@@ -413,7 +506,7 @@ def get_languages() -> list[dict]:
         {
             "name": r["language"],
             "share": round(r["n"] / total * 100),
-            "color": LANG_COLORS.get(r["language"], "#8b8b9e"),
+            "color": LANG_COLORS.get(r["language"], "#8a96b2"),
         }
         for r in rows
     ]
@@ -504,6 +597,8 @@ def upsert_call(vapi_call_id: str, **fields) -> None:
     went nowhere, and every web call stayed 'active' with no duration and no
     transcript. The dashboard read zero calls for the same reason.
     """
+    if "phone" in fields and fields["phone"]:
+        fields["phone"] = normalize_phone(fields["phone"])
     with connect() as conn:
         known = conn.execute(
             "SELECT 1 FROM calls WHERE vapi_call_id = ?", (vapi_call_id,)
@@ -563,6 +658,7 @@ def clear_needs_reply(message_id: int) -> None:
 
 def get_history(phone: str, limit: int = 12) -> list[dict]:
     """Recent turns for one number, oldest first — fed to the LLM as context."""
+    phone = normalize_phone(phone)
     with connect() as conn:
         rows = conn.execute(
             # failed = 0 matters: a failure leaves an "[auto-reply failed: …]"
@@ -591,6 +687,7 @@ def add_message(phone: str, sender: str, kind: str, body: str, seconds: int | No
     WhatsApp's own message id, which makes re-running an import a no-op instead
     of duplicating the thread.
     """
+    phone = normalize_phone(phone)
     now = at or datetime.now(timezone.utc).isoformat()
     with connect() as conn:
         conn.execute(
@@ -664,6 +761,7 @@ def set_auto_reply_global(enabled: bool) -> None:
 
 def set_auto_reply_for(phone: str, enabled: bool) -> None:
     """Per-thread override — the owner taking one conversation over by hand."""
+    phone = normalize_phone(phone)
     with connect() as conn:
         conn.execute(
             "UPDATE conversations SET auto_reply = ? WHERE phone = ?", (int(enabled), phone)
@@ -783,6 +881,12 @@ def delete_agent(agent_id: int) -> None:
         # Never delete the last one — calls would have no persona to fall back to.
         if conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0] <= 1:
             raise ValueError("Cannot delete the only agent")
+        conn.execute("UPDATE campaigns SET agent_id = NULL WHERE agent_id = ?", (agent_id,))
+        conn.execute("DELETE FROM learned_answers WHERE agent_id = ?", (agent_id,))
+        conn.execute("DELETE FROM eval_runs WHERE case_id IN (SELECT id FROM eval_cases WHERE agent_id = ?)", (agent_id,))
+        conn.execute("DELETE FROM eval_cases WHERE agent_id = ?", (agent_id,))
+        conn.execute("UPDATE calls SET agent_id = NULL WHERE agent_id = ?", (agent_id,))
+        conn.execute("UPDATE conversations SET agent_id = NULL WHERE agent_id = ?", (agent_id,))
         conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
         if not conn.execute("SELECT 1 FROM agents WHERE is_default = 1").fetchone():
             conn.execute("UPDATE agents SET is_default = 1 WHERE id = (SELECT MIN(id) FROM agents)")
@@ -798,6 +902,7 @@ def touch_contact(phone: str, name: str | None = None) -> None:
     """
     if not phone or phone == "unknown":
         return
+    phone = normalize_phone(phone)
     now = datetime.now(timezone.utc).isoformat()
     with connect() as conn:
         conn.execute(
@@ -807,6 +912,24 @@ def touch_contact(phone: str, name: str | None = None) -> None:
                    name = COALESCE(NULLIF(excluded.name,''), contacts.name)""",
             (name, phone, now, now),
         )
+
+
+def find_candidate_contacts(tokens: list[str]) -> list[dict]:
+    """Retrieve candidate contacts whose name contains any of the given tokens, or recent contacts."""
+    with connect() as conn:
+        if tokens:
+            clauses = ["name LIKE ?" for _ in tokens]
+            params = [f"%{t}%" for t in tokens]
+            sql = f"""SELECT id, name, phone, last_seen_at FROM contacts
+                      WHERE {' OR '.join(clauses)}
+                      ORDER BY last_seen_at DESC"""
+            rows = conn.execute(sql, params).fetchall()
+            if rows:
+                return [dict(r) for r in rows]
+        rows = conn.execute(
+            "SELECT id, name, phone, last_seen_at FROM contacts ORDER BY last_seen_at DESC LIMIT 5000"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def get_contacts(limit: int = 200) -> list[dict]:
@@ -911,7 +1034,7 @@ def create_campaign(name: str, agent_id: int | None, targets: list[dict]) -> int
         cid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.executemany(
             "INSERT INTO campaign_targets (campaign_id, name, phone) VALUES (?,?,?)",
-            [(cid, t.get("name"), t["phone"]) for t in targets],
+            [(cid, t.get("name"), normalize_phone(t["phone"])) for t in targets],
         )
     return cid
 
@@ -1139,6 +1262,8 @@ def kb_chunks_with_embeddings(agent_id: int | None) -> list[tuple[str, bytes | N
 def add_booking(item: str, name: str | None = None, phone: str | None = None,
                 when_text: str | None = None, notes: str | None = None,
                 channel: str = "call", escalated: bool = False) -> dict:
+    if phone:
+        phone = normalize_phone(phone)
     with connect() as conn:
         cur = conn.execute(
             """INSERT INTO bookings (phone, name, item, when_text, notes, channel,
@@ -1388,6 +1513,8 @@ def _next_bill_number() -> str:
 
 def create_bill(customer_name: str | None = None, customer_phone: str | None = None,
                 agent_id: int | None = None, channel: str = "call") -> dict:
+    if customer_phone:
+        customer_phone = normalize_phone(customer_phone)
     now = datetime.now(timezone.utc).isoformat()
     bill_number = _next_bill_number()
     with connect() as conn:
@@ -1498,6 +1625,7 @@ def get_active_bill(channel: str = "call") -> dict | None:
 # customer's past bookings, bills and messages, never another customer's.
 
 def bookings_for(phone: str, limit: int = 10) -> list[dict]:
+    phone = normalize_phone(phone)
     with connect() as conn:
         rows = conn.execute(
             "SELECT * FROM bookings WHERE phone = ? ORDER BY id DESC LIMIT ?",
@@ -1509,6 +1637,7 @@ def bookings_for(phone: str, limit: int = 10) -> list[dict]:
 
 
 def bills_for(phone: str, limit: int = 10) -> list[dict]:
+    phone = normalize_phone(phone)
     with connect() as conn:
         rows = conn.execute(
             "SELECT id FROM bills WHERE customer_phone = ? ORDER BY id DESC LIMIT ?",
@@ -1519,6 +1648,7 @@ def bills_for(phone: str, limit: int = 10) -> list[dict]:
 
 def messages_for(phone: str, limit: int = 300) -> list[str]:
     """This number's whole thread (beyond the short prompt window), newest first."""
+    phone = normalize_phone(phone)
     with connect() as conn:
         rows = conn.execute(
             """SELECT m.sender, m.body, m.created_at FROM messages m
@@ -1605,8 +1735,16 @@ def normalize_phone(raw: str) -> str:
     Incoming messages arrive keyed as country code + number, so an outgoing
     thread must use the same form or the reply lands in a different thread.
     """
-    d = _digits(raw or "")
-    if len(d) == 11 and d.startswith("0"):
+    if not raw:
+        return ""
+    d = _digits(raw)
+    if not d:
+        return raw.strip()
+    if d.startswith("0091"):
+        d = d[2:]
+    elif d.startswith("091") and len(d) == 13:
+        d = d[1:]
+    elif len(d) == 11 and d.startswith("0"):
         d = d[1:]
     if len(d) == 10:
         d = "91" + d
@@ -1617,6 +1755,7 @@ def assign_conversation(phone: str, agent_id: int | None, goal: str, name: str |
     """Hand a WhatsApp thread to an agent with a goal, and make sure it will
     actually auto-reply there — an allowlist or a per-thread "off" would
     otherwise silently stop the agent the owner just asked to talk."""
+    phone = normalize_phone(phone)
     now = datetime.now(timezone.utc).isoformat()
     with connect() as conn:
         conn.execute(
@@ -1634,6 +1773,7 @@ def assign_conversation(phone: str, agent_id: int | None, goal: str, name: str |
 
 def conversation_brief(phone: str) -> dict:
     """The agent and goal the owner set for this thread, if any."""
+    phone = normalize_phone(phone)
     with connect() as conn:
         r = conn.execute(
             "SELECT agent_id, goal FROM conversations WHERE phone = ?", (phone,)
@@ -1644,6 +1784,7 @@ def conversation_brief(phone: str) -> dict:
 def set_thread_auto_reply(phone: str, enabled: bool) -> None:
     """Per-number auto-reply, creating the thread if this number never wrote yet
     (set_auto_reply_for only touches existing threads)."""
+    phone = normalize_phone(phone)
     now = datetime.now(timezone.utc).isoformat()
     with connect() as conn:
         conn.execute(

@@ -419,6 +419,7 @@ async function onIncoming(msg, source) {
   }
 
   const payload = {
+    id: msg.id?._serialized || (typeof msg.id === "string" ? msg.id : dedupeKey(msg)),
     from,
     name: contact?.pushname || contact?.name || null,
     type: msg.type === "ptt" || msg.type === "audio" ? "audio" : "text",

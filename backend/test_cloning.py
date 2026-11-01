@@ -30,10 +30,10 @@ def _fake(monkeypatch, convert_ok=True):
     monkeypatch.setattr(cloning, "enroll", lambda clips: calls.setdefault("enroll", clips) and "abc123")
     monkeypatch.setattr(cloning, "delete", lambda cid: calls.setdefault("deleted", cid))
 
-    def convert(base, cid):
+    def convert(base, cid, tau=0.20, text="", cache=True):
         if not convert_ok:
             raise RuntimeError("torch exploded")
-        calls["convert"] = (base, cid)
+        calls["convert"] = (base, cid, tau, text, cache)
         return b"CLONED"
 
     monkeypatch.setattr(cloning, "convert", convert)
@@ -56,7 +56,7 @@ def test_clone_enrols_every_clip_and_speaks_through_the_converter(monkeypatch):
     assert asyncio.run(voice.synthesize("Namaste", "Hindi")) == b"CLONED"
     # Base voice matches the owner's gender and the caller's language.
     assert calls["edge"] == "hi-IN-MadhurNeural"
-    assert calls["convert"] == (b"BASE", "abc123")
+    assert calls["convert"] == (b"BASE", "abc123", 0.20, "Namaste,", True)
     asyncio.run(voice.synthesize("Hello", "English"))
     assert calls["edge"] == "en-IN-PrabhatNeural"
 

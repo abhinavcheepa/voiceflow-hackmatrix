@@ -82,9 +82,9 @@ function VoiceProfile() {
       </p>
       {active && <p className="mt-0.5 truncate text-xs text-dim">{active.name}</p>}
       <p
-        className={`mt-1.5 flex items-center gap-1.5 text-xs ${ready ? "text-mint" : "text-saffron"}`}
+        className={`mt-1.5 flex items-center gap-1.5 text-xs ${ready ? "text-aqua" : "text-saffron"}`}
       >
-        <span className={`size-1.5 rounded-full ${ready ? "bg-mint" : "bg-saffron"}`} />
+        <span className={`size-1.5 rounded-full ${ready ? "bg-aqua" : "bg-saffron"}`} />
         {ready ? "Agent live" : "Setup incomplete"}
       </p>
     </div>
@@ -161,7 +161,7 @@ function TokenModal({ open, onClose }) {
               }}
               className="flex items-center gap-1.5 rounded-xl bg-violet px-4 py-2 text-xs font-medium text-white transition hover:bg-violet-soft"
             >
-              {saved ? <CheckCircle2 className="size-3.5 text-mint" /> : null}
+              {saved ? <CheckCircle2 className="size-3.5 text-aqua" /> : null}
               {saved ? "Saved!" : "Save Token"}
             </button>
           </div>
@@ -283,7 +283,7 @@ export default function AppShell() {
             <div className="hidden items-center gap-2 rounded-full border border-line bg-panel-2/80 px-2.5 py-1 text-xs text-dim md:flex">
               <span
                 className={`size-2 rounded-full transition ${
-                  sseConnected ? "animate-pulse bg-mint shadow-[0_0_8px_#34d399]" : "bg-dim/40"
+                  sseConnected ? "animate-pulse bg-aqua shadow-[0_0_8px_#40e5e1]" : "bg-dim/40"
                 }`}
               />
               <span className="text-[11px] font-medium">
@@ -299,7 +299,7 @@ export default function AppShell() {
               disabled={toggling}
               className={`flex items-center gap-2 rounded-xl border px-3 py-1.5 text-xs font-medium transition active:scale-95 ${
                 automationOn
-                  ? "border-mint/30 bg-mint/10 text-mint hover:bg-mint/15"
+                  ? "border-aqua/30 bg-aqua/10 text-aqua hover:bg-aqua/15"
                   : "border-saffron/30 bg-saffron/10 text-saffron hover:bg-saffron/15"
               }`}
               title={

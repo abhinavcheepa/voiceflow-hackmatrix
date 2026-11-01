@@ -53,10 +53,12 @@ import kb  # noqa: E402
 import recording  # noqa: E402
 import vapi  # noqa: E402
 import voice  # noqa: E402
-import webcall  # noqa: E402
+import webcall
+import webcall_gate  # noqa: E402
 import whatsapp  # noqa: E402
 import whatsapp_web  # noqa: E402
 import adaptive  # noqa: E402
+import assistant_auth  # noqa: E402
 import auth
 from auth import TokenAuthMiddleware  # noqa: E402
 import events  # noqa: E402
@@ -108,6 +110,7 @@ async def startup() -> None:
     if auth.IS_PROD and not auth.API_TOKEN:
         raise RuntimeError("FATAL: API_TOKEN must be configured when ENV=production")
     db.init()
+    assistant_auth.auth_manager.check_startup()
     # Anything that arrived while we were down, or whose reply threw, still
     # deserves an answer — once now, then on a timer.
     asyncio.create_task(whatsapp.answer_pending())
@@ -488,6 +491,8 @@ async def voice_clone(name: str = Form(...), samples: list[UploadFile] = File(..
                for f in samples]
     try:
         voice_id = await voice.clone(name, payload, gender_=gender)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except RuntimeError as e:
         raise HTTPException(503, str(e))
     return {"voiceId": voice_id, **voice.profile()}
@@ -497,6 +502,8 @@ async def voice_clone(name: str = Form(...), samples: list[UploadFile] = File(..
 async def voice_clone_delete() -> dict:
     try:
         await voice.delete_clone()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except RuntimeError as e:
         raise HTTPException(503, str(e))
     return voice.profile()
@@ -929,19 +936,94 @@ def eval_delete(case_id: int) -> dict:
 
 # --- web calling --------------------------------------------------------
 
+@app.api_route("/api/web-call/ticket", methods=["GET", "POST"])
+async def web_call_ticket(request: Request) -> dict:
+    """Issue a single-use ticket (TTL 30s) for browser calling."""
+    if not webcall_gate.WEBCALL_PUBLIC:
+        auth.require_auth(request)
+    client_ip = webcall_gate.get_real_client_ip(request)
+    mode = request.query_params.get("mode", "customer")
+    agent_id_raw = request.query_params.get("agent")
+    agent_id = int(agent_id_raw) if agent_id_raw and agent_id_raw.isdigit() else None
+    try:
+        token = await webcall_gate.gate.issue_ticket(client_ip, mode=mode, agent_id=agent_id)
+        return {"ticket": token, "ttl": 30, "expiresIn": 30}
+    except PermissionError as e:
+        raise HTTPException(429, str(e))
+    except ValueError as e:
+        raise HTTPException(402, str(e))
+
+
 @app.websocket("/api/web-call/ws")
 async def web_call(ws: WebSocket) -> None:
     """Talk to the agent from the browser. One socket per call."""
-    await ws.accept()
-    agent_id = ws.query_params.get("agent")
-    assistant = ws.query_params.get("mode") == "assistant"
+    client_ip = webcall_gate.get_real_client_ip(ws)
+    origin = ws.headers.get("origin")
+
+    # 1. Origin check
+    if not webcall_gate.gate.check_origin(origin):
+        await ws.close(code=webcall_gate.WS_CLOSE_FORBIDDEN_ORIGIN)
+        return
+
+    # 2. Daily budget check (global and per-IP)
+    if not await webcall_gate.gate.check_budget_ok(client_ip):
+        await ws.close(code=webcall_gate.WS_CLOSE_BUDGET_EXCEEDED)
+        return
+
+    # 3. WS connect rate limit check (separate from ticket-issue rate limit)
+    if not await webcall_gate.gate.check_ws_rate_limit(client_ip):
+        await ws.close(code=webcall_gate.WS_CLOSE_RATE_LIMITED)
+        return
+
+    # 4. Ticket verification (subprotocol or first message ONLY - never from query string)
+    ticket_token = None
+    subprotocol_selected = None
+    protocols = ws.headers.get("sec-websocket-protocol", "").split(",")
+    for proto in protocols:
+        proto = proto.strip()
+        if proto.startswith("vf-ticket."):
+            ticket_token = proto.split(".", 1)[1]
+            subprotocol_selected = proto
+            break
+
+    await ws.accept(subprotocol=subprotocol_selected)
+
+    if not ticket_token:
+        try:
+            init_msg = await asyncio.wait_for(ws.receive(), timeout=5.0)
+            if init_msg.get("type") == "websocket.receive" and "text" in init_msg:
+                import json
+                init_data = json.loads(init_msg["text"])
+                ticket_token = init_data.get("ticket")
+        except Exception:
+            ticket_token = None
+
+    ticket_data = await webcall_gate.gate.consume_ticket(ticket_token, client_ip)
+    if not ticket_data:
+        await ws.close(code=webcall_gate.WS_CLOSE_INVALID_TICKET)
+        return
+
+    agent_id = ticket_data.get("agent_id") or ws.query_params.get("agent")
+    mode = ticket_data.get("mode") or ws.query_params.get("mode")
+    assistant = mode == "assistant"
     if assistant and not await _owner_ok(ws):
         await ws.send_json({"type": "error", "text": "Assistant mode needs the owner PIN "
                             "(ASSISTANT_PIN in backend/.env) when used from another device."})
         await ws.close()
         return
+
     session = webcall.Session(int(agent_id) if agent_id else None,
                               caller_key=ws.query_params.get("caller"), assistant=assistant)
+
+    slot_acquired = False
+    # 5. Concurrent slot acquisition
+    if not await webcall_gate.gate.acquire_slot(session.id, client_ip):
+        await ws.close(code=webcall_gate.WS_CLOSE_SERVER_BUSY)
+        return
+    slot_acquired = True
+
+    call_start_time = time.time()
+    frame_times: list[float] = []
     session.open_record()
     await ws.send_json(
         {"type": "connected", "callId": session.id, "agent": session.agent.get("name", "")}
@@ -950,9 +1032,45 @@ async def web_call(ws: WebSocket) -> None:
     try:
         await webcall.speak(ws, session, session.greeting)
         while True:
-            message = await ws.receive()
+            # Duration limit check
+            elapsed = time.time() - call_start_time
+            if elapsed > webcall_gate.MAX_WEBCALL_DURATION_SECONDS:
+                await ws.send_json({"type": "ended", "reason": "duration_limit"})
+                await ws.close(code=webcall_gate.WS_CLOSE_DURATION_EXCEEDED)
+                break
+
+            # Idle timeout
+            try:
+                message = await asyncio.wait_for(ws.receive(), timeout=webcall_gate.WEBCALL_IDLE_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                await ws.send_json({"type": "ended", "reason": "idle_timeout"})
+                await ws.close()
+                break
+
             if message.get("type") == "websocket.disconnect":
                 break
+
+            if (time.time() - call_start_time) > webcall_gate.MAX_WEBCALL_DURATION_SECONDS:
+                await ws.send_json({"type": "ended", "reason": "duration_limit"})
+                await ws.close(code=webcall_gate.WS_CLOSE_DURATION_EXCEEDED)
+                break
+
+            # Frame rate cap safeguard
+            now_frame = time.time()
+            frame_times = [t for t in frame_times if now_frame - t <= 1.0]
+            if len(frame_times) >= webcall_gate.MAX_FRAME_RATE_PER_SEC:
+                await ws.close(code=webcall_gate.WS_CLOSE_FRAME_TOO_LARGE)
+                break
+            frame_times.append(now_frame)
+
+            # Frame size safeguard
+            if "bytes" in message and len(message["bytes"]) > webcall_gate.MAX_FRAME_SIZE_BYTES:
+                await ws.close(code=webcall_gate.WS_CLOSE_FRAME_TOO_LARGE)
+                break
+            if "text" in message and len(message["text"].encode()) > webcall_gate.MAX_FRAME_SIZE_BYTES:
+                await ws.close(code=webcall_gate.WS_CLOSE_FRAME_TOO_LARGE)
+                break
+
             if "text" in message:
                 try:
                     import json
@@ -972,13 +1090,12 @@ async def web_call(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
+        if slot_acquired:
+            duration_sec = time.time() - call_start_time
+            await webcall_gate.gate.release_slot(session.id, client_ip, duration_sec)
         session.close_record()
-        # Analysis, stitched recording and text record — as their own task, not
-        # awaited here. This handler can be cancelled the moment the socket
-        # goes, and an await in its `finally` died with it: the call kept its
-        # segments but never got a summary, an mp3 or a text record.
         task = asyncio.create_task(_finalize(session))
-        _finalizing.add(task)  # a bare task can be garbage-collected mid-run
+        _finalizing.add(task)
         task.add_done_callback(_finalizing.discard)
 
 
@@ -992,27 +1109,86 @@ async def _owner_ok(ws: WebSocket) -> bool:
     so it is not open to whoever reaches the port.
 
     On this machine (directly, or through the Vite proxy from this machine):
-    yes. From anywhere else — a phone on the Wi-Fi — the first message must
-    carry ASSISTANT_PIN; with no PIN configured, remote use is refused.
+    yes. From anywhere else ? a phone on the Wi-Fi ? the first message must
+    carry a valid session token or ASSISTANT_PIN; with no PIN configured, remote use is refused.
     """
     origin = ws.client.host if ws.client else ""
-    # X-Forwarded-For is only believed when the hop itself is local (our Vite
-    # proxy); from anyone else it's a header they could simply type.
     fwd = ws.headers.get("x-forwarded-for", "")
     if origin in _LOOPBACK and fwd:
         origin = fwd.split(",")[0].strip()
     if origin in _LOOPBACK:
         return True
-    pin = os.getenv("ASSISTANT_PIN", "")
-    if not pin:
+
+    if not assistant_auth.auth_manager.is_pin_configured():
+        log.warning("Remote assistant connection rejected: ASSISTANT_PIN is unset, invalid, or default.")
         return False
+
     try:
         first = await asyncio.wait_for(ws.receive_json(), timeout=15)
     except Exception:  # noqa: BLE001 - timeout, bad json, disconnect: all a no
         return False
-    import hmac
 
-    return first.get("type") == "auth" and hmac.compare_digest(str(first.get("pin", "")), pin)
+    if not isinstance(first, dict) or first.get("type") != "auth":
+        return False
+
+    # Session token authentication ONLY (raw PIN acceptance is removed on WebSocket)
+    token = first.get("token")
+    if not token:
+        if hasattr(ws, "send_json"):
+            await ws.send_json({
+                "type": "error",
+                "text": "WebSocket requires a session token. Obtain one via POST /api/assistant/auth first.",
+                "retry_after": 5,
+            })
+        return False
+
+    token_str = str(token).strip()
+    if assistant_auth.auth_manager.verify_session_token(token_str):
+        return True
+
+    if hasattr(ws, "send_json"):
+        await ws.send_json({"type": "error", "text": assistant_auth.GENERIC_ERROR_MESSAGE, "retry_after": 5})
+    return False
+
+@app.post("/api/assistant/auth")
+async def assistant_auth_endpoint(request: Request, payload: dict = Body(...)) -> dict:
+    """Exchange ASSISTANT_PIN for a short-lived random session token."""
+    client_ip = webcall_gate.get_real_client_ip(request)
+    pin = payload.get("pin")
+    # Identity is strictly None on unauthenticated HTTP endpoints: unauthenticated clients
+    # cannot specify an identity (e.g. owner phone) to cause a denial-of-service/lockout against another user.
+    # Identity tracking is reserved for authenticated/tamper-proof channels (e.g. verified WhatsApp sender phone).
+    success, token, retry_after, error_msg = assistant_auth.auth_manager.authenticate(
+        pin, ip=client_ip, identity=None
+    )
+    if not success:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": error_msg, "retry_after": retry_after},
+            headers={"Retry-After": str(retry_after)},
+        )
+    return {
+        "status": "ok",
+        "token": token,
+        "expires_in": assistant_auth.SESSION_TTL_SECONDS,
+    }
+
+
+@app.get("/api/assistant/status")
+async def assistant_status_endpoint(request: Request, authorization: str | None = Header(default=None)) -> dict:
+    """Check session authentication status. Never leaks whether PIN is unset, lengths, or lockouts to unauthenticated callers."""
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:].strip()
+
+    if not token or not assistant_auth.auth_manager.verify_session_token(token):
+        return {"authenticated": False}
+
+    return {
+        "authenticated": True,
+        "expires_in": assistant_auth.auth_manager.get_session_remaining_ttl(token),
+    }
+
 
 
 async def _finalize(session) -> None:

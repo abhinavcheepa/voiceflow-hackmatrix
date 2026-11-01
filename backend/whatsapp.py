@@ -156,6 +156,7 @@ def parse(payload: dict) -> list[dict]:
             names = {c["wa_id"]: c.get("profile", {}).get("name") for c in value.get("contacts", [])}
             for m in value.get("messages", []):
                 out.append({
+                    "id": m.get("id"),
                     "from": m.get("from", ""),
                     "name": names.get(m.get("from", "")),
                     "type": m.get("type"),
@@ -174,6 +175,7 @@ async def handle(message: dict) -> None:
     sender = message["from"]
     name = message.get("name")
     is_voice = message["type"] in ("audio", "voice")
+    wa_id = message.get("id")
 
     try:
         if is_voice:
@@ -203,7 +205,12 @@ async def handle(message: dict) -> None:
         message_id = db.add_message(
             sender, "them", "voice" if is_voice else "text", incoming,
             name=name, language=language, needs_reply=blocked is None,
+            wa_id=wa_id,
         )
+
+        if wa_id and message_id is None:
+            log.info("duplicate message %s from %s ignored", wa_id, sender)
+            return
 
         events.broadcast("message_update", {"phone": sender, "direction": "them", "name": name})
         push.notify(f"WhatsApp from {name or sender}", incoming[:100], {"url": f"/app/whatsapp?phone={sender}"}, tag=f"wa-{sender}")

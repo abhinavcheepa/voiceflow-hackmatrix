@@ -9,7 +9,7 @@ const statusStyle = {
   New: "bg-panel-2 text-dim ring-line",
   Contacted: "bg-violet/15 text-violet-soft ring-violet/30",
   Qualified: "bg-saffron/10 text-saffron ring-saffron/25",
-  Customer: "bg-mint/10 text-mint ring-mint/25",
+  Customer: "bg-aqua/10 text-aqua ring-aqua/25",
   Lost: "bg-rose/10 text-rose ring-rose/25",
 };
 
@@ -72,7 +72,7 @@ function Detail({ id, onClose, onChanged }) {
               {t.kind === "call" ? (
                 <Phone className="size-3.5 text-violet-soft" />
               ) : (
-                <MessageSquare className="size-3.5 text-mint" />
+                <MessageSquare className="size-3.5 text-aqua" />
               )}
             </span>
             <div className="min-w-0 flex-1">

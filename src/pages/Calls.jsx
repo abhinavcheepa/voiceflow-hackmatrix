@@ -76,7 +76,7 @@ function NewCall({ onPlaced }) {
         <p className="mt-2 text-xs text-dim">Enter 8–15 digits, optionally starting with +.</p>
       )}
       {result && (
-        <p className={`mt-3 text-xs ${result.ok ? "text-mint" : "text-saffron"}`}>{result.text}</p>
+        <p className={`mt-3 text-xs ${result.ok ? "text-aqua" : "text-saffron"}`}>{result.text}</p>
       )}
     </Card>
   );

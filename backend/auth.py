@@ -38,6 +38,9 @@ _OPEN_PATHS = frozenset({
     "/api/vapi/webhook",          # Verified via X-Vapi-Secret
     "/api/whatsapp/webhook",      # Verified via Meta verify token / signature
     "/api/whatsapp/web/incoming", # Verified via X-Bridge-Token
+    "/api/web-call/ticket",       # Guarded by webcall_gate based on WEBCALL_PUBLIC
+    "/api/assistant/auth",        # Authenticated via ASSISTANT_PIN in assistant_auth
+    "/api/assistant/status",      # Verified via session token in assistant_auth
 })
 
 _OPEN_PREFIXES: tuple[str, ...] = ()
@@ -58,6 +61,19 @@ def _extract_token(request: Request) -> str | None:
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
     return None
+
+
+def check_auth(request: Request) -> bool:
+    if not API_TOKEN:
+        return True
+    token = _extract_token(request)
+    return bool(token and hmac.compare_digest(token, API_TOKEN))
+
+
+def require_auth(request: Request) -> None:
+    from fastapi import HTTPException
+    if not check_auth(request):
+        raise HTTPException(status_code=401, detail="Missing or invalid API token")
 
 
 class TokenAuthMiddleware(BaseHTTPMiddleware):

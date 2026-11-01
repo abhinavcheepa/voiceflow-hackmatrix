@@ -1,3 +1,4 @@
+import assistant_auth
 """Checks for the owner assistant ("Jarvis" mode): owner-only tools, the
 two-turn confirmation before anything is sent, WhatsApp threads handed to an
 agent, and who may use the assistant at all.
@@ -165,10 +166,12 @@ def test_assistant_access(monkeypatch):
     # Someone hitting the port directly can't claim to be local.
     assert not ok(FakeWS("192.168.1.9", {"x-forwarded-for": "127.0.0.1"}))
 
-    monkeypatch.setenv("ASSISTANT_PIN", "4321")
+    monkeypatch.setenv("ASSISTANT_PIN", "43210000")
+    token = assistant_auth.auth_manager.issue_session_token(ip="192.168.1.9")
     phone = {"x-forwarded-for": "192.168.1.9"}
-    assert ok(FakeWS("127.0.0.1", phone, {"type": "auth", "pin": "4321"}))
-    assert not ok(FakeWS("127.0.0.1", phone, {"type": "auth", "pin": "0000"}))
+    assert ok(FakeWS("127.0.0.1", phone, {"type": "auth", "token": token}))
+    assert not ok(FakeWS("127.0.0.1", phone, {"type": "auth", "token": "invalid_token_123"}))
+    assert not ok(FakeWS("127.0.0.1", phone, {"type": "auth", "pin": "43210000"}))  # raw PIN on WS is rejected
     assert not ok(FakeWS("127.0.0.1", phone, None))
 
 
@@ -231,8 +234,17 @@ def test_speech_cleanup_matches_what_the_voice_misread():
     assert say("Naam batayein.Ji, bataiye.(Waiting for your details).") == "Naam batayein. Ji, bataiye."
     assert say("Bill BILL-0001, ₹700, Ravi ko bhejun?") == "Bill 1, 700 rupaye, Ravi ko bhejun?"
     assert say("Spelling V-O-I-C-E hai, VICE FLOW nahi") == "Spelling Voice hai, Vice Flow nahi"
-    assert say("GST 18% aur AI, 4.5 kg") == "GST 18% aur AI, 4.5 kg"  # acronyms and decimals kept
+    assert say("GST 18% aur AI, 4.5 kg") == "GST 18 percent aur AI, 4.5 kg"  # spoken converts % to percent; acronyms and decimals kept
     assert say("जल्दी जल्दी भेजो।ठीक") == "जल्दी जल्दी भेजो। ठीक"
+
+
+def test_stored_and_displayed_text_keeps_percentage():
+    """Text stored in DB or formatted for display/WhatsApp keeps literal '18%', not '18 percent'."""
+    raw = "Total bill amount with GST 18% is ₹700"
+    msg_id = db.add_message("919999999999", "us", "text", raw)
+    assert msg_id is not None
+    msgs = db.messages_for("919999999999")
+    assert any("GST 18%" in m and "18 percent" not in m for m in msgs)
 
 
 def test_primed_whisper_reciting_its_vocab_is_dropped():
@@ -245,11 +257,11 @@ def test_auto_reply_settings_change_settings_and_send_nothing(monkeypatch):
     _wa(monkeypatch)
     db.set_allowlist(["9000000001"])
     ctx = {"owner": True, "_turn": 1}
-    out = _run("auto_reply_settings", {"action": "allow", "phone": "88178 82519"}, ctx)
+    out = _run("auto_reply_settings", {"action": "allow", "phone": "99999 00001"}, ctx)
     assert "Ho gaya" in out and not sent
-    assert db.auto_reply_block("918817882519") is None
-    _run("auto_reply_settings", {"action": "block", "phone": "88178 82519"}, ctx)
-    assert db.auto_reply_block("918817882519") is not None
+    assert db.auto_reply_block("919999900001") is None
+    _run("auto_reply_settings", {"action": "block", "phone": "99999 00001"}, ctx)
+    assert db.auto_reply_block("919999900001") is not None
     assert db.get_allowlist()  # never emptied — empty would mean "reply to everyone"
     assert "Only these numbers" in _run("auto_reply_settings", {"action": "status"}, ctx)
     db.set_allowlist([])
