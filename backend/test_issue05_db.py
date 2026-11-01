@@ -69,6 +69,51 @@ def test_cascade_or_safe_delete_paths(monkeypatch):
     # Deleting agent must not raise IntegrityError
     db.delete_agent(ag_id)
 
+    # 5. Campaign delete (with campaign_targets child rows)
+    camp_id = db.create_campaign("Promo Campaign", None, [{"name": "Lead 1", "phone": "919999911111"}])
+    with db.connect() as conn:
+        targets_before = conn.execute("SELECT COUNT(*) FROM campaign_targets WHERE campaign_id = ?", (camp_id,)).fetchone()[0]
+        assert targets_before == 1
+    db.delete_campaign(camp_id)
+    with db.connect() as conn:
+        targets_after = conn.execute("SELECT COUNT(*) FROM campaign_targets WHERE campaign_id = ?", (camp_id,)).fetchone()[0]
+        assert targets_after == 0
+
+    # 6. Conversation delete (with messages child rows)
+    db.add_message("919999922222", "them", "text", "Hello message")
+    with db.connect() as conn:
+        conv_id = conn.execute("SELECT id FROM conversations WHERE phone = '919999922222'").fetchone()["id"]
+    with db.connect() as conn:
+        msgs_before = conn.execute("SELECT COUNT(*) FROM messages WHERE conversation_id = ?", (conv_id,)).fetchone()[0]
+        assert msgs_before >= 1
+    db.delete_conversation(conv_id)
+    with db.connect() as conn:
+        msgs_after = conn.execute("SELECT COUNT(*) FROM messages WHERE conversation_id = ?", (conv_id,)).fetchone()[0]
+        assert msgs_after == 0
+
+    # 7. Eval Case delete (with eval_runs child rows)
+    case_id = db.add_eval_case(name="Test Case", agent_id=None, mode="script", turns="[]", persona="Tester", max_turns=3, rubric="{}")
+    with db.connect() as conn:
+        conn.execute("INSERT INTO eval_runs (case_id, passed, reason, transcript, tools, created_at) VALUES (?, 1, 'ok', '[]', '[]', 'now')", (case_id,))
+    with db.connect() as conn:
+        runs_before = conn.execute("SELECT COUNT(*) FROM eval_runs WHERE case_id = ?", (case_id,)).fetchone()[0]
+        assert runs_before == 1
+    db.delete_eval_case(case_id)
+    with db.connect() as conn:
+        runs_after = conn.execute("SELECT COUNT(*) FROM eval_runs WHERE case_id = ?", (case_id,)).fetchone()[0]
+        assert runs_after == 0
+
+    # 8. Contact delete
+    db.touch_contact("919999933333", name="Contact To Delete")
+    with db.connect() as conn:
+        c_row = conn.execute("SELECT id FROM contacts WHERE phone = '919999933333'").fetchone()
+        assert c_row is not None
+        contact_id = c_row["id"]
+    db.delete_contact(contact_id)
+    with db.connect() as conn:
+        c_after = conn.execute("SELECT COUNT(*) FROM contacts WHERE id = ?", (contact_id,)).fetchone()[0]
+        assert c_after == 0
+
 
 def test_schema_version_and_migration_idempotency(monkeypatch):
     """schema_version table tracks migrations; running init twice produces identical schema."""
@@ -232,3 +277,63 @@ def test_migrating_old_db_copy(monkeypatch):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
         assert "wa_id" in cols
         assert "needs_reply" in cols
+
+
+def test_http_delete_endpoints_no_500(monkeypatch):
+    """Verify HTTP DELETE endpoints for all 8 entities succeed with status 200 and no 500 errors."""
+    from starlette.testclient import TestClient
+    from main import app
+
+    temp_dir = tempfile.mkdtemp()
+    test_db = os.path.join(temp_dir, "test_http_deletes.db")
+    monkeypatch.setattr(db, "DB_PATH", test_db)
+    db.init()
+    import auth
+    token = "test-token-12345"
+    monkeypatch.setattr(auth, "API_TOKEN", token)
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1. Agent delete via HTTP
+    ag = db.save_agent(None, name="Test Ag", prompt="p", greeting="g")
+    r_ag = client.delete(f"/api/agents/{ag['id']}", headers=headers)
+    assert r_ag.status_code == 200
+
+    # 2. KB Doc delete via HTTP
+    doc = db.add_kb_document(None, "doc.txt", ["chunk"])
+    r_kb = client.delete(f"/api/kb/{doc['id']}", headers=headers)
+    assert r_kb.status_code == 200
+
+    # 3. Campaign delete via HTTP
+    cid = db.create_campaign("Camp", None, [{"name": "Lead", "phone": "919999900011"}])
+    r_camp = client.delete(f"/api/campaigns/{cid}", headers=headers)
+    assert r_camp.status_code == 200
+
+    # 4. Conversation delete via HTTP
+    db.add_message("919999900022", "them", "text", "msg")
+    with db.connect() as conn:
+        cvid = conn.execute("SELECT id FROM conversations WHERE phone = '919999900022'").fetchone()["id"]
+    r_conv = client.delete(f"/api/conversations/{cvid}", headers=headers)
+    assert r_conv.status_code == 200
+
+    # 5. Eval case delete via HTTP
+    ecid = db.add_eval_case(name="HTTP Eval Case", agent_id=None, mode="script", turns="[]", persona="Tester", max_turns=3, rubric="{}")
+    r_eval = client.delete(f"/api/evals/{ecid}", headers=headers)
+    assert r_eval.status_code == 200
+
+    # 6. Stock item delete via HTTP
+    stk = db.add_stock_item("Brick", "Building", 100, "pcs", 10.0, 5)
+    r_stk = client.delete(f"/api/stock/{stk['id']}", headers=headers)
+    assert r_stk.status_code == 200
+
+    # 7. Bill delete via HTTP
+    bill = db.create_bill("Cust", "919999900033")
+    r_bill = client.delete(f"/api/bills/{bill['id']}", headers=headers)
+    assert r_bill.status_code == 200
+
+    # 8. Contact delete via HTTP
+    db.touch_contact("919999900044", name="Cust")
+    with db.connect() as conn:
+        ct_id = conn.execute("SELECT id FROM contacts WHERE phone = '919999900044'").fetchone()["id"]
+    r_ct = client.delete(f"/api/contacts/{ct_id}", headers=headers)
+    assert r_ct.status_code == 200

@@ -1303,6 +1303,20 @@ def delete_contact(contact_id: int) -> None:
         conn.execute("DELETE FROM contacts WHERE id = ?", (contact_id,))
 
 
+def delete_campaign(campaign_id: int) -> None:
+    """Delete a campaign and safely clean up all its campaign_targets children first."""
+    with connect() as conn:
+        conn.execute("DELETE FROM campaign_targets WHERE campaign_id = ?", (campaign_id,))
+        conn.execute("DELETE FROM campaigns WHERE id = ?", (campaign_id,))
+
+
+def delete_conversation(conversation_id: int) -> None:
+    """Delete a conversation and safely clean up all its messages children first."""
+    with connect() as conn:
+        conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+        conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+
+
 # --- adaptive learning ---------------------------------------------------
 
 def add_learned_answer(agent_id: int | None, question: str, answer: str,

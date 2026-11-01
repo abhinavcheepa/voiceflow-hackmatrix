@@ -127,3 +127,27 @@ def test_meta_webhook_endpoint_deduplication_e2e():
     with db.connect() as conn:
         rows = conn.execute("SELECT id, wa_id FROM messages WHERE wa_id = ?", ("wamid.E2E_DEDUP_123",)).fetchall()
         assert len(rows) == 1
+
+
+def test_whatsapp_signature_unset_fails_open_and_set_verifies(monkeypatch):
+    """When WHATSAPP_APP_SECRET is unset, signature verification fails open (returns True).
+    When WHATSAPP_APP_SECRET is set, invalid signatures fail closed (returns False)."""
+    import hmac
+    import hashlib
+
+    raw_body = b'{"test": "payload"}'
+
+    # 1. Secret unset: fails open
+    monkeypatch.delenv("WHATSAPP_APP_SECRET", raising=False)
+    assert whatsapp.verify_signature(raw_body, None) is True
+    assert whatsapp.verify_signature(raw_body, "sha256=invalid") is True
+
+    # 2. Secret set: fails closed on invalid signature
+    secret = "my_webhook_secret_key"
+    monkeypatch.setenv("WHATSAPP_APP_SECRET", secret)
+    assert whatsapp.verify_signature(raw_body, None) is False
+    assert whatsapp.verify_signature(raw_body, "sha256=wrong_hex") is False
+
+    # 3. Valid signature succeeds
+    valid_sig = "sha256=" + hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    assert whatsapp.verify_signature(raw_body, valid_sig) is True

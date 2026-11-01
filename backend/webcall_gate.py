@@ -12,6 +12,7 @@ Enforces:
 """
 
 import asyncio
+import ipaddress
 import logging
 import os
 import secrets
@@ -46,7 +47,52 @@ MAX_FRAME_RATE_PER_SEC = int(os.getenv("WEBCALL_MAX_FRAME_RATE_PER_SEC") or 25)
 DAILY_WEBCALL_MINUTES_BUDGET = float(os.getenv("DAILY_WEBCALL_MINUTES_BUDGET") or _DEFAULT_GLOBAL_MINUTES)
 PER_IP_DAILY_MINUTES = float(os.getenv("WEBCALL_PER_IP_DAILY_MINUTES") or _DEFAULT_PER_IP_MINUTES)
 
-TRUSTED_PROXIES = {p.strip() for p in os.getenv("TRUSTED_PROXIES", "127.0.0.1,::1,localhost").split(",") if p.strip()}
+def parse_trusted_proxies(raw_val: str | None = None) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Parse comma-separated CIDR / IP list for trusted reverse proxies. Defaults to loopback only."""
+    raw = (raw_val if raw_val is not None else os.getenv("TRUSTED_PROXIES", "")).strip()
+    if not raw:
+        return [ipaddress.ip_network("127.0.0.1/32"), ipaddress.ip_network("::1/128")]
+    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for item in raw.split(","):
+        clean = item.strip()
+        if not clean:
+            continue
+        if clean.lower() == "localhost":
+            networks.extend([ipaddress.ip_network("127.0.0.1/32"), ipaddress.ip_network("::1/128")])
+            continue
+        try:
+            networks.append(ipaddress.ip_network(clean, strict=False))
+        except ValueError:
+            pass
+    return networks if networks else [ipaddress.ip_network("127.0.0.1/32"), ipaddress.ip_network("::1/128")]
+
+def is_trusted_proxy(ip_str: str, networks: Any = None) -> bool:
+    """Check if an IP string falls within any configured trusted proxy CIDR block."""
+    if not ip_str:
+        return False
+    if ip_str.lower() in ("localhost", "testclient"):
+        ip_str = "127.0.0.1"
+    active_nets = networks if networks is not None else TRUSTED_PROXIES
+    if isinstance(active_nets, (set, list, tuple)):
+        try:
+            addr = ipaddress.ip_address(ip_str)
+            for item in active_nets:
+                if isinstance(item, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+                    if addr in item:
+                        return True
+                elif isinstance(item, str):
+                    try:
+                        net = ipaddress.ip_network(item.strip(), strict=False)
+                        if addr in net:
+                            return True
+                    except ValueError:
+                        if item.strip() == ip_str:
+                            return True
+        except ValueError:
+            return False
+    return False
+
+TRUSTED_PROXIES = parse_trusted_proxies()
 
 # WebSocket Close Codes
 WS_CLOSE_INVALID_TICKET = 4001
@@ -76,7 +122,7 @@ def mask_ip(ip: str | None) -> str:
 def get_real_client_ip(request_or_ws: Any) -> str:
     """Extract client IP, verifying X-Forwarded-For only when the immediate peer is trusted."""
     client_host = request_or_ws.client.host if request_or_ws.client else "127.0.0.1"
-    if client_host in TRUSTED_PROXIES:
+    if is_trusted_proxy(client_host):
         fwd = request_or_ws.headers.get("x-forwarded-for")
         if fwd:
             candidate = fwd.split(",")[0].strip()

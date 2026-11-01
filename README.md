@@ -296,6 +296,7 @@ This starts:
 - **`backend`**: FastAPI running on Python 3.11 with SQLite WAL mode, background job worker, and single-worker uvicorn. Persists database to `voiceflow_data`.
 - **`wa-bridge`**: WhatsApp Web Puppeteer bridge with Chromium. Persists session authentication to `voiceflow_wa_session` (scan QR code once, stays authenticated).
 - **`caddy`**: Automated HTTPS reverse proxy with SSL certificate management. Configured with unbuffered SSE streaming (`flush_interval -1`).
+  - **Reverse Proxy IP Trust (`TRUSTED_PROXIES`)**: Backend extracts real client IPs from `X-Forwarded-For` only when the immediate peer falls within `TRUSTED_PROXIES` (comma-separated CIDR blocks, defaulting to loopback `127.0.0.1/32,::1/128`). In Docker Compose behind Caddy, configure `TRUSTED_PROXIES=172.16.0.0/12,127.0.0.1/32` so rate limiting and lockouts bind to individual visitor IPs rather than the shared Caddy container IP.
 
 ### 3. Asterisk (Telephony)
 Asterisk PBX requires direct UDP RTP port access (10000–20000). For containerized setups, run with `network_mode: host` or point `ASTERISK_ARI_URL` in `.env` to your bare-metal / cloud Asterisk server.

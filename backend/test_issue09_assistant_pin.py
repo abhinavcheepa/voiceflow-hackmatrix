@@ -143,27 +143,44 @@ def test_lockout_after_n_failures_per_ip(monkeypatch):
     assert retry_after >= 1
 
 
-def test_lockout_after_n_failures_per_identity(monkeypatch):
-    """After 5 failed attempts for the same client identity (e.g. WhatsApp number), identity is locked out."""
-    monkeypatch.setenv("ASSISTANT_PIN", "CorrectPasscode99")
-    identity = "919999900001"
+def test_two_clients_behind_trusted_proxy_independent_lockout(monkeypatch):
+    """When multiple clients connect via a trusted reverse proxy (e.g. Caddy),
+    failed attempts from Client A (X-Forwarded-For: 203.0.113.1) lock out Client A,
+    while Client B (X-Forwarded-For: 203.0.113.2) remains unaffected and successfully authenticates."""
+    import webcall_gate
+    monkeypatch.setenv("ASSISTANT_PIN", "ValidPasscode999")
+    monkeypatch.setattr(webcall_gate, "TRUSTED_PROXIES", webcall_gate.parse_trusted_proxies("127.0.0.1/32,172.16.0.0/12"))
 
-    # Send 5 failures from changing IPs but same identity
-    for i in range(5):
-        ok, _, retry_after, _ = assistant_auth.auth_manager.authenticate(
-            "BadPin123", ip=f"192.168.2.{i+1}", identity=identity
+    client = TestClient(app)
+    client_a_ip = "203.0.113.10"
+    client_b_ip = "203.0.113.20"
+
+    # Client A fails 5 times behind proxy
+    for _ in range(5):
+        res = client.post(
+            "/api/assistant/auth",
+            json={"pin": "WrongPassword123"},
+            headers={"x-forwarded-for": client_a_ip}
         )
-        assert ok is False
+        assert res.status_code == 401
 
-    assert retry_after >= assistant_auth.BASE_LOCKOUT_SECONDS
-
-    # 6th attempt from yet another IP for this locked out identity is blocked
-    ok, token, retry_after, _ = assistant_auth.auth_manager.authenticate(
-        "CorrectPasscode99", ip="192.168.2.99", identity=identity
+    # 6th attempt from Client A is locked out
+    res_a = client.post(
+        "/api/assistant/auth",
+        json={"pin": "ValidPasscode999"},
+        headers={"x-forwarded-for": client_a_ip}
     )
-    assert ok is False
-    assert token is None
-    assert retry_after >= 1
+    assert res_a.status_code == 401
+    assert "Retry-After" in res_a.headers
+
+    # Client B connecting behind the EXACT SAME proxy with correct PIN succeeds immediately
+    res_b = client.post(
+        "/api/assistant/auth",
+        json={"pin": "ValidPasscode999"},
+        headers={"x-forwarded-for": client_b_ip}
+    )
+    assert res_b.status_code == 200
+    assert "token" in res_b.json()
 
 
 def test_lockout_expiry(monkeypatch):

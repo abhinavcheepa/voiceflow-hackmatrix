@@ -660,6 +660,18 @@ def contact_delete(contact_id: int) -> dict:
     return {"ok": True}
 
 
+@app.delete("/api/campaigns/{campaign_id}")
+def campaign_delete(campaign_id: int) -> dict:
+    db.delete_campaign(campaign_id)
+    return {"ok": True}
+
+
+@app.delete("/api/conversations/{conversation_id}")
+def conversation_delete(conversation_id: int) -> dict:
+    db.delete_conversation(conversation_id)
+    return {"ok": True}
+
+
 @app.put("/api/contacts/{contact_id}")
 def contact_update(
     contact_id: int,
@@ -1159,7 +1171,7 @@ async def assistant_auth_endpoint(request: Request, payload: dict = Body(...)) -
     # cannot specify an identity (e.g. owner phone) to cause a denial-of-service/lockout against another user.
     # Identity tracking is reserved for authenticated/tamper-proof channels (e.g. verified WhatsApp sender phone).
     success, token, retry_after, error_msg = assistant_auth.auth_manager.authenticate(
-        pin, ip=client_ip, identity=None
+        pin, ip=client_ip
     )
     if not success:
         return JSONResponse(

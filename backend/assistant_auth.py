@@ -93,29 +93,23 @@ class AssistantAuthManager:
     """Stateful assistant authentication manager for PIN verification, lockouts, and session tokens."""
 
     def __init__(self):
-        # Failed attempt timestamps: key -> list of float timestamps
+        # Failed attempt timestamps: ip -> list of float timestamps
         self._failed_ip_attempts: Dict[str, List[float]] = {}
-        self._failed_identity_attempts: Dict[str, List[float]] = {}
         self._global_failures: List[float] = []
 
-        # Lockout state: key -> (lockout_until_timestamp, consecutive_lockouts_count)
+        # Lockout state: ip -> (lockout_until_timestamp, consecutive_lockouts_count)
         self._ip_lockouts: Dict[str, Tuple[float, int]] = {}
-        self._identity_lockouts: Dict[str, Tuple[float, int]] = {}
         self._ip_lockout_counts: Dict[str, int] = {}
-        self._identity_lockout_counts: Dict[str, int] = {}
 
-        # Active sessions: token -> dict(created_at, expires_at, ip, identity)
+        # Active sessions: token -> dict(created_at, expires_at, ip)
         self._sessions: Dict[str, Dict[str, Any]] = {}
 
     def reset(self) -> None:
         """Clear all state (primarily for test isolation)."""
         self._failed_ip_attempts.clear()
-        self._failed_identity_attempts.clear()
         self._global_failures.clear()
         self._ip_lockouts.clear()
-        self._identity_lockouts.clear()
         self._ip_lockout_counts.clear()
-        self._identity_lockout_counts.clear()
         self._sessions.clear()
 
     def get_configured_pin(self) -> Optional[str]:
@@ -161,7 +155,6 @@ class AssistantAuthManager:
         self,
         candidate_pin: Optional[str],
         ip: str = "127.0.0.1",
-        identity: Optional[str] = None,
     ) -> Tuple[bool, Optional[str], int, str]:
         """Authenticate a candidate PIN under strict rate limiting and lockout rules.
         
@@ -180,26 +173,12 @@ class AssistantAuthManager:
             else:
                 del self._ip_lockouts[ip]
 
-        # 2. Check client identity lockout
-        if identity and identity in self._identity_lockouts:
-            until, count = self._identity_lockouts[identity]
-            if now < until:
-                retry_after = max(1, int(until - now + 0.99))
-                log.warning(
-                    "Assistant PIN auth rejected: identity %s is locked out (%ds remaining)",
-                    mask_identifier(identity),
-                    retry_after,
-                )
-                return False, None, retry_after, GENERIC_ERROR_MESSAGE
-            else:
-                del self._identity_lockouts[identity]
-
-        # 3. Verify PIN constant time
+        # 2. Verify PIN constant time
         configured = self.get_configured_pin()
         match = verify_pin_constant_time(candidate_pin, configured)
 
         if not match:
-            # 4. Check global rate limit (failed attempts in past 60s)
+            # 3. Check global rate limit (failed attempts in past 60s)
             self._global_failures = [t for t in self._global_failures if now - t <= 60.0]
             if len(self._global_failures) >= GLOBAL_MAX_FAILURES_PER_MINUTE:
                 log.warning("Assistant PIN global failed attempt cap reached (%d/min); throttling failed attempts", len(self._global_failures))
@@ -213,35 +192,20 @@ class AssistantAuthManager:
             ip_attempts.append(now)
             self._failed_ip_attempts[ip] = ip_attempts
 
-            # Record Identity failures if provided
-            if identity:
-                ident_attempts = [t for t in self._failed_identity_attempts.get(identity, []) if now - t <= 900.0]
-                ident_attempts.append(now)
-                self._failed_identity_attempts[identity] = ident_attempts
-
-            ip_fail_count = len(ip_attempts)
-            ident_fail_count = len(self._failed_identity_attempts.get(identity, [])) if identity else 0
-            is_locked = (ip_fail_count >= MAX_FAILURES_BEFORE_LOCKOUT) or (ident_fail_count >= MAX_FAILURES_BEFORE_LOCKOUT)
-            fail_count = max(ip_fail_count, ident_fail_count)
-
-            if is_locked:
-                prev_ip_lockouts = self._ip_lockout_counts.get(ip, 0)
-                prev_ident_lockouts = self._identity_lockout_counts.get(identity, 0) if identity else 0
-                new_lockout_count = max(prev_ip_lockouts, prev_ident_lockouts) + 1
+            fail_count = len(ip_attempts)
+            if fail_count >= MAX_FAILURES_BEFORE_LOCKOUT:
+                prev_lockouts = self._ip_lockout_counts.get(ip, 0)
+                new_lockout_count = prev_lockouts + 1
                 self._ip_lockout_counts[ip] = new_lockout_count
                 lockout_duration = min(
                     BASE_LOCKOUT_SECONDS * (2 ** (new_lockout_count - 1)),
                     MAX_LOCKOUT_SECONDS,
                 )
                 self._ip_lockouts[ip] = (now + lockout_duration, new_lockout_count)
-                if identity:
-                    self._identity_lockout_counts[identity] = new_lockout_count
-                    self._identity_lockouts[identity] = (now + lockout_duration, new_lockout_count)
                 retry_after = int(lockout_duration)
                 log.warning(
-                    "Assistant PIN auth locked out for IP %s and identity %s for %ds (attempt %d)",
+                    "Assistant PIN auth locked out for IP %s for %ds (attempt %d)",
                     mask_ip(ip),
-                    mask_identifier(identity),
                     lockout_duration,
                     fail_count,
                 )
@@ -256,26 +220,21 @@ class AssistantAuthManager:
 
             return False, None, retry_after, GENERIC_ERROR_MESSAGE
 
-        # Successful authentication: reset failed counters and lockouts for this IP & identity
+        # Successful authentication: reset failed counters and lockouts for this IP
         self._failed_ip_attempts.pop(ip, None)
         self._ip_lockouts.pop(ip, None)
         self._ip_lockout_counts.pop(ip, None)
-        if identity:
-            self._failed_identity_attempts.pop(identity, None)
-            self._identity_lockouts.pop(identity, None)
-            self._identity_lockout_counts.pop(identity, None)
 
         session_token = secrets.token_urlsafe(32)
         self._sessions[session_token] = {
             "created_at": now,
             "expires_at": now + SESSION_TTL_SECONDS,
             "ip": ip,
-            "identity": identity,
         }
         log.info("Assistant PIN verified successfully for IP %s; issued session token", mask_ip(ip))
         return True, session_token, 0, ""
 
-    def issue_session_token(self, ip: str = "127.0.0.1", identity: Optional[str] = None) -> str:
+    def issue_session_token(self, ip: str = "127.0.0.1") -> str:
         """Directly issue a session token (e.g. for loopback caller or authenticated admin)."""
         now = time.time()
         session_token = secrets.token_urlsafe(32)
@@ -283,7 +242,6 @@ class AssistantAuthManager:
             "created_at": now,
             "expires_at": now + SESSION_TTL_SECONDS,
             "ip": ip,
-            "identity": identity,
         }
         return session_token
 
