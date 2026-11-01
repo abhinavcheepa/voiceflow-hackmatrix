@@ -488,6 +488,8 @@ async def voice_clone(name: str = Form(...), samples: list[UploadFile] = File(..
                for f in samples]
     try:
         voice_id = await voice.clone(name, payload, gender_=gender)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except RuntimeError as e:
         raise HTTPException(503, str(e))
     return {"voiceId": voice_id, **voice.profile()}
@@ -497,6 +499,8 @@ async def voice_clone(name: str = Form(...), samples: list[UploadFile] = File(..
 async def voice_clone_delete() -> dict:
     try:
         await voice.delete_clone()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except RuntimeError as e:
         raise HTTPException(503, str(e))
     return voice.profile()
