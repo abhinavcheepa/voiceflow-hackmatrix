@@ -40,3 +40,4 @@ def test_valid_clone_ids_resolve_inside_clones_dir():
         path = cloning._path(good_id)
         assert path.name == f"{good_id}.pt"
         assert path.parent == cloning._CLONES_DIR.resolve()
+

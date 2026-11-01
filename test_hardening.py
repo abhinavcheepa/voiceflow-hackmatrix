@@ -203,7 +203,8 @@ def test_5_pause_resume_enforcement():
         row = conn.execute(
             """SELECT m.* FROM messages m
                JOIN conversations c ON c.id = m.conversation_id
-               WHERE c.phone = '+918817882519' ORDER BY m.id DESC LIMIT 1"""
+               WHERE c.phone = ? ORDER BY m.id DESC LIMIT 1""",
+            (db.normalize_phone('+918817882519'),),
         ).fetchone()
     print(f"Stored message while paused: direction='{row['sender']}', text='{row['body']}', needs_reply={row['needs_reply']}")
     assert row["sender"] == "them"

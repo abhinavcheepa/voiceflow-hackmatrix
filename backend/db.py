@@ -401,6 +401,16 @@ def _migrate(conn) -> None:
         )
         current_version = 2
 
+    if current_version < 3:
+        # Step 3: Phone normalization unique indexes on contacts and conversations
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_phone_unique ON contacts(phone)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_phone_unique ON conversations(phone)")
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at, description) VALUES (3, ?, ?)",
+            (now, "Phone normalization unique indexes on contacts and conversations")
+        )
+        current_version = 3
+
 
 def init() -> None:
     # Use isolation_level=None with BEGIN IMMEDIATE to serialize concurrent startup
@@ -587,6 +597,8 @@ def upsert_call(vapi_call_id: str, **fields) -> None:
     went nowhere, and every web call stayed 'active' with no duration and no
     transcript. The dashboard read zero calls for the same reason.
     """
+    if "phone" in fields and fields["phone"]:
+        fields["phone"] = normalize_phone(fields["phone"])
     with connect() as conn:
         known = conn.execute(
             "SELECT 1 FROM calls WHERE vapi_call_id = ?", (vapi_call_id,)
@@ -646,6 +658,7 @@ def clear_needs_reply(message_id: int) -> None:
 
 def get_history(phone: str, limit: int = 12) -> list[dict]:
     """Recent turns for one number, oldest first — fed to the LLM as context."""
+    phone = normalize_phone(phone)
     with connect() as conn:
         rows = conn.execute(
             # failed = 0 matters: a failure leaves an "[auto-reply failed: …]"
@@ -674,6 +687,7 @@ def add_message(phone: str, sender: str, kind: str, body: str, seconds: int | No
     WhatsApp's own message id, which makes re-running an import a no-op instead
     of duplicating the thread.
     """
+    phone = normalize_phone(phone)
     now = at or datetime.now(timezone.utc).isoformat()
     with connect() as conn:
         conn.execute(
@@ -747,6 +761,7 @@ def set_auto_reply_global(enabled: bool) -> None:
 
 def set_auto_reply_for(phone: str, enabled: bool) -> None:
     """Per-thread override — the owner taking one conversation over by hand."""
+    phone = normalize_phone(phone)
     with connect() as conn:
         conn.execute(
             "UPDATE conversations SET auto_reply = ? WHERE phone = ?", (int(enabled), phone)
@@ -887,6 +902,7 @@ def touch_contact(phone: str, name: str | None = None) -> None:
     """
     if not phone or phone == "unknown":
         return
+    phone = normalize_phone(phone)
     now = datetime.now(timezone.utc).isoformat()
     with connect() as conn:
         conn.execute(
@@ -1018,7 +1034,7 @@ def create_campaign(name: str, agent_id: int | None, targets: list[dict]) -> int
         cid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.executemany(
             "INSERT INTO campaign_targets (campaign_id, name, phone) VALUES (?,?,?)",
-            [(cid, t.get("name"), t["phone"]) for t in targets],
+            [(cid, t.get("name"), normalize_phone(t["phone"])) for t in targets],
         )
     return cid
 
@@ -1246,6 +1262,8 @@ def kb_chunks_with_embeddings(agent_id: int | None) -> list[tuple[str, bytes | N
 def add_booking(item: str, name: str | None = None, phone: str | None = None,
                 when_text: str | None = None, notes: str | None = None,
                 channel: str = "call", escalated: bool = False) -> dict:
+    if phone:
+        phone = normalize_phone(phone)
     with connect() as conn:
         cur = conn.execute(
             """INSERT INTO bookings (phone, name, item, when_text, notes, channel,
@@ -1495,6 +1513,8 @@ def _next_bill_number() -> str:
 
 def create_bill(customer_name: str | None = None, customer_phone: str | None = None,
                 agent_id: int | None = None, channel: str = "call") -> dict:
+    if customer_phone:
+        customer_phone = normalize_phone(customer_phone)
     now = datetime.now(timezone.utc).isoformat()
     bill_number = _next_bill_number()
     with connect() as conn:
@@ -1605,6 +1625,7 @@ def get_active_bill(channel: str = "call") -> dict | None:
 # customer's past bookings, bills and messages, never another customer's.
 
 def bookings_for(phone: str, limit: int = 10) -> list[dict]:
+    phone = normalize_phone(phone)
     with connect() as conn:
         rows = conn.execute(
             "SELECT * FROM bookings WHERE phone = ? ORDER BY id DESC LIMIT ?",
@@ -1616,6 +1637,7 @@ def bookings_for(phone: str, limit: int = 10) -> list[dict]:
 
 
 def bills_for(phone: str, limit: int = 10) -> list[dict]:
+    phone = normalize_phone(phone)
     with connect() as conn:
         rows = conn.execute(
             "SELECT id FROM bills WHERE customer_phone = ? ORDER BY id DESC LIMIT ?",
@@ -1626,6 +1648,7 @@ def bills_for(phone: str, limit: int = 10) -> list[dict]:
 
 def messages_for(phone: str, limit: int = 300) -> list[str]:
     """This number's whole thread (beyond the short prompt window), newest first."""
+    phone = normalize_phone(phone)
     with connect() as conn:
         rows = conn.execute(
             """SELECT m.sender, m.body, m.created_at FROM messages m
@@ -1712,8 +1735,16 @@ def normalize_phone(raw: str) -> str:
     Incoming messages arrive keyed as country code + number, so an outgoing
     thread must use the same form or the reply lands in a different thread.
     """
-    d = _digits(raw or "")
-    if len(d) == 11 and d.startswith("0"):
+    if not raw:
+        return ""
+    d = _digits(raw)
+    if not d:
+        return raw.strip()
+    if d.startswith("0091"):
+        d = d[2:]
+    elif d.startswith("091") and len(d) == 13:
+        d = d[1:]
+    elif len(d) == 11 and d.startswith("0"):
         d = d[1:]
     if len(d) == 10:
         d = "91" + d
@@ -1724,6 +1755,7 @@ def assign_conversation(phone: str, agent_id: int | None, goal: str, name: str |
     """Hand a WhatsApp thread to an agent with a goal, and make sure it will
     actually auto-reply there — an allowlist or a per-thread "off" would
     otherwise silently stop the agent the owner just asked to talk."""
+    phone = normalize_phone(phone)
     now = datetime.now(timezone.utc).isoformat()
     with connect() as conn:
         conn.execute(
@@ -1741,6 +1773,7 @@ def assign_conversation(phone: str, agent_id: int | None, goal: str, name: str |
 
 def conversation_brief(phone: str) -> dict:
     """The agent and goal the owner set for this thread, if any."""
+    phone = normalize_phone(phone)
     with connect() as conn:
         r = conn.execute(
             "SELECT agent_id, goal FROM conversations WHERE phone = ?", (phone,)
@@ -1751,6 +1784,7 @@ def conversation_brief(phone: str) -> dict:
 def set_thread_auto_reply(phone: str, enabled: bool) -> None:
     """Per-number auto-reply, creating the thread if this number never wrote yet
     (set_auto_reply_for only touches existing threads)."""
+    phone = normalize_phone(phone)
     now = datetime.now(timezone.utc).isoformat()
     with connect() as conn:
         conn.execute(
