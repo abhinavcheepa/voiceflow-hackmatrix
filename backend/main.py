@@ -55,6 +55,7 @@ import vapi  # noqa: E402
 import voice  # noqa: E402
 import webcall
 import webcall_gate  # noqa: E402
+import upload_security  # noqa: E402
 import whatsapp  # noqa: E402
 import whatsapp_web  # noqa: E402
 import adaptive  # noqa: E402
@@ -494,19 +495,42 @@ def voice_select(voice_id: str = Body(...), name: str = Body(...)) -> dict:
 
 
 @app.post("/api/voice/clone")
-async def voice_clone(name: str = Form(...), samples: list[UploadFile] = File(...),
+async def voice_clone(request: Request, name: str = Form(...), samples: list[UploadFile] = File(...),
                       gender: str = Form("female")) -> dict:
-    """Upload 30s+ of the owner's speech to create the cloned voice. `gender`
-    ("female"/"male") makes the reply grammar match the cloned speaker."""
-    payload = [(f.filename or "sample.wav", await f.read(), f.content_type or "audio/wav")
-               for f in samples]
+    """Upload 30s+ of the owner's speech to create the cloned voice with bounded streaming & magic validation."""
+    client_ip = webcall_gate.get_real_client_ip(request)
+    await upload_security.quota_manager.acquire(client_ip)
     try:
-        voice_id = await voice.clone(name, payload, gender_=gender)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except RuntimeError as e:
-        raise HTTPException(503, str(e))
-    return {"voiceId": voice_id, **voice.profile()}
+        if not samples:
+            raise HTTPException(400, "No audio samples provided.")
+
+        total_bytes = 0
+        payload = []
+        for f in samples:
+            safe_name = upload_security.sanitize_filename(f.filename or "sample.wav")
+            data = await upload_security.read_bounded(f, upload_security.MAX_AUDIO_SAMPLE_BYTES)
+            total_bytes += len(data)
+            if total_bytes > upload_security.MAX_TOTAL_CLONE_BYTES:
+                raise HTTPException(
+                    413, f"Total audio samples exceed limit of {upload_security.MAX_TOTAL_CLONE_BYTES // (1024*1024)} MB."
+                )
+            mime = upload_security.validate_magic_bytes_audio(data, safe_name)
+            payload.append((safe_name, data, mime))
+
+        try:
+            voice_id = await asyncio.wait_for(
+                voice.clone(name, payload, gender_=gender),
+                timeout=upload_security.PARSING_TIMEOUT_SECONDS * 2
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(408, "Voice cloning operation timed out.")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except RuntimeError as e:
+            raise HTTPException(503, str(e))
+        return {"voiceId": voice_id, **voice.profile()}
+    finally:
+        await upload_security.quota_manager.release(client_ip)
 
 
 @app.delete("/api/voice/clone")
@@ -530,15 +554,27 @@ def kb_list(agent_id: int | None = None) -> list[dict]:
 
 @app.post("/api/kb")
 async def kb_upload(
-    file: UploadFile = File(...), agent_id: int | None = Form(None)
+    request: Request, file: UploadFile = File(...), agent_id: int | None = Form(None)
 ) -> dict:
-    """Upload one reference file the agent will answer from. agent_id blank = all
-    agents."""
-    data = await file.read()
+    """Upload one reference file the agent will answer from with bounded streaming & magic validation."""
+    client_ip = webcall_gate.get_real_client_ip(request)
+    await upload_security.quota_manager.acquire(client_ip)
     try:
-        return kb.add_document(agent_id, file.filename or "document", data)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+        safe_name = upload_security.sanitize_filename(file.filename or "document")
+        data = await upload_security.read_bounded(file, upload_security.MAX_KB_FILE_BYTES)
+        upload_security.validate_magic_bytes_document(data, safe_name)
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(kb.add_document, agent_id, safe_name, data),
+                timeout=upload_security.PARSING_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(408, "Document parsing and embedding timed out.")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    finally:
+        await upload_security.quota_manager.release(client_ip)
 
 
 @app.delete("/api/kb/{doc_id}")
@@ -968,6 +1004,17 @@ async def web_call_ticket(request: Request) -> dict:
     mode = request.query_params.get("mode", "customer")
     agent_id_raw = request.query_params.get("agent")
     agent_id = int(agent_id_raw) if agent_id_raw and agent_id_raw.isdigit() else None
+
+    # Owner/assistant mode verification: Docker/private IPs do not grant owner by themselves
+    if mode in ("assistant", "owner"):
+        fwd = request.headers.get("x-forwarded-for", "")
+        is_direct_local = client_ip in _LOOPBACK and (not fwd or all(p.strip() in _LOOPBACK for p in fwd.split(",")))
+        if not is_direct_local:
+            auth_header = request.headers.get("authorization", "")
+            token = auth_header.replace("Bearer ", "").strip() if auth_header.startswith("Bearer ") else ""
+            if not token or not assistant_auth.auth_manager.verify_session_token(token):
+                raise HTTPException(403, "Remote assistant mode requires a valid session token.")
+
     try:
         token = await webcall_gate.gate.issue_ticket(client_ip, mode=mode, agent_id=agent_id)
         return {"ticket": token, "ttl": 30, "expiresIn": 30}
@@ -1124,22 +1171,20 @@ async def web_call(ws: WebSocket) -> None:
 
 _finalizing: set[asyncio.Task] = set()
 
-_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+_LOOPBACK = {"127.0.0.1", "::1", "localhost", "testclient"}
 
 
 async def _owner_ok(ws: WebSocket) -> bool:
-    """May this socket drive the owner assistant? It can message any number,
-    so it is not open to whoever reaches the port.
-
-    On this machine (directly, or through the Vite proxy from this machine):
-    yes. From anywhere else ? a phone on the Wi-Fi ? the first message must
-    carry a valid session token or ASSISTANT_PIN; with no PIN configured, remote use is refused.
+    """May this socket drive the owner assistant?
+    
+    Direct loopback on this machine (without remote proxying): yes.
+    From anywhere else (LAN, Docker bridge, or proxied through Caddy):
+    the first message MUST carry a valid session token.
+    Private/Docker addresses do NOT grant owner mode by themselves.
     """
-    origin = ws.client.host if ws.client else ""
+    real_ip = webcall_gate.get_real_client_ip(ws)
     fwd = ws.headers.get("x-forwarded-for", "")
-    if origin in _LOOPBACK and fwd:
-        origin = fwd.split(",")[0].strip()
-    if origin in _LOOPBACK:
+    if real_ip in _LOOPBACK and (not fwd or all(p.strip() in _LOOPBACK for p in fwd.split(","))):
         return True
 
     if not assistant_auth.auth_manager.is_pin_configured():

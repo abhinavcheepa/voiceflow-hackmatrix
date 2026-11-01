@@ -265,13 +265,28 @@ def _ext(filename: str) -> str:
 
 
 def extract_text(filename: str, data: bytes) -> str:
-    """Pull plain text out of an uploaded file, by type."""
+    """Pull plain text out of an uploaded file, by type with magic-byte validation."""
+    import upload_security
+    upload_security.validate_magic_bytes_document(data, filename)
+
     ext = _ext(filename)
     if ext in PDF_EXTS:
         from pypdf import PdfReader
 
-        reader = PdfReader(io.BytesIO(data))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        try:
+            reader = PdfReader(io.BytesIO(data))
+            if len(reader.pages) > upload_security.MAX_PDF_PAGES:
+                raise ValueError(f"PDF exceeds page limit ({len(reader.pages)} > {upload_security.MAX_PDF_PAGES}).")
+            extracted = []
+            for i, page in enumerate(reader.pages):
+                if i >= upload_security.MAX_PDF_PAGES:
+                    break
+                extracted.append(page.extract_text() or "")
+            return "\n".join(extracted)
+        except Exception as e:
+            if isinstance(e, ValueError):
+                raise
+            raise ValueError(f"Invalid or corrupted PDF file: {e}")
     if ext in {".csv", ".tsv"}:
         delim = "\t" if ext == ".tsv" else ","
         text = data.decode("utf-8", errors="replace")
