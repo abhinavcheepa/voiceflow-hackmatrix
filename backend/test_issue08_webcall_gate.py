@@ -369,9 +369,13 @@ def test_demo_mode_env_override(monkeypatch):
     importlib.reload(webcall_gate)
     assert webcall_gate.WEBCALL_DEMO_MODE is True
     assert webcall_gate.RATE_LIMIT_PER_IP == 50
-    assert webcall_gate.PER_IP_DAILY_MINUTES == 120.0
+    assert webcall_gate.DAILY_WEBCALL_MINUTES_BUDGET == 300.0
+    assert webcall_gate.PER_IP_DAILY_MINUTES == 30.0
 
     # Reset back to test defaults
     monkeypatch.delenv("WEBCALL_DEMO_MODE", raising=False)
     importlib.reload(webcall_gate)
     assert webcall_gate.WEBCALL_DEMO_MODE is False
+    assert webcall_gate.RATE_LIMIT_PER_IP == 5
+    assert webcall_gate.DAILY_WEBCALL_MINUTES_BUDGET == 120.0
+    assert webcall_gate.PER_IP_DAILY_MINUTES == 15.0

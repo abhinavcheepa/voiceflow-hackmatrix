@@ -490,8 +490,8 @@ export default function WebCall() {
         setError("All call lines are busy right now. Please try again in a moment.");
       } else if (code === 4010 || code === 4410) {
         setError("Call ended: maximum call duration reached (5 minutes).");
-      } else if (code === 1009) {
-        setError("Audio frame exceeded maximum allowed size.");
+      } else if (code === 1009 || code === 4011) {
+        setError("Audio frame exceeded maximum allowed size or rate limit.");
       }
     };
   }
