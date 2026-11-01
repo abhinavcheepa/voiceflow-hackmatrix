@@ -24,6 +24,29 @@ import pkg from "whatsapp-web.js";
 
 const { Client, LocalAuth, MessageMedia } = pkg;
 
+// Load environment variables from .env or ../.env if present
+for (const envFile of [".env", "../.env"]) {
+  if (existsSync(envFile)) {
+    try {
+      if (typeof process.loadEnvFile === "function") {
+        process.loadEnvFile(envFile);
+      } else {
+        const content = fs.readFileSync(envFile, "utf-8");
+        for (const line of content.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith("#")) continue;
+          const eqIdx = trimmed.indexOf("=");
+          if (eqIdx !== -1) {
+            const key = trimmed.slice(0, eqIdx).trim();
+            const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
+            if (!process.env[key]) process.env[key] = val;
+          }
+        }
+      }
+    } catch (_) {}
+  }
+}
+
 const PORT = Number(process.env.BRIDGE_PORT || 8100);
 function getBackendUrl() {
   return (process.env.BACKEND_URL || "http://127.0.0.1:8000").replace(/\/$/, "");

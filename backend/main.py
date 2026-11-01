@@ -106,6 +106,48 @@ app.add_middleware(
 )
 
 
+async def run_startup_self_check() -> dict:
+    """Check and print one-line status for STT, TTS, ffmpeg, LLM, and WhatsApp bridge."""
+    import recording
+    stt = brain.stt_status()
+    tts = voice.tts_status()
+    ff = recording.ffmpeg_status()
+    llm = brain.llm_status()
+
+    wa_provider = whatsapp.PROVIDER
+    wa_status = "ok"
+    wa_detail = ""
+    if wa_provider == "web":
+        try:
+            ws_data = await whatsapp_web.status()
+            if ws_data.get("status") == "offline":
+                wa_status = "fail"
+                wa_detail = "bridge offline / unreachable"
+            else:
+                wa_status = "ok"
+                wa_detail = f"bridge reachable ({ws_data.get('status')})"
+        except Exception as e:
+            wa_status = "fail"
+            wa_detail = f"bridge check error: {e}"
+    else:
+        wa_status = "ok" if whatsapp.configured() else "info"
+        wa_detail = "Meta Cloud API configured" if whatsapp.configured() else "Meta credentials not set"
+
+    print(f"[SELF-CHECK] STT:      {'OK' if stt.get('status') == 'ok' else 'FAIL'} - {stt.get('detail') or stt.get('reason')}")
+    print(f"[SELF-CHECK] TTS:      {'OK' if tts.get('status') == 'ok' else 'FAIL'} - {tts.get('detail') or tts.get('reason')}")
+    print(f"[SELF-CHECK] FFMPEG:   {'OK' if ff.get('status') == 'ok' else 'FAIL'} - {ff.get('detail') or ff.get('reason')}")
+    print(f"[SELF-CHECK] LLM:      {'OK' if llm.get('status') == 'ok' else 'FAIL'} - {llm.get('detail') or llm.get('reason')}")
+    print(f"[SELF-CHECK] WHATSAPP: {'OK' if wa_status == 'ok' else 'FAIL'} - {wa_detail}")
+
+    return {
+        "stt": stt,
+        "tts": tts,
+        "ffmpeg": ff,
+        "llm": llm,
+        "whatsapp": {"status": wa_status, "detail": wa_detail, "provider": wa_provider},
+    }
+
+
 @app.on_event("startup")
 async def startup() -> None:
     if auth.IS_PROD and not auth.API_TOKEN:
@@ -117,6 +159,11 @@ async def startup() -> None:
             log.warning("SECURITY WARNING: WHATSAPP_APP_SECRET is unset! ALLOW_UNSIGNED_WEBHOOKS=true is enabled. WhatsApp webhooks are vulnerable to spoofing.")
         else:
             log.warning("WHATSAPP_APP_SECRET is unset. Inbound WhatsApp webhooks will FAIL CLOSED (HTTP 403).")
+    
+    app.state.self_check = await run_startup_self_check()
+    # Preload Whisper in background so first call has no model loading delay
+    asyncio.create_task(asyncio.to_thread(brain.preload_local_model))
+
     # Anything that arrived while we were down, or whose reply threw, still
     # deserves an answer — once now, then on a timer.
     asyncio.create_task(whatsapp.answer_pending())
@@ -136,6 +183,16 @@ async def shutdown() -> None:
 @app.get("/health")
 def health() -> dict:
     """Which integrations are live. The dashboard uses this to warn on setup gaps."""
+    import recording
+    self_chk = getattr(app.state, "self_check", None)
+    if not self_chk:
+        self_chk = {
+            "stt": brain.stt_status(),
+            "tts": voice.tts_status(),
+            "ffmpeg": recording.ffmpeg_status(),
+            "llm": brain.llm_status(),
+            "whatsapp": {"provider": whatsapp.PROVIDER, "configured": whatsapp.configured()},
+        }
     return {
         "ok": True,
         "vapi": vapi.configured(),
@@ -144,6 +201,7 @@ def health() -> dict:
         "brain": brain.configured(),
         "voiceReady": bool(voice.voice_id()),
         "stt": brain.stt_backend(),
+        "ffmpeg": recording.ffmpeg_status().get("status") == "ok",
         "asterisk": asterisk_ari.configured(),
         "model": brain.CHAT_MODEL,
         # Empty until the first reply. The per-minute token cap is the ceiling
@@ -154,6 +212,7 @@ def health() -> dict:
         "sseClients": events.client_count(),
         "pendingJobs": db.get_pending_jobs_count(),
         "automation": worker.automation_enabled(),
+        "self_check": self_chk,
     }
 
 

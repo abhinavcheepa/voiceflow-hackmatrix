@@ -17,6 +17,8 @@ services:
     volumes:
       # Persistent SQLite database volume - survives container upgrades & restarts
       - voiceflow_data:/data
+      # Persistent Whisper model cache volume - avoids downloading on container restart
+      - whisper_cache:/root/.cache/huggingface
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -38,6 +40,7 @@ services:
     volumes:
       # Persistent WhatsApp Web session - scan QR code once, stays authenticated
       - wa_session:/app/.session
+      - wa_session_auth:/app/.wwebjs_auth
     depends_on:
       - backend
 
@@ -73,7 +76,11 @@ services:
 volumes:
   voiceflow_data:
     name: voiceflow_data
+  whisper_cache:
+    name: voiceflow_whisper_cache
   wa_session:
     name: voiceflow_wa_session
+  wa_session_auth:
+    name: voiceflow_wa_session_auth
   caddy_data:
   caddy_config:

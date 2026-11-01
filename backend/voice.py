@@ -118,6 +118,18 @@ TTS_TIMEOUT = float(os.getenv("TTS_TIMEOUT_SECONDS") or 8)
 LIBRARY_LANGUAGES = os.getenv("VOICE_LIBRARY_LANGUAGES", "hi,ta,te,en").split(",")
 
 
+def tts_status() -> dict:
+    """Structured TTS status for startup self-check and /health."""
+    if PROVIDER == EDGE_MODEL:
+        vid = voice_id()
+        return {"provider": "edge", "status": "ok", "voice": vid, "detail": f"Edge TTS (voice: {vid})"}
+    if PROVIDER == "cartesia":
+        if not API_KEY:
+            return {"provider": "cartesia", "status": "fail", "reason": "CARTESIA_API_KEY missing"}
+        return {"provider": "cartesia", "status": "ok", "voice": voice_id(), "detail": f"Cartesia TTS (voice: {voice_id()})"}
+    return {"provider": PROVIDER, "status": "unknown", "detail": f"Provider {PROVIDER}"}
+
+
 def configured() -> bool:
     # Edge needs nothing at all; Cartesia needs its key.
     return True if PROVIDER == EDGE_MODEL else bool(API_KEY)
@@ -395,6 +407,8 @@ async def _edge_speak(text: str, vid: str, locale: str) -> bytes:
             return bytes(audio)
         last = f"empty stream from {voice_id_}"
 
+    if "Cannot connect to host" in last or "ClientConnector" in last or "getaddrinfo failed" in last:
+        raise RuntimeError(f"Edge TTS failed (no internet / speech.platform.bing.com unreachable): {last}")
     raise RuntimeError(f"Edge TTS returned no audio after {len(attempts)} tries — {last}")
 
 

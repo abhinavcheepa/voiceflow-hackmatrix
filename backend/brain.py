@@ -78,7 +78,9 @@ def chat_providers() -> list[dict]:
 # containers, so there is no endpoint to point a key at.
 STT_PROVIDER = (os.getenv("STT_PROVIDER") or "auto").lower()
 STT_MODEL = os.getenv("GROQ_STT_MODEL") or "whisper-large-v3"
-LOCAL_STT_MODEL = os.getenv("LOCAL_STT_MODEL") or "small"
+WHISPER_MODEL = os.getenv("WHISPER_MODEL") or os.getenv("LOCAL_STT_MODEL") or "base"
+WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE") or "int8"
+LOCAL_STT_MODEL = WHISPER_MODEL
 
 BUSINESS_NAME = os.getenv("BUSINESS_NAME", "our business")
 OWNER_NAME = os.getenv("OWNER_NAME", "the owner")
@@ -489,27 +491,85 @@ _local_model = None
 
 
 def _load_local():
-    """Load faster-whisper once, on first use.
-
-    Not at import: the model is a few hundred MB and downloads on first run,
-    which would otherwise stall server startup.
+    """Load faster-whisper once, on first use or preload.
+    Uses WHISPER_MODEL (default 'base') and WHISPER_COMPUTE (default 'int8').
     """
     global _local_model
     if _local_model is None:
         from faster_whisper import WhisperModel
 
-        _local_model = WhisperModel(LOCAL_STT_MODEL, device="cpu", compute_type="int8")
+        model_name = os.getenv("WHISPER_MODEL") or os.getenv("LOCAL_STT_MODEL") or "base"
+        compute = os.getenv("WHISPER_COMPUTE") or "int8"
+        _local_model = WhisperModel(model_name, device="cpu", compute_type=compute)
     return _local_model
+
+
+def preload_local_model() -> None:
+    """Preload Whisper in background if local STT is enabled, so first call has no lag."""
+    if stt_backend() == "local" and _local_stt_available():
+        try:
+            _load_local()
+            model_name = os.getenv("WHISPER_MODEL") or os.getenv("LOCAL_STT_MODEL") or "base"
+            log.info("Whisper model preloaded successfully (%s)", model_name)
+        except Exception as e:
+            log.warning("Whisper preload deferred: %s", e)
+
+
+def stt_status() -> dict:
+    """Structured status for startup self-check and /health."""
+    backend = stt_backend()
+    model_name = os.getenv("WHISPER_MODEL") or os.getenv("LOCAL_STT_MODEL") or "base"
+    compute = os.getenv("WHISPER_COMPUTE") or "int8"
+    if backend == "groq":
+        return {"backend": "groq", "status": "ok", "model": STT_MODEL, "detail": f"hosted Groq Whisper API ({STT_MODEL})"}
+    if not _local_stt_available():
+        return {
+            "backend": "local",
+            "status": "fail",
+            "model": model_name,
+            "compute": compute,
+            "reason": "faster-whisper package not installed",
+        }
+    loaded = _local_model is not None
+    return {
+        "backend": "local",
+        "status": "ok",
+        "model": model_name,
+        "compute": compute,
+        "loaded": loaded,
+        "detail": f"faster-whisper on CPU ({model_name}, {compute})" + (" [preloaded]" if loaded else ""),
+    }
+
+
+def llm_status() -> dict:
+    """Structured LLM status for startup self-check and /health."""
+    if not configured():
+        return {"status": "fail", "reason": "no LLM API key configured (GROQ_API_KEY or CHAT_API_KEY)"}
+    provider = CHAT_BASE_URL or "groq"
+    return {"status": "ok", "provider": provider, "model": CHAT_MODEL, "detail": f"{provider} ({CHAT_MODEL})"}
 
 
 def _transcribe_local(audio: bytes, vocab: str = "") -> str:
     """Blocking — always call via asyncio.to_thread so the event loop keeps running."""
-    # beam_size=1 is greedy decoding: noticeably faster on CPU, and voice notes
-    # are short and clear enough that the accuracy difference doesn't show.
-    segments, _ = _load_local().transcribe(io.BytesIO(audio), beam_size=1,
-                                           initial_prompt=vocab or None)
-    kept = [s for s in segments if getattr(s, "no_speech_prob", 0) <= NO_SPEECH_LIMIT]
-    return _clean(" ".join(s.text for s in kept))
+    try:
+        model = _load_local()
+    except Exception as e:
+        err_msg = str(e)
+        if "IncompleteSnapshot" in type(e).__name__ or "missing" in err_msg.lower():
+            raise RuntimeError("Whisper model downloading or cache incomplete — internet required on first download") from e
+        if "getaddrinfo" in err_msg.lower() or "ConnectError" in type(e).__name__:
+            raise RuntimeError("Whisper model download failed: no internet connection") from e
+        raise RuntimeError(f"Whisper model load failed: {e}") from e
+
+    try:
+        segments, _ = model.transcribe(io.BytesIO(audio), beam_size=1, initial_prompt=vocab or None)
+        kept = [s for s in segments if getattr(s, "no_speech_prob", 0) <= NO_SPEECH_LIMIT]
+        return _clean(" ".join(s.text for s in kept))
+    except Exception as e:
+        err_name = type(e).__name__
+        if "AVError" in err_name or "InvalidData" in str(e):
+            raise RuntimeError("Microphone audio format not supported or corrupted") from e
+        raise
 
 
 # ── Speaker gender ────────────────────────────────────────────────────────

@@ -34,6 +34,14 @@ def ffmpeg_exe() -> str | None:
         return shutil.which("ffmpeg")
 
 
+def ffmpeg_status() -> dict:
+    """Structured ffmpeg status for startup self-check and /health."""
+    exe = ffmpeg_exe()
+    if exe and os.path.exists(exe):
+        return {"status": "ok", "path": exe, "detail": f"ffmpeg available at {exe}"}
+    return {"status": "fail", "reason": "ffmpeg not found in PATH or imageio_ffmpeg"}
+
+
 def path(call_id: str, ext: str) -> str:
     """Where a call's file lives. The id reaches the filesystem and, via the
     download endpoints, comes from a URL — so it is validated, never trusted."""

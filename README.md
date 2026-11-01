@@ -146,14 +146,48 @@ Once paired, verify the end-to-end flow before enabling broad auto-replies:
    - From an unallowlisted external phone, send a test message (e.g., *"Hello"*).
    - Check the dashboard: the message appears in the conversation inbox marked with `needs_reply`, and **no automated reply is sent** (LLM is not invoked).
 3. **Test Explicit Allowlist Add:**
-   - In `/app/whatsapp`, add the test number to the Allowlist (or ask the assistant during an owner voice call / WhatsApp chat: *"Add [number] to allowlist"*).
+   - In `/app/whatsapp`, add the test number to the Allowlist (or ask the assistant during an owner voice call: *"Add [number] to allowlist"*).
    - Send another message from the test phone; verify the assistant replies automatically.
 4. **Test Opt-Out Suppression (STOP):**
    - From the test phone, reply with **"STOP"** or **"band karo"**.
    - Verify the assistant sends a suppression confirmation, records the opt-out in the database suppression table, and blocks subsequent automated replies.
 5. **Test Owner Exemption:**
-   - From the number configured in `OWNER_PHONE`, send a command to the assistant.
-   - Verify that owner messages bypass the allowlist filter and are processed directly.
+   - From the number configured in `OWNER_PHONE`, send a message.
+   - Verify that `OWNER_PHONE` only skips the allowlist for auto-replies; the allowlist is managed from the dashboard or the voice assistant.
+
+---
+
+### Run with Docker (Production Stack)
+
+> [!CAUTION]
+> **Stop local servers first:** Local development processes and Docker containers share the same ports (`8000`, `8100`, `5174/80`). Ensure all local dev processes are stopped before starting Docker (`.\start.ps1 -Stop` on Windows).
+
+#### 1. Build the Frontend
+Caddy serves pre-compiled production assets from `./dist`:
+```bash
+npm run build
+```
+
+#### 2. Configure Environment (`.env`)
+Create a `.env` file in the repository root (see `.env.example`).
+
+#### 3. Start the Stack
+```bash
+docker compose up -d --build
+```
+
+#### 4. Access URLs & Logs
+- **Dashboard:** `http://localhost`
+- **WhatsApp Web Bridge:** `http://localhost/app/whatsapp`
+- **View Container Logs:**
+  ```bash
+  docker compose logs -f backend wa-bridge caddy
+  ```
+- **Stop Stack:**
+  ```bash
+  docker compose down
+  ```
+
 ---
 
 ## API keys
