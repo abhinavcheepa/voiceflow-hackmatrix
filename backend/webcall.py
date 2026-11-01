@@ -19,6 +19,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 import brain
 import db
@@ -128,10 +129,17 @@ MIN_AUDIO_BYTES = 2000
 # Spoken when the LLM fails, so the caller hears something instead of silence.
 # Gendered to match the voice — "paayi" from a male voice is the same mismatch
 # the prompt rule fixes for replies.
+LLM_FALLBACK_TEXT = "Abhi thodi takleef hai, thodi der mein try karein."
 FALLBACK = {
-    "female": "Maaf kijiye, ek baar phir se boliye, main sun nahi paayi.",
-    "male": "Maaf kijiye, ek baar phir se boliye, main sun nahi paaya.",
+    "female": LLM_FALLBACK_TEXT,
+    "male": LLM_FALLBACK_TEXT,
 }
+
+
+def mask_error(err: Any) -> str:
+    """Mask sensitive tokens (API keys, bearer auth) in error messages."""
+    s = str(err)
+    return re.sub(r"(gsk_|nvapi-|sk-|Bearer\s+|ghp_|github_pat_|AIza)[A-Za-z0-9_\-\.]{4,}", r"\1***", s)
 
 
 class Session:
@@ -497,9 +505,11 @@ async def respond(ws, session: Session, heard: str) -> None:
     except Exception as e:  # noqa: BLE001
         # Free LLM endpoints rate-limit under load. Say something rather than
         # leaving the caller in silence — the call stays up either way.
-        log.warning("LLM failed on %s: %s", session.id, e)
-        await ws.send_json({"type": "error", "text": f"Could not answer: {e}"})
-        await speak(ws, session, os.getenv("WEBCALL_FALLBACK") or FALLBACK[brain.agent_gender()])
+        masked_err = mask_error(e)
+        log.warning("LLM failed on %s: %s", session.id, masked_err)
+        await ws.send_json({"type": "error", "text": f"Could not answer: {masked_err}"})
+        fallback_msg = os.getenv("WEBCALL_FALLBACK") or LLM_FALLBACK_TEXT
+        await speak(ws, session, fallback_msg)
         return
 
     # An outward action parked this turn: speak its exact question, whatever

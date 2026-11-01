@@ -59,6 +59,22 @@ is live. Stop everything with `.\start.ps1 -Stop`.
 
 Open **http://localhost:5174/app**.
 
+### First Run: LLM Key & Self-Check
+
+1. **Set your LLM Key in `backend/.env`**:
+   - **Groq (Free)**: Sign up at [console.groq.com/keys](https://console.groq.com/keys) and set `GROQ_API_KEY=gsk_...`.
+   - **Or NVIDIA NIM (Free)**: Sign up at [build.nvidia.com](https://build.nvidia.com) and set `CHAT_BASE_URL=https://integrate.api.nvidia.com/v1` and `CHAT_API_KEY=nvapi-...`.
+2. **Verify `/health` Self-Check**:
+   Start the backend (`cd backend && uvicorn main:app --port 8000`) and query the health endpoint:
+   ```bash
+   curl http://127.0.0.1:8000/health
+   ```
+   Confirm that the `self_check` response shows status `ok` across all core subsystems:
+   - `stt`: `local` (faster-whisper base, compute int8) or `groq`
+   - `tts`: `edge`
+   - `ffmpeg`: status `ok`
+   - `llm`: status `ok`
+
 ### Connect WhatsApp (Local Web Bridge)
 
 > [!WARNING]
@@ -110,12 +126,18 @@ BRIDGE_SECRET=your_strong_secret_32_chars
 ##### 2. Start the Three Terminals
 
 - **Terminal 1: WhatsApp Web Bridge**
+  *(If Puppeteer's automatic Chromium download is blocked or fails on your network, use your installed Chrome or Edge)*:
   ```powershell
+  # Optional: skip Chromium download if blocked
+  $env:PUPPETEER_SKIP_DOWNLOAD = "true"
   cd wa-bridge
   npm install
+
+  # Point to your installed browser (or set PUPPETEER_EXECUTABLE_PATH in wa-bridge/.env)
+  $env:PUPPETEER_EXECUTABLE_PATH = "C:\Program Files\Google\Chrome\Application\chrome.exe"
   npm start
   ```
-  *(The bridge initializes Chromium and listens on port 8100, displaying a terminal QR code if not yet paired).*
+  *(The bridge initializes Chromium/Chrome and listens on port 8100, displaying a terminal QR code if not yet paired).*
 
 - **Terminal 2: FastAPI Backend**
   ```powershell
@@ -132,6 +154,23 @@ BRIDGE_SECRET=your_strong_secret_32_chars
 
 ##### 3. Link WhatsApp
 Open **`http://localhost:5174/app/whatsapp`** in your browser. Verify the bridge status displays `ready` or shows the QR code, then scan the QR code from WhatsApp on your phone (*Settings &rarr; Linked Devices &rarr; Link a Device*).
+
+---
+
+### Production Authentication (Docker & API_TOKEN)
+
+When running in production (`ENV=production` in Docker or root `.env`) with an `API_TOKEN` set:
+- **No Secret in Client Builds**: `VITE_*` environment variables are compiled into static client-side JavaScript bundles and must **never** hold confidential API tokens.
+- **Client Token Storage**: The dashboard frontend retrieves the authentication token from browser storage via `localStorage.getItem("voiceflow_api_token")`.
+- **One-Time Token Setup**:
+  1. Open the dashboard at `http://localhost/app` (or `http://localhost:5174/app`).
+  2. If the backend returns `401 Unauthorized`, the dashboard automatically opens the **API Authentication Token** modal.
+  3. Enter your `API_TOKEN` and click **Save Token** (saved to `localStorage["voiceflow_api_token"]`).
+  4. You can also click the **Token** (key icon) button in the sidebar anytime to view, update, or clear the token, or run in the browser console:
+     ```javascript
+     localStorage.setItem("voiceflow_api_token", "your_api_token_here");
+     location.reload();
+     ```
 
 ---
 

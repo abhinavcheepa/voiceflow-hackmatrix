@@ -375,12 +375,17 @@ async def reply_to(sender: str, name: str | None, incoming: str, is_voice: bool,
     )
 
     if is_voice:
-        audio_out = await voice.synthesize(answer, language)
-        await send_voice(sender, audio_out)
-        # Store the words, not the bytes — the dashboard shows the text
-        # under the voice-note bubble.
-        db.add_message(sender, "us", "voice", answer,
-                       seconds=_estimate_seconds(answer), name=name, language=language)
+        try:
+            audio_out = await voice.synthesize(answer, language)
+            await send_voice(sender, audio_out)
+            # Store the words, not the bytes — the dashboard shows the text
+            # under the voice-note bubble.
+            db.add_message(sender, "us", "voice", answer,
+                           seconds=_estimate_seconds(answer), name=name, language=language)
+        except Exception as e:  # noqa: BLE001 - if TTS fails offline, fall back to text so customer receives reply
+            log.warning("TTS failed for %s (%s); falling back to text reply", sender, e)
+            await send_text(sender, answer)
+            db.add_message(sender, "us", "text", answer, name=name, language=language)
     else:
         await send_text(sender, answer)
         db.add_message(sender, "us", "text", answer, name=name, language=language)

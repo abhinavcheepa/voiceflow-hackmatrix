@@ -89,6 +89,7 @@ function log(...parts) {
  * machine, use that instead — set CHROME_PATH, or let these defaults find it.
  */
 function findChrome() {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
   if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
   const candidates = [
     "C:/Program Files/Google/Chrome/Application/chrome.exe",
