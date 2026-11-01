@@ -323,3 +323,55 @@ def test_owner_tools_unreachable_in_customer_webcall():
 
     res_settings = tools.run("auto_reply_settings", {"action": "on"}, customer_ctx)
     assert res_settings == "Tool 'auto_reply_settings' is not available."
+
+
+def test_ticket_value_never_appears_in_logs(caplog):
+    """Single-use ticket value is never written to application or access logs."""
+    import logging
+    client = TestClient(app)
+    with caplog.at_level(logging.DEBUG):
+        r = client.get("/api/web-call/ticket")
+        token = r.json()["ticket"]
+        with client.websocket_connect("/api/web-call/ws", subprotocols=[f"vf-ticket.{token}"]) as ws:
+            ws.receive_json()
+
+    # The token must NEVER appear anywhere in the captured logs
+    assert token not in caplog.text
+
+
+def test_client_ip_trusted_proxy_and_untrusted(monkeypatch):
+    """X-Forwarded-For is only honored when immediate client host is in TRUSTED_PROXIES."""
+    from unittest.mock import MagicMock
+    monkeypatch.setattr(webcall_gate, "TRUSTED_PROXIES", {"127.0.0.1", "10.0.0.1"})
+
+    # 1. Trusted proxy (e.g. ngrok / Caddy on localhost): client IP extracted from X-Forwarded-For
+    req_trusted = MagicMock()
+    req_trusted.client.host = "127.0.0.1"
+    req_trusted.headers = {"x-forwarded-for": "203.0.113.195, 10.0.0.1"}
+    assert webcall_gate.get_real_client_ip(req_trusted) == "203.0.113.195"
+
+    # 2. Untrusted direct client: forged X-Forwarded-For header is IGNORED
+    req_untrusted = MagicMock()
+    req_untrusted.client.host = "198.51.100.2"
+    req_untrusted.headers = {"x-forwarded-for": "8.8.8.8"}
+    assert webcall_gate.get_real_client_ip(req_untrusted) == "198.51.100.2"
+
+    # 3. No proxy configured: direct peer host used
+    monkeypatch.setattr(webcall_gate, "TRUSTED_PROXIES", set())
+    assert webcall_gate.get_real_client_ip(req_trusted) == "127.0.0.1"
+
+
+def test_demo_mode_env_override(monkeypatch):
+    """WEBCALL_DEMO_MODE=true raises default rate limits for live demos."""
+    monkeypatch.setenv("WEBCALL_DEMO_MODE", "true")
+    # Re-evaluate module defaults
+    import importlib
+    importlib.reload(webcall_gate)
+    assert webcall_gate.WEBCALL_DEMO_MODE is True
+    assert webcall_gate.RATE_LIMIT_PER_IP == 50
+    assert webcall_gate.PER_IP_DAILY_MINUTES == 120.0
+
+    # Reset back to test defaults
+    monkeypatch.delenv("WEBCALL_DEMO_MODE", raising=False)
+    importlib.reload(webcall_gate)
+    assert webcall_gate.WEBCALL_DEMO_MODE is False

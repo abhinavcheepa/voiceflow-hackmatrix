@@ -475,7 +475,25 @@ export default function WebCall() {
       }, 10000);
     };
     socket.onerror = () => setError("Could not reach the backend. Is it running on port 8000?");
-    socket.onclose = () => setStatus((s) => (s === "idle" ? s : "ended"));
+    socket.onclose = (e) => {
+      setStatus((s) => (s === "idle" ? s : "ended"));
+      const code = e.code;
+      if (code === 4001 || code === 4401) {
+        setError("Session expired or invalid ticket. Please click Start call again.");
+      } else if (code === 4002 || code === 4402) {
+        setError("Daily web-call budget reached. Please try again tomorrow.");
+      } else if (code === 4003 || code === 4403) {
+        setError("Access from this domain is forbidden (Origin not allowed).");
+      } else if (code === 4008 || code === 4408) {
+        setError("Too many calls from your connection. Please wait a few minutes.");
+      } else if (code === 4009 || code === 4409) {
+        setError("All call lines are busy right now. Please try again in a moment.");
+      } else if (code === 4010 || code === 4410) {
+        setError("Call ended: maximum call duration reached (5 minutes).");
+      } else if (code === 1009) {
+        setError("Audio frame exceeded maximum allowed size.");
+      }
+    };
   }
 
   function hangUp() {

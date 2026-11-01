@@ -26,8 +26,14 @@ WEBCALL_PUBLIC = os.getenv("WEBCALL_PUBLIC", "true").lower() in ("true", "1", "y
 ALLOWED_ORIGINS_RAW = os.getenv("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in ALLOWED_ORIGINS_RAW.split(",") if o.strip()]
 
-RATE_LIMIT_PER_IP = int(os.getenv("WEBCALL_RATE_LIMIT_PER_IP") or 5)
-WS_CONNECT_RATE_LIMIT_PER_IP = int(os.getenv("WEBCALL_WS_CONNECT_RATE_LIMIT_PER_IP") or 5)
+# Demo day mode support: raises default rate limits and budgets for high-traffic live presentations
+WEBCALL_DEMO_MODE = os.getenv("WEBCALL_DEMO_MODE", "false").lower() in ("true", "1", "yes")
+
+_DEFAULT_RATE_LIMIT = 50 if WEBCALL_DEMO_MODE else 5
+_DEFAULT_PER_IP_MINUTES = 120.0 if WEBCALL_DEMO_MODE else 30.0
+
+RATE_LIMIT_PER_IP = int(os.getenv("WEBCALL_RATE_LIMIT_PER_IP") or _DEFAULT_RATE_LIMIT)
+WS_CONNECT_RATE_LIMIT_PER_IP = int(os.getenv("WEBCALL_WS_CONNECT_RATE_LIMIT_PER_IP") or _DEFAULT_RATE_LIMIT)
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("WEBCALL_RATE_LIMIT_WINDOW_SECONDS") or 600)  # 10 min
 
 MAX_CONCURRENT_WEBCALLS = int(os.getenv("MAX_CONCURRENT_WEBCALLS") or 10)
@@ -37,7 +43,7 @@ MAX_FRAME_SIZE_BYTES = int(os.getenv("MAX_FRAME_SIZE_BYTES") or 1_048_576)  # 1 
 MAX_FRAME_RATE_PER_SEC = int(os.getenv("WEBCALL_MAX_FRAME_RATE_PER_SEC") or 25)
 
 DAILY_WEBCALL_MINUTES_BUDGET = float(os.getenv("DAILY_WEBCALL_MINUTES_BUDGET") or 120.0)
-PER_IP_DAILY_MINUTES = float(os.getenv("WEBCALL_PER_IP_DAILY_MINUTES") or 30.0)
+PER_IP_DAILY_MINUTES = float(os.getenv("WEBCALL_PER_IP_DAILY_MINUTES") or _DEFAULT_PER_IP_MINUTES)
 
 TRUSTED_PROXIES = {p.strip() for p in os.getenv("TRUSTED_PROXIES", "127.0.0.1,::1,localhost").split(",") if p.strip()}
 
