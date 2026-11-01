@@ -14,15 +14,18 @@
         reverse_proxy backend:8000 {
             flush_interval -1
             header_down X-Accel-Buffering no
+            header_up X-Forwarded-For {remote_host}
         }
     }
 
-    # 2. REST API & Health endpoints:
-    # Proxy all backend routes without caching
-    @api path /api/* /health
+    # 2. REST API, WebSocket & Health endpoints:
+    # Proxy all backend routes without caching and overwrite XFF with connecting peer
+    @api path /api/* /health /ws/*
     handle @api {
         header Cache-Control "no-store, no-cache, must-revalidate"
-        reverse_proxy backend:8000
+        reverse_proxy backend:8000 {
+            header_up X-Forwarded-For {remote_host}
+        }
     }
 
     # 3. Progressive Web App (PWA) App Shell & Assets

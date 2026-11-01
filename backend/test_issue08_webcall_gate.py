@@ -350,6 +350,12 @@ def test_client_ip_trusted_proxy_and_untrusted(monkeypatch):
     req_trusted.headers = {"x-forwarded-for": "203.0.113.195, 10.0.0.1"}
     assert webcall_gate.get_real_client_ip(req_trusted) == "203.0.113.195"
 
+    # Forged spoofed header behind proxy: rightmost untrusted entry is picked, ignoring left forged IP
+    req_spoof = MagicMock()
+    req_spoof.client.host = "127.0.0.1"
+    req_spoof.headers = {"x-forwarded-for": "1.2.3.4, 203.0.113.195"}
+    assert webcall_gate.get_real_client_ip(req_spoof) == "203.0.113.195"
+
     # 2. Untrusted direct client: forged X-Forwarded-For header is IGNORED
     req_untrusted = MagicMock()
     req_untrusted.client.host = "198.51.100.2"

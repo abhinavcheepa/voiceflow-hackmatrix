@@ -111,6 +111,11 @@ async def startup() -> None:
         raise RuntimeError("FATAL: API_TOKEN must be configured when ENV=production")
     db.init()
     assistant_auth.auth_manager.check_startup()
+    if not os.getenv("WHATSAPP_APP_SECRET", "").strip():
+        if os.getenv("ALLOW_UNSIGNED_WEBHOOKS", "").lower() in ("true", "1", "yes"):
+            log.warning("SECURITY WARNING: WHATSAPP_APP_SECRET is unset! ALLOW_UNSIGNED_WEBHOOKS=true is enabled. WhatsApp webhooks are vulnerable to spoofing.")
+        else:
+            log.warning("WHATSAPP_APP_SECRET is unset. Inbound WhatsApp webhooks will FAIL CLOSED (HTTP 403).")
     # Anything that arrived while we were down, or whose reply threw, still
     # deserves an answer — once now, then on a timer.
     asyncio.create_task(whatsapp.answer_pending())
@@ -320,7 +325,7 @@ async def whatsapp_receive(request: Request, tasks: BackgroundTasks) -> dict:
     raw_body = await request.body()
     sig = request.headers.get("x-hub-signature-256")
     if not whatsapp.verify_signature(raw_body, sig):
-        raise HTTPException(401, "invalid webhook signature")
+        raise HTTPException(403, "invalid or missing webhook signature")
     import json
     try:
         payload = json.loads(raw_body)
@@ -337,7 +342,13 @@ async def whatsapp_web_incoming(
 ) -> dict:
     """Inbound from the local wa-bridge. Same pipeline as the Meta webhook."""
     import hmac
-    if not whatsapp_web.TOKEN or not x_bridge_token or not hmac.compare_digest(x_bridge_token, whatsapp_web.TOKEN):
+    bridge_secret = os.getenv("BRIDGE_SECRET") or os.getenv("WA_BRIDGE_TOKEN") or whatsapp_web.TOKEN
+    if not bridge_secret:
+        if os.getenv("ALLOW_UNSIGNED_WEBHOOKS", "").lower() in ("true", "1", "yes"):
+            tasks.add_task(whatsapp.handle, whatsapp_web.parse(await request.json()))
+            return {"ok": True}
+        raise HTTPException(401, "BRIDGE_SECRET / WA_BRIDGE_TOKEN is unset (fail closed)")
+    if not x_bridge_token or not hmac.compare_digest(x_bridge_token, bridge_secret):
         raise HTTPException(401, "bad or missing bridge token")
     tasks.add_task(whatsapp.handle, whatsapp_web.parse(await request.json()))
     return {"ok": True}

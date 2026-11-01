@@ -60,10 +60,20 @@ def verify(mode: str, token: str, challenge: str) -> str:
 
 
 def verify_signature(raw_body: bytes, signature_header: str | None) -> bool:
-    """Validate Meta's X-Hub-Signature-256 header when WHATSAPP_APP_SECRET is set."""
-    app_secret = os.getenv("WHATSAPP_APP_SECRET", "")
+    """Validate Meta's X-Hub-Signature-256 header.
+
+    FAIL CLOSED in production: if WHATSAPP_APP_SECRET is unset, reject incoming
+    webhooks unless ALLOW_UNSIGNED_WEBHOOKS=true is explicitly set in development.
+    """
+    app_secret = os.getenv("WHATSAPP_APP_SECRET", "").strip()
     if not app_secret:
-        return True  # open in dev when no secret is configured
+        if os.getenv("ALLOW_UNSIGNED_WEBHOOKS", "").lower() in ("true", "1", "yes"):
+            return True
+        log.warning(
+            "Rejecting WhatsApp webhook: WHATSAPP_APP_SECRET is not configured (fail closed). "
+            "Set ALLOW_UNSIGNED_WEBHOOKS=true only for local development."
+        )
+        return False
     if not signature_header or not signature_header.startswith("sha256="):
         return False
     import hashlib

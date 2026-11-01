@@ -120,14 +120,19 @@ def mask_ip(ip: str | None) -> str:
 
 
 def get_real_client_ip(request_or_ws: Any) -> str:
-    """Extract client IP, verifying X-Forwarded-For only when the immediate peer is trusted."""
+    """Extract client IP, verifying X-Forwarded-For only when the immediate peer is trusted.
+    Traverses comma-separated X-Forwarded-For chain from right to left, returning
+    the rightmost untrusted IP to prevent spoofing through trusted reverse proxies."""
     client_host = request_or_ws.client.host if request_or_ws.client else "127.0.0.1"
     if is_trusted_proxy(client_host):
         fwd = request_or_ws.headers.get("x-forwarded-for")
         if fwd:
-            candidate = fwd.split(",")[0].strip()
-            if candidate:
-                return candidate
+            parts = [p.strip() for p in fwd.split(",") if p.strip()]
+            for ip in reversed(parts):
+                if not is_trusted_proxy(ip):
+                    return ip
+            if parts:
+                return parts[-1]
     return client_host
 
 

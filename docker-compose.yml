@@ -12,6 +12,7 @@ services:
       - ENV=production
       - DB_PATH=/data/voiceflow.db
       - WA_BRIDGE_URL=http://wa-bridge:8100
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-172.16.0.0/12,127.0.0.1/32}
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:5174,http://localhost:5173,https://${DOMAIN:-localhost}}
     volumes:
       # Persistent SQLite database volume - survives container upgrades & restarts
