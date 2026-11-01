@@ -62,63 +62,98 @@ Open **http://localhost:5174/app**.
 ### Connect WhatsApp (Local Web Bridge)
 
 > [!WARNING]
-> **Spare Number Required:** Always use a dedicated business SIM or spare number with WhatsApp Web automation. Do **not** link your primary personal phone number. WhatsApp Web automation carries a risk of temporary or permanent phone number flags from Meta anti-spam systems.
+> **Spare Number Required:** Always use a dedicated business SIM or spare number with WhatsApp Web automation. Do **not** link your primary personal phone number. WhatsApp Web automation drives a browser session and carries a risk of temporary or permanent phone number flags from Meta anti-spam systems.
 
-The web bridge listens on port **8100** by default (`wa-bridge/index.js`, started via `npm start`).
+The web bridge connects WhatsApp Web to the VoiceFlow backend, listening on port **8100** by default.
+
+---
 
 #### Mode A: Docker Compose (Production)
-- **Environment variables in `.env`:**
+- **Environment variables in root `.env`:**
   - `WHATSAPP_PROVIDER=web`
   - `BRIDGE_SECRET=your_strong_secret_32_chars`
-- **Network routing in `docker-compose.yml`:**
-  - `backend` container connects to: `WA_BRIDGE_URL=http://wa-bridge:8100`
-  - `wa-bridge` container routes to: `BACKEND_URL=http://backend:8000`
+- **Internal container routing (configured in `docker-compose.yml`):**
+  - `backend` connects to: `WA_BRIDGE_URL=http://wa-bridge:8100`
+  - `wa-bridge` connects to: `BACKEND_URL=http://backend:8000`
 - **Run & Link:**
-  1. `docker compose up -d`
-  2. Open **`http://localhost/app/whatsapp`** (served by Caddy on port 80).
-  3. Scan the QR code with WhatsApp (*Settings &rarr; Linked Devices &rarr; Link a Device*) or view terminal QR via `docker compose logs -f wa-bridge`.
+  1. Start the stack: `docker compose up -d`
+  2. Open **`http://localhost/app/whatsapp`** (served through Caddy on port 80).
+  3. Scan the QR code using WhatsApp on your spare phone (*Settings &rarr; Linked Devices &rarr; Link a Device*) or view the terminal QR code via `docker compose logs -f wa-bridge`.
+
+---
 
 #### Mode B: Local Run without Docker (Development)
-Configure environment variables in your `.env` file (or set them in PowerShell):
-- **1. Start Web Bridge (`wa-bridge/index.js`):**
+
+Run the three services across separate terminals. Both `backend` and `wa-bridge` load configuration from their respective `.env` files (or environment variables).
+
+##### 1. Environment Configuration
+
+**Backend (`backend/.env`):**
+```env
+# WhatsApp provider configuration
+WHATSAPP_PROVIDER=web
+WA_BRIDGE_URL=http://127.0.0.1:8100
+BRIDGE_SECRET=your_strong_secret_32_chars
+
+# Auto-reply mode & owner bypass
+AUTO_REPLY_MODE=allowlist
+OWNER_PHONE=+919999000001
+```
+
+**Web Bridge (`wa-bridge/.env`):**
+```env
+BRIDGE_PORT=8100
+BACKEND_URL=http://127.0.0.1:8000
+BRIDGE_SECRET=your_strong_secret_32_chars
+```
+
+##### 2. Start the Three Terminals
+
+- **Terminal 1: WhatsApp Web Bridge**
   ```powershell
   cd wa-bridge
-  # In PowerShell (or configure in .env):
-  $env:BRIDGE_PORT="8100"
-  $env:BACKEND_URL="http://127.0.0.1:8000"
-  $env:BRIDGE_SECRET="your_strong_secret_32_chars"
+  npm install
   npm start
   ```
-- **2. Start Backend (`backend/`):**
+  *(The bridge initializes Chromium and listens on port 8100, displaying a terminal QR code if not yet paired).*
+
+- **Terminal 2: FastAPI Backend**
   ```powershell
   cd backend
-  # In PowerShell (or configure in .env):
-  $env:WHATSAPP_PROVIDER="web"
-  $env:WA_BRIDGE_URL="http://127.0.0.1:8100"
-  $env:BRIDGE_SECRET="your_strong_secret_32_chars"
-  uvicorn main:app --port 8000
+  uvicorn main:app --port 8000 --reload
   ```
-- **3. Start Frontend & Link:**
-  Open **`http://localhost:5174/app/whatsapp`** (Vite dev server) to view connection status and scan the QR code.
+  *(FastAPI loads `backend/.env`, validates `BRIDGE_SECRET`, and listens on `http://127.0.0.1:8000`).*
 
+- **Terminal 3: React Frontend**
+  ```powershell
+  npm run dev
+  ```
+  *(Vite development server starts on `http://localhost:5174`).*
 
-<details>
-<summary>Starting the pieces by hand (macOS / Linux)</summary>
+##### 3. Link WhatsApp
+Open **`http://localhost:5174/app/whatsapp`** in your browser. Verify the bridge status displays `ready` or shows the QR code, then scan the QR code from WhatsApp on your phone (*Settings &rarr; Linked Devices &rarr; Link a Device*).
 
-```bash
-cd backend && ./venv/bin/uvicorn main:app --port 8000
-```
+---
 
-```bash
-npm run dev
-```
+#### First Live Test Checklist
 
-```bash
-cd wa-bridge && npm install && BRIDGE_TOKEN=<from .env> npm start
-```
+Once paired, verify the end-to-end flow before enabling broad auto-replies:
 
-</details>
-
+1. **Verify Connection Status:**
+   - Navigate to `/app/whatsapp` (on `http://localhost:5174/app/whatsapp` for local Vite, or `http://localhost/app/whatsapp` for Docker).
+   - Confirm status shows **Provider: web**, **Bridge Reachable: Yes**, and status is **CONNECTED** with your paired phone number.
+2. **Test Stranger Protection (Allowlist Enforcement):**
+   - From an unallowlisted external phone, send a test message (e.g., *"Hello"*).
+   - Check the dashboard: the message appears in the conversation inbox marked with `needs_reply`, and **no automated reply is sent** (LLM is not invoked).
+3. **Test Explicit Allowlist Add:**
+   - In `/app/whatsapp`, add the test number to the Allowlist (or ask the assistant during an owner voice call / WhatsApp chat: *"Add [number] to allowlist"*).
+   - Send another message from the test phone; verify the assistant replies automatically.
+4. **Test Opt-Out Suppression (STOP):**
+   - From the test phone, reply with **"STOP"** or **"band karo"**.
+   - Verify the assistant sends a suppression confirmation, records the opt-out in the database suppression table, and blocks subsequent automated replies.
+5. **Test Owner Exemption:**
+   - From the number configured in `OWNER_PHONE`, send a command to the assistant.
+   - Verify that owner messages bypass the allowlist filter and are processed directly.
 ---
 
 ## API keys
