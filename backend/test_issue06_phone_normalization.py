@@ -118,4 +118,68 @@ def test_migration_apply_merges_duplicates_and_repoints_messages(tmp_path):
     assert messages[0][1] == 10
     assert messages[1][1] == 10
     conn.close()
+@pytest.mark.anyio
+async def test_all_write_paths_normalize_phone():
+    from unittest.mock import AsyncMock, patch
+    import whatsapp
 
+    # 1. WhatsApp webhook
+    payload = {
+        "id": "wa_norm_001",
+        "from": "+91 99999 11111",
+        "name": "Customer One",
+        "type": "text",
+        "text": "Hello from webhook",
+    }
+    with patch("whatsapp.reply_to", new_callable=AsyncMock):
+        await whatsapp.handle(payload)
+
+    with db.connect() as conn:
+        conv = conn.execute("SELECT phone FROM conversations WHERE name = 'Customer One'").fetchone()
+        assert conv["phone"] == "919999911111"
+        contact = conn.execute("SELECT phone FROM contacts WHERE name = 'Customer One'").fetchone()
+        assert contact["phone"] == "919999911111"
+
+    # 2. Campaign target
+    cid = db.create_campaign("Test Campaign", None, [{"name": "Lead", "phone": "09999922222"}])
+    targets = db.get_campaign_targets(cid)
+    assert len(targets) == 1
+    assert targets[0]["phone"] == "919999922222"
+
+    # 3. Web call upsert
+    db.upsert_call("VAPI-WEBCALL-NORM", phone="Web call", status="active")
+    with db.connect() as conn:
+        call_row = conn.execute("SELECT phone FROM calls WHERE vapi_call_id = 'VAPI-WEBCALL-NORM'").fetchone()
+        assert call_row["phone"] == "Web call"
+
+    # 4. Booking & Bill creation
+    booking = db.add_booking("Demo", name="Client", phone="+91 99999 33333")
+    b_rows = db.bookings_for("+91 99999 33333")
+    assert len(b_rows) == 1
+    with db.connect() as conn:
+        b_row = conn.execute("SELECT phone FROM bookings WHERE id = ?", (booking["id"],)).fetchone()
+        assert b_row["phone"] == "919999933333"
+
+    bill = db.create_bill("Client", customer_phone="09999933333")
+    with db.connect() as conn:
+        b_row = conn.execute("SELECT customer_phone FROM bills WHERE id = ?", (bill["id"],)).fetchone()
+        assert b_row["customer_phone"] == "919999933333"
+
+
+def test_unique_violation_never_drops_message():
+    # Message 1 via format A
+    mid1 = db.add_message("+91 98765 00000", "them", "text", "First message")
+    assert mid1 is not None
+
+    # Message 2 via format B (equivalent phone, different format)
+    mid2 = db.add_message("09876500000", "them", "text", "Second message")
+    assert mid2 is not None
+
+    # Both messages must be recorded in the same conversation
+    with db.connect() as conn:
+        convs = conn.execute("SELECT id, phone FROM conversations WHERE phone = '919876500000'").fetchall()
+        assert len(convs) == 1
+        msgs = conn.execute("SELECT body FROM messages WHERE conversation_id = ? ORDER BY id", (convs[0]["id"],)).fetchall()
+        assert len(msgs) == 2
+        assert msgs[0]["body"] == "First message"
+        assert msgs[1]["body"] == "Second message"

@@ -567,21 +567,33 @@ def _confirm(ctx: dict, name: str, args: dict, key: str, ask: str) -> str | None
     action itself (approve_pending), so what goes out is what they heard.
     A number misheard by speech-to-text therefore never goes out unheard.
     """
+    import time
     pending, turn = ctx.get("_pending"), ctx.get("_turn", 0)
+    now = time.time()
     if ctx.get("_approved") == key or (pending and pending["key"] == key and pending["turn"] < turn):
         ctx.pop("_pending", None)
         ctx.pop("_approved", None)
         return None
     # `ask` is spoken to the owner verbatim by the call loop — the model once
     # said "bhej diya" over a NOT SENT YET, and the owner never said yes.
-    ctx["_pending"] = {"key": key, "turn": turn, "name": name, "args": dict(args), "ask": ask}
+    ctx["_pending"] = {"key": key, "turn": turn, "name": name, "args": dict(args), "ask": ask, "ts": now}
     return f"NOT SENT YET. The owner will be asked: {ask} Their yes sends it."
+
+
+MAX_PENDING_TURNS = 2
+MAX_PENDING_SECONDS = 120
 
 
 async def approve_pending(ctx: dict) -> str | None:
     """Run the parked action the owner just said yes to. None if nothing is parked."""
+    import time
     pending = ctx.get("_pending")
     if not pending:
+        return None
+    turn = ctx.get("_turn", 0)
+    # Check expiry: stale if > 2 turns elapsed or older than 120 seconds
+    if (turn - pending.get("turn", 0) > MAX_PENDING_TURNS) or (time.time() - pending.get("ts", time.time()) > MAX_PENDING_SECONDS):
+        ctx.pop("_pending", None)
         return None
     ctx["_approved"] = pending["key"]
     result = run(pending["name"], pending["args"], ctx)

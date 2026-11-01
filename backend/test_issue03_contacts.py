@@ -75,3 +75,59 @@ def test_scalability_beyond_2000_contacts():
     assert hits, "Contact beyond index 2000 must be found"
     assert hits[0][1] == "Target Person"
     assert hits[0][2] == "919999888877"
+@pytest.mark.anyio
+async def test_candidate_changes_between_readback_and_yes():
+    """If owner switches contact before saying yes, pending action is replaced."""
+    ctx = {"owner": True, "_turn": 1}
+    # Turn 1: Propose send to Contact A
+    res1 = tools._confirm(ctx, "send_whatsapp", {"phone": "919811111111", "message": "Hi A"}, "wa:919811111111:Hi A", "Send to A?")
+    assert "NOT SENT YET" in res1
+    assert ctx["_pending"]["args"]["phone"] == "919811111111"
+
+    # Turn 2: Owner changes mind to Contact B before confirming
+    ctx["_turn"] = 2
+    res2 = tools._confirm(ctx, "send_whatsapp", {"phone": "919822222222", "message": "Hi B"}, "wa:919822222222:Hi B", "Send to B?")
+    assert "NOT SENT YET" in res2
+    assert ctx["_pending"]["args"]["phone"] == "919822222222"
+
+    # Now owner says yes on turn 3
+    ctx["_turn"] = 3
+    from unittest.mock import AsyncMock, patch
+    with patch("tools._deliver", new_callable=AsyncMock) as mock_del:
+        with patch("tools._whatsapp_ready", return_value=None):
+            await tools.approve_pending(ctx)
+            # Must deliver to Contact B, NEVER Contact A
+            assert mock_del.call_count == 1
+            assert mock_del.call_args[0][0] == "919822222222"
+
+
+@pytest.mark.anyio
+async def test_stale_pending_send_expiry():
+    """A pending send parked many turns ago or long ago expires and is not sent."""
+    ctx = {"owner": True, "_turn": 1}
+    tools._confirm(ctx, "send_whatsapp", {"phone": "919811111111", "message": "Hi"}, "wa:919811111111:Hi A", "Send?")
+
+    # Turn jumps past MAX_PENDING_TURNS (e.g. turn 4 > 1 + 2)
+    ctx["_turn"] = 5
+    result = await tools.approve_pending(ctx)
+    assert result is None
+    assert "_pending" not in ctx
+
+
+@pytest.mark.anyio
+async def test_yes_after_different_contact_resolved():
+    """Resolving a new contact and saying yes delivers strictly to the resolved contact."""
+    db.touch_contact("919811111111", name="Rohan Sharma")
+    db.touch_contact("919822222222", name="Kunal Verma")
+
+    ctx = {"owner": True, "_turn": 1}
+    phone, who, _ = tools._resolve({"name": "Kunal"}, ctx)
+    tools._confirm(ctx, "send_whatsapp", {"phone": phone, "message": "Invoice"}, f"wa:{phone}:Invoice", f"Send to {who}?")
+
+    ctx["_turn"] = 2
+    from unittest.mock import AsyncMock, patch
+    with patch("tools._deliver", new_callable=AsyncMock) as mock_del:
+        with patch("tools._whatsapp_ready", return_value=None):
+            await tools.approve_pending(ctx)
+            assert mock_del.call_count == 1
+            assert mock_del.call_args[0][0] == "919822222222"

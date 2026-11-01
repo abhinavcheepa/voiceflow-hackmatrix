@@ -54,6 +54,8 @@ def plan_and_migrate(db_path: str, dry_run: bool = True) -> dict:
     """Plans or applies phone normalization across the SQLite database."""
     conn = sqlite3.connect(db_path, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA busy_timeout = 5000;")
 
     actions = {
         "contacts_updated": [],
@@ -120,9 +122,39 @@ def plan_and_migrate(db_path: str, dry_run: bool = True) -> dict:
                     return distinct[0]
 
                 update_fields = {"phone": norm}
-                for cname in ("name", "email", "status", "notes"):
+                for cname in ("name", "email", "status"):
                     if cname in contact_cols:
                         update_fields[cname] = pick_attr(cname)
+
+                # Protective flags: if ANY duplicate was opted out or blocked, preserve protection
+                for pflag in ("dnd_opt_out", "blocked", "opt_out", "dnd"):
+                    if pflag in contact_cols:
+                        flag_vals = [r[pflag] for r in rows if r[pflag] is not None]
+                        update_fields[pflag] = 1 if (1 in flag_vals or True in flag_vals) else 0
+
+                # Notes: deduplicate and concatenate chronologically
+                if "notes" in contact_cols:
+                    notes_list = []
+                    seen_notes = set()
+                    for r in sorted(rows, key=lambda x: (x["created_at"] or "", x["id"])):
+                        n = (r["notes"] or "").strip()
+                        if n and n not in seen_notes:
+                            seen_notes.add(n)
+                            dt = (r["created_at"] or "")[:10]
+                            notes_list.append(f"[{dt}] {n}" if dt else n)
+                    update_fields["notes"] = "\n".join(notes_list) if notes_list else None
+
+                # Tags: union set of tags
+                if "tags" in contact_cols:
+                    tags_set = set()
+                    for r in rows:
+                        raw_tags = r["tags"] or ""
+                        for tag in raw_tags.split(","):
+                            t = tag.strip()
+                            if t:
+                                tags_set.add(t)
+                    update_fields["tags"] = ", ".join(sorted(tags_set)) if tags_set else None
+
                 if "created_at" in contact_cols:
                     all_created = [r["created_at"] for r in rows if r["created_at"]]
                     update_fields["created_at"] = min(all_created) if all_created else survivor["created_at"]
@@ -202,6 +234,8 @@ def plan_and_migrate(db_path: str, dry_run: bool = True) -> dict:
                     update_conv_fields["auto_reply"] = 0 if 0 in ar_vals else 1
                 if "agent_id" in conv_cols:
                     update_conv_fields["agent_id"] = pick_conv_attr("agent_id")
+                if "assigned" in conv_cols:
+                    update_conv_fields["assigned"] = pick_conv_attr("assigned")
                 if "goal" in conv_cols:
                     update_conv_fields["goal"] = pick_conv_attr("goal")
                 if "updated_at" in conv_cols:
