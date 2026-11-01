@@ -183,3 +183,77 @@ def test_allow_unsigned_webhooks_ignored_in_production(monkeypatch):
 
     res = client.post("/api/whatsapp/webhook", data=raw_body, headers={"Content-Type": "application/json"})
     assert res.status_code == 403
+
+
+def test_audio_upload_webm_browser_clip_accepted(auth_headers):
+    """Audio in WebM container (EBML magic header 1A 45 DF A3 from browser MediaRecorder) is accepted."""
+    client = TestClient(app)
+    # Real browser WebM header with audio payload
+    webm_data = b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01\x42\xf7\x81\x01\x42\xf2\x81\x04" + b"\x00" * 100
+    assert upload_security.validate_magic_bytes_audio(webm_data, "browser_recording.webm") == "audio/webm"
+
+    with patch("voice.clone", return_value="v_cloned_webm_123") as mock_clone:
+        files = [("samples", ("recording.webm", io.BytesIO(webm_data), "audio/webm"))]
+        res = client.post("/api/voice/clone", data={"name": "WebMSpeaker"}, files=files, headers=auth_headers)
+        assert res.status_code == 200
+        assert mock_clone.called
+        assert mock_clone.call_args[0][0] == "WebMSpeaker"
+        # Verify the webm file was accepted in payload
+        assert mock_clone.call_args[0][1][0][2] == "audio/webm"
+
+
+def test_loopback_owner_shortcut_requires_loopback_host_header(monkeypatch):
+    """Peer 127.0.0.1, no XFF, but Host: example.com (DNS rebinding) must NOT get owner mode without token."""
+    client = TestClient(app)
+    # Peer is 127.0.0.1 (local client), no XFF, but Host header is spoofed/rebinding
+    res = client.post("/api/web-call/ticket?mode=assistant", headers={"Host": "example.com"})
+    assert res.status_code == 403
+    assert "session token" in res.json()["detail"].lower()
+
+
+def test_total_storage_cap_exceeded_returns_507(monkeypatch, auth_headers):
+    """When system-wide storage exceeds MAX_TOTAL_STORAGE_BYTES, upload is rejected with HTTP 507."""
+    client = TestClient(app)
+    # Set cap to 1000 bytes
+    monkeypatch.setattr(upload_security, "MAX_TOTAL_STORAGE_BYTES", 1000)
+    monkeypatch.setattr(upload_security, "get_current_storage_bytes", lambda: 900)
+
+    data = b"Some valid document text exceeding the remaining 100 bytes capacity." * 10
+    files = {"file": ("overflow.txt", io.BytesIO(data), "text/plain")}
+    res = client.post("/api/kb", files=files, headers=auth_headers)
+    assert res.status_code == 507
+    assert "storage capacity exceeded" in res.json()["detail"].lower()
+
+
+@pytest.mark.anyio
+async def test_daily_upload_count_quota_enforced():
+    """Exceeding MAX_DAILY_UPLOADS_PER_IP raises HTTP 429."""
+    manager = upload_security.UploadQuotaManager(max_concurrent=10, max_daily=3)
+    ip = "203.0.113.199"
+
+    for _ in range(3):
+        await manager.acquire(ip)
+        await manager.release(ip)
+
+    # 4th upload today exceeds daily limit
+    with pytest.raises(HTTPException) as exc:
+        await manager.acquire(ip)
+    assert exc.value.status_code == 429
+    assert "daily upload limit" in exc.value.detail.lower()
+
+
+def test_wa_bridge_incoming_ignores_allow_unsigned_in_production(monkeypatch):
+    """When ENV=production, ALLOW_UNSIGNED_WEBHOOKS=true is strictly ignored on wa-bridge incoming (401)."""
+    client = TestClient(app)
+    monkeypatch.setenv("ENV", "production")
+    monkeypatch.setenv("ALLOW_UNSIGNED_WEBHOOKS", "true")
+    monkeypatch.delenv("BRIDGE_SECRET", raising=False)
+    monkeypatch.delenv("WA_BRIDGE_TOKEN", raising=False)
+
+    import whatsapp_web
+    monkeypatch.setattr(whatsapp_web, "TOKEN", "")
+
+    payload = {"id": "test_prod_fail_closed", "from": "919999900001@c.us", "body": "hi"}
+    res = client.post("/api/whatsapp/web/incoming", json=payload)
+    assert res.status_code == 401
+    assert "unset" in res.json()["detail"].lower()

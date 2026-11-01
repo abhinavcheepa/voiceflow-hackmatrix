@@ -763,6 +763,8 @@ async def _deliver(phone: str, text: str, ctx: dict, name: str | None = None) ->
 
 async def _send_whatsapp(args: dict, ctx: dict) -> str:
     phone, who, bad = _resolve(args, ctx)
+    if phone and db.is_opted_out(phone):
+        return f"Cannot send WhatsApp message to {who}: recipient has opted out (suppression list)."
     text = (args.get("message") or "").strip()
     if bad or not text:
         return bad or "What should the message say? Ask the owner."
@@ -814,6 +816,8 @@ async def _send_bill(args: dict, ctx: dict) -> str:
 
 async def _start_whatsapp_chat(args: dict, ctx: dict) -> str:
     phone, who, bad = _resolve(args, ctx)
+    if phone and db.is_opted_out(phone):
+        return f"Cannot start WhatsApp chat with {who}: recipient has opted out (suppression list)."
     goal = (args.get("goal") or "").strip()
     opening = (args.get("opening_message") or "").strip()
     if bad or not goal or not opening:

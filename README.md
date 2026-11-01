@@ -59,6 +59,12 @@ is live. Stop everything with `.\start.ps1 -Stop`.
 
 Open **http://localhost:5174/app**.
 
+### Connect WhatsApp (Local Web Bridge)
+1. In `.env`: set `WHATSAPP_PROVIDER=web` and `BRIDGE_SECRET=your_strong_secret_32_chars`.
+2. Start containers: `docker compose up -d` and open `http://localhost:8000/app/whatsapp` (or scan QR in bridge log).
+3. Scan the QR code once with WhatsApp on your phone — messages and voice notes now sync automatically.
+
+
 <details>
 <summary>Starting the pieces by hand (macOS / Linux)</summary>
 

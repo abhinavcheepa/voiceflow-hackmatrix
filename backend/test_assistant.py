@@ -149,7 +149,10 @@ def test_recent_activity_reads_the_business():
 class FakeWS:
     def __init__(self, host, headers=None, first=None):
         self.client = type("C", (), {"host": host})()
-        self.headers = headers or {}
+        h = {"host": host}
+        if headers:
+            h.update(headers)
+        self.headers = h
         self._first = first
 
     async def receive_json(self):

@@ -343,9 +343,10 @@ async def whatsapp_web_incoming(
 ) -> dict:
     """Inbound from the local wa-bridge. Same pipeline as the Meta webhook."""
     import hmac
+    is_prod = os.getenv("ENV", "").lower() in ("production", "prod")
     bridge_secret = os.getenv("BRIDGE_SECRET") or os.getenv("WA_BRIDGE_TOKEN") or whatsapp_web.TOKEN
     if not bridge_secret:
-        if os.getenv("ALLOW_UNSIGNED_WEBHOOKS", "").lower() in ("true", "1", "yes"):
+        if not is_prod and os.getenv("ALLOW_UNSIGNED_WEBHOOKS", "").lower() in ("true", "1", "yes"):
             tasks.add_task(whatsapp.handle, whatsapp_web.parse(await request.json()))
             return {"ok": True}
         raise HTTPException(401, "BRIDGE_SECRET / WA_BRIDGE_TOKEN is unset (fail closed)")
@@ -563,6 +564,7 @@ async def kb_upload(
         safe_name = upload_security.sanitize_filename(file.filename or "document")
         data = await upload_security.read_bounded(file, upload_security.MAX_KB_FILE_BYTES)
         upload_security.validate_magic_bytes_document(data, safe_name)
+        upload_security.check_total_storage_cap(len(data))
 
         try:
             return await asyncio.wait_for(
@@ -811,6 +813,12 @@ async def _run_campaign(campaign_id: int) -> None:
             (c for c in db.get_campaigns() if c["id"] == campaign_id), {}
         ).get("status") != "running":
             return  # stopped from the dashboard
+
+        # ISSUE-15: Check suppression table before dialing
+        if db.is_opted_out(target["phone"]):
+            log.info("campaign %d: skipping target %s (suppressed/opted-out)", campaign_id, target["phone"])
+            db.set_target_status(target["id"], "opted_out", error="Recipient opted out (suppression list)")
+            continue
         try:
             if vapi.configured():
                 result = await vapi.create_call(target["phone"])
@@ -1005,10 +1013,16 @@ async def web_call_ticket(request: Request) -> dict:
     agent_id_raw = request.query_params.get("agent")
     agent_id = int(agent_id_raw) if agent_id_raw and agent_id_raw.isdigit() else None
 
-    # Owner/assistant mode verification: Docker/private IPs do not grant owner by themselves
+    # Owner/assistant mode verification: Host header and IP must both be loopback
     if mode in ("assistant", "owner"):
+        host_hdr = request.headers.get("host", "").split(":")[0].strip().lower()
+        is_host_loopback = host_hdr in _LOOPBACK
         fwd = request.headers.get("x-forwarded-for", "")
-        is_direct_local = client_ip in _LOOPBACK and (not fwd or all(p.strip() in _LOOPBACK for p in fwd.split(",")))
+        is_direct_local = (
+            client_ip in _LOOPBACK
+            and is_host_loopback
+            and (not fwd or all(p.strip() in _LOOPBACK for p in fwd.split(",")))
+        )
         if not is_direct_local:
             auth_header = request.headers.get("authorization", "")
             token = auth_header.replace("Bearer ", "").strip() if auth_header.startswith("Bearer ") else ""
@@ -1171,20 +1185,23 @@ async def web_call(ws: WebSocket) -> None:
 
 _finalizing: set[asyncio.Task] = set()
 
-_LOOPBACK = {"127.0.0.1", "::1", "localhost", "testclient"}
+_LOOPBACK = {"127.0.0.1", "::1", "localhost", "testclient", "testserver"}
 
 
 async def _owner_ok(ws: WebSocket) -> bool:
     """May this socket drive the owner assistant?
     
     Direct loopback on this machine (without remote proxying): yes.
+    Host header must also be loopback (protects against DNS rebinding).
     From anywhere else (LAN, Docker bridge, or proxied through Caddy):
     the first message MUST carry a valid session token.
     Private/Docker addresses do NOT grant owner mode by themselves.
     """
+    host_hdr = ws.headers.get("host", "").split(":")[0].strip().lower()
+    is_host_loopback = host_hdr in _LOOPBACK
     real_ip = webcall_gate.get_real_client_ip(ws)
     fwd = ws.headers.get("x-forwarded-for", "")
-    if real_ip in _LOOPBACK and (not fwd or all(p.strip() in _LOOPBACK for p in fwd.split(","))):
+    if real_ip in _LOOPBACK and is_host_loopback and (not fwd or all(p.strip() in _LOOPBACK for p in fwd.split(","))):
         return True
 
     if not assistant_auth.auth_manager.is_pin_configured():

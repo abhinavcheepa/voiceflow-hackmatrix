@@ -206,6 +206,25 @@ async def handle(message: dict) -> None:
 
         language = brain.detect_language(incoming)
 
+        # Check for opt-out / STOP keywords (ISSUE-15)
+        import opt_out
+        if opt_out.is_opt_out_keyword(incoming):
+            log.info("Opt-out request received from %s: '%s'", sender, incoming)
+            db.add_message(sender, "them", "voice" if is_voice else "text", incoming, name=name, language=language, needs_reply=False, wa_id=wa_id)
+            db.opt_out(sender, reason=f"keyword: {incoming[:50]}")
+            await send_text(sender, opt_out.ACK_OPTOUT_TEXT)
+            db.add_message(sender, "us", "text", opt_out.ACK_OPTOUT_TEXT, name=name, language=language)
+            return
+
+        # Check for resubscribe / START keywords (ISSUE-15)
+        if opt_out.is_resubscribe_keyword(incoming):
+            log.info("Resubscribe request received from %s: '%s'", sender, incoming)
+            db.add_message(sender, "them", "voice" if is_voice else "text", incoming, name=name, language=language, needs_reply=False, wa_id=wa_id)
+            db.opt_in(sender)
+            await send_text(sender, opt_out.ACK_RESUBSCRIBE_TEXT)
+            db.add_message(sender, "us", "text", opt_out.ACK_RESUBSCRIBE_TEXT, name=name, language=language)
+            return
+
         # The message is recorded whatever happens next. Only the *reply* is
         # switchable — turning auto-reply off must never lose a customer's
         # message, just leave it for the owner to answer.

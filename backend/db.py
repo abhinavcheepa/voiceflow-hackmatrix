@@ -113,6 +113,13 @@ CREATE TABLE IF NOT EXISTS campaign_targets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_targets_campaign ON campaign_targets(campaign_id, status);
+
+CREATE TABLE IF NOT EXISTS opt_outs (
+    phone       TEXT PRIMARY KEY,
+    reason      TEXT NOT NULL DEFAULT 'user_requested',
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_opt_outs_phone ON opt_outs(phone);
 CREATE INDEX IF NOT EXISTS idx_contacts_seen    ON contacts(last_seen_at);
 
 CREATE INDEX IF NOT EXISTS idx_calls_started  ON calls(started_at);
@@ -690,12 +697,13 @@ def add_message(phone: str, sender: str, kind: str, body: str, seconds: int | No
     phone = normalize_phone(phone)
     now = at or datetime.now(timezone.utc).isoformat()
     with connect() as conn:
+        initial_ar = 0 if is_opted_out(phone) else 1
         conn.execute(
-            """INSERT INTO conversations (name, phone, language, updated_at) VALUES (?,?,?,?)
+            """INSERT INTO conversations (name, phone, language, updated_at, auto_reply) VALUES (?,?,?,?,?)
                ON CONFLICT(phone) DO UPDATE SET
                    updated_at = MAX(conversations.updated_at, excluded.updated_at),
                    name = COALESCE(NULLIF(excluded.name,''), conversations.name)""",
-            (name or phone, phone, language, now),
+            (name or phone, phone, language, now, initial_ar),
         )
         conv_id = conn.execute("SELECT id FROM conversations WHERE phone = ?", (phone,)).fetchone()[0]
         cur = conn.execute(
@@ -769,6 +777,8 @@ def set_auto_reply_for(phone: str, enabled: bool) -> None:
 
 
 def auto_reply_block(phone: str) -> str | None:
+    if is_opted_out(phone):
+        return f"{phone} has opted out (suppression list)"
     """Why this number gets no auto-reply, or None if it does.
 
     Three switches can each stop a reply, and for a long time all three failed
@@ -1962,3 +1972,49 @@ def delete_cloned_audio(audio_id: int) -> str | None:
             return None
         db.execute("""DELETE FROM cloned_audios WHERE id = ?""", (audio_id,))
         return row["filepath"]
+
+
+# --- opt-out / suppression list (ISSUE-15) -------------------------------
+
+def opt_out(phone: str, reason: str = "user_requested") -> None:
+    """Add phone to suppression list and disable auto_reply for this conversation."""
+    norm = normalize_phone(phone)
+    if not norm:
+        return
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO opt_outs (phone, reason, created_at) VALUES (?, ?, ?)",
+            (norm, reason, now)
+        )
+        conn.execute(
+            "UPDATE conversations SET auto_reply = 0 WHERE phone = ?", (norm,)
+        )
+
+
+def opt_in(phone: str) -> None:
+    """Remove phone from suppression list and re-enable auto_reply."""
+    norm = normalize_phone(phone)
+    if not norm:
+        return
+    with connect() as conn:
+        conn.execute("DELETE FROM opt_outs WHERE phone = ?", (norm,))
+        conn.execute("UPDATE conversations SET auto_reply = 1 WHERE phone = ?", (norm,))
+
+
+def is_opted_out(phone: str) -> bool:
+    """Check if phone is in suppression list."""
+    norm = normalize_phone(phone)
+    if not norm:
+        return False
+    with connect() as conn:
+        row = conn.execute("SELECT 1 FROM opt_outs WHERE phone = ?", (norm,)).fetchone()
+        return bool(row)
+
+
+def get_opt_outs() -> list[dict]:
+    """Return list of all opted-out entries."""
+    with connect() as conn:
+        rows = conn.execute("SELECT phone, reason, created_at FROM opt_outs ORDER BY created_at DESC").fetchall()
+        return [dict(r) for r in rows]
