@@ -33,17 +33,61 @@ _embedder = None
 _embed_unavailable = False
 
 
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
+_embed_cooldown_until = 0.0
+
+
 def _get_embedder():
-    global _embedder, _embed_unavailable
-    if _embedder is None and not _embed_unavailable:
-        try:
-            from fastembed import TextEmbedding
-            _embedder = TextEmbedding(model_name=EMBED_MODEL)
-            log.info("KB embedding model loaded: %s", EMBED_MODEL)
-        except Exception as e:  # noqa: BLE001 - any failure falls back to BM25
-            _embed_unavailable = True
-            log.warning("KB embedding model unavailable (%s) — using BM25 only", e)
-    return _embedder
+    global _embedder, _embed_unavailable, _embed_cooldown_until
+
+    # Fast check: offline mode skips embeddings entirely
+    if os.getenv("VF_OFFLINE", "").strip().lower() in ("1", "true", "yes"):
+        return None
+
+    if _embedder is not None:
+        return _embedder
+
+    if _embed_unavailable:
+        return None
+
+    now = time.time()
+    if now < _embed_cooldown_until:
+        return None
+
+    try:
+        timeout_sec = float(os.getenv("KB_EMBED_TIMEOUT_SECONDS", "20.0"))
+    except (ValueError, TypeError):
+        timeout_sec = 20.0
+    try:
+        cooldown_sec = float(os.getenv("KB_EMBED_COOLDOWN_SECONDS", "300.0"))
+    except (ValueError, TypeError):
+        cooldown_sec = 300.0
+
+    def _loader():
+        from fastembed import TextEmbedding
+        return TextEmbedding(model_name=EMBED_MODEL)
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(_loader)
+        _embedder = future.result(timeout=timeout_sec)
+        executor.shutdown(wait=False)
+        log.info("KB embedding model loaded: %s", EMBED_MODEL)
+        return _embedder
+    except FuturesTimeoutError:
+        executor.shutdown(wait=False, cancel_futures=True)
+        _embed_cooldown_until = time.time() + cooldown_sec
+        log.warning("KB embedding model load timed out after %gs — cached cooldown for %gs, using BM25 only",
+                    timeout_sec, cooldown_sec)
+        return None
+    except Exception as e:  # noqa: BLE001 - any failure falls back to BM25
+        executor.shutdown(wait=False, cancel_futures=True)
+        _embed_cooldown_until = time.time() + cooldown_sec
+        log.warning("KB embedding model unavailable (%s) — cached cooldown for %gs, using BM25 only",
+                    e, cooldown_sec)
+        return None
 
 
 def _embed(texts: list[str]):
