@@ -607,12 +607,16 @@ NAME_MATCH = 0.7
 def _name_tokens(s: str) -> list[str]:
     import kb
 
+    s = s or ""
     s = kb._romanize(s) if kb._has_devanagari(s) else s
     return [t for t in re.findall(r"[a-z]+", s.lower()) if t not in _HONORIFICS and len(t) > 1]
 
 
 def is_contact(phone: str) -> bool:
-    return any(db.normalize_phone(c["phone"]) == phone for c in db.get_contacts(limit=2000))
+    norm = db.normalize_phone(phone)
+    with db.connect() as conn:
+        row = conn.execute("SELECT 1 FROM contacts WHERE phone = ?", (norm,)).fetchone()
+        return row is not None
 
 
 # Stricter than NAME_MATCH: this scans every word of a command, not a name the
@@ -620,24 +624,50 @@ def is_contact(phone: str) -> bool:
 HINT_MATCH = 0.85
 
 
-def contact_hints(text: str, limit: int = 3) -> list[tuple[str, str]]:
-    """Saved contacts whose name appears in what the owner just said.
+def _score_contact(q_tokens: list[str], c_tokens: list[str]) -> float:
+    """Calculates weighted similarity: full name highest, first name next, surname lowest.
 
-    Handed to the model up front, so "Kanishk ko bhejo" finds Kanishk's number
-    even when the model doesn't think to look — it once asked the owner for a
-    number that was already saved.
+    Disqualifies any contact where a multi-token query's first name doesn't match (<0.8).
+    Surname-only matches stay strictly below NAME_MATCH (0.7).
     """
     from difflib import SequenceMatcher
 
+    if not q_tokens or not c_tokens:
+        return 0.0
+
+    first_ratio = SequenceMatcher(None, q_tokens[0], c_tokens[0]).ratio()
+
+    # Spoken name has 2+ tokens: first token must match contact's first token (>= 0.8)
+    if len(q_tokens) >= 2 and first_ratio < 0.8:
+        return 0.0
+
+    # 1-token query that doesn't match first name: cap surname match below threshold
+    if len(q_tokens) == 1 and first_ratio < NAME_MATCH:
+        surname_match = max((SequenceMatcher(None, q_tokens[0], t).ratio() for t in c_tokens[1:]), default=0.0)
+        return min(0.65, surname_match * 0.65)
+
+    full_q = " ".join(q_tokens)
+    full_c = " ".join(c_tokens)
+    full_ratio = SequenceMatcher(None, full_q, full_c).ratio()
+
+    if len(q_tokens) >= 2 and len(c_tokens) >= 2:
+        surname_ratio = SequenceMatcher(None, q_tokens[-1], c_tokens[-1]).ratio()
+        return (full_ratio * 0.50) + (first_ratio * 0.35) + (surname_ratio * 0.15)
+
+    return (full_ratio * 0.50) + (first_ratio * 0.50)
+
+
+def contact_hints(text: str, limit: int = 3) -> list[tuple[str, str]]:
+    """Saved contacts whose name appears in what the owner just said."""
     words = [w for w in _name_tokens(text) if len(w) >= 3]
     if not words:
         return []
     found: dict[str, tuple[float, str]] = {}
-    for c in db.get_contacts(limit=2000):
+    for c in db.find_candidate_contacts(words):
         n = [t for t in _name_tokens(c.get("name") or "") if len(t) >= 3]
         if not n or not c.get("phone"):
             continue
-        score = max(SequenceMatcher(None, a, b).ratio() for a in words for b in n)
+        score = _score_contact(words[:2], n)
         phone = db.normalize_phone(c["phone"])
         if score >= HINT_MATCH and score > found.get(phone, (0.0,))[0]:
             found[phone] = (score, c["name"])
@@ -646,25 +676,16 @@ def contact_hints(text: str, limit: int = 3) -> list[tuple[str, str]]:
 
 
 def find_contacts(query: str, limit: int = 3) -> list[tuple[float, str, str]]:
-    """Saved people whose name sounds like `query`: [(score, name, phone)], best first.
-
-    Tolerant of script and spelling — the owner says a name, speech-to-text
-    writes it in Devanagari or misspells it, the contact is saved in Latin.
-    """
-    from difflib import SequenceMatcher
-
+    """Saved people whose name sounds like `query`: [(score, name, phone)], best first."""
     q = _name_tokens(query)
     if not q:
         return []
     best: dict[str, tuple[float, str, str]] = {}
-    for c in db.get_contacts(limit=2000):
+    for c in db.find_candidate_contacts(q):
         n = _name_tokens(c.get("name") or "")
         if not n or not c.get("phone"):
             continue
-        score = max(
-            max(SequenceMatcher(None, a, b).ratio() for a in q for b in n),
-            SequenceMatcher(None, " ".join(q), " ".join(n)).ratio(),
-        )
+        score = _score_contact(q, n)
         phone = db.normalize_phone(c["phone"])
         if score >= NAME_MATCH and score > best.get(phone, (0.0,))[0]:
             best[phone] = (score, c["name"], phone)

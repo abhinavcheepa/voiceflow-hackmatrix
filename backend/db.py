@@ -898,6 +898,24 @@ def touch_contact(phone: str, name: str | None = None) -> None:
         )
 
 
+def find_candidate_contacts(tokens: list[str]) -> list[dict]:
+    """Retrieve candidate contacts whose name contains any of the given tokens, or recent contacts."""
+    with connect() as conn:
+        if tokens:
+            clauses = ["name LIKE ?" for _ in tokens]
+            params = [f"%{t}%" for t in tokens]
+            sql = f"""SELECT id, name, phone, last_seen_at FROM contacts
+                      WHERE {' OR '.join(clauses)}
+                      ORDER BY last_seen_at DESC"""
+            rows = conn.execute(sql, params).fetchall()
+            if rows:
+                return [dict(r) for r in rows]
+        rows = conn.execute(
+            "SELECT id, name, phone, last_seen_at FROM contacts ORDER BY last_seen_at DESC LIMIT 5000"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def get_contacts(limit: int = 200) -> list[dict]:
     with connect() as conn:
         rows = conn.execute(

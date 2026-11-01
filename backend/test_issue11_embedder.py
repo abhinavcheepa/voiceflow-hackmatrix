@@ -62,3 +62,4 @@ def test_embedder_failure_cooldown(monkeypatch):
         # Second call should hit the cooldown without calling TextEmbedding again
         assert kb._get_embedder() is None
         assert call_count == 1
+
