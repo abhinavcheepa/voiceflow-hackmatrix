@@ -370,7 +370,23 @@ export default function WebCall() {
     else if (agentId) params.set("agent", agentId);
     const key = callerKey();
     if (key) params.set("caller", key);
-    const socket = new WebSocket(`${WS_BASE}?${params}`);
+
+    let ticket = "";
+    try {
+      const ticketRes = await fetch(`${API || ""}/api/web-call/ticket?${params}`);
+      if (ticketRes.ok) {
+        const ticketData = await ticketRes.json();
+        ticket = ticketData.ticket || "";
+      }
+    } catch (_) {
+      // ticket fetch fallback
+    }
+
+    if (ticket) params.set("ticket", ticket);
+    const subprotocols = ticket ? ["vf-ticket." + ticket] : [];
+    const socket = subprotocols.length
+      ? new WebSocket(`${WS_BASE}?${params}`, subprotocols)
+      : new WebSocket(`${WS_BASE}?${params}`);
     socket.binaryType = "arraybuffer";
     ws.current = socket;
 

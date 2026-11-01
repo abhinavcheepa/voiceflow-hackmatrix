@@ -53,7 +53,8 @@ import kb  # noqa: E402
 import recording  # noqa: E402
 import vapi  # noqa: E402
 import voice  # noqa: E402
-import webcall  # noqa: E402
+import webcall
+import webcall_gate  # noqa: E402
 import whatsapp  # noqa: E402
 import whatsapp_web  # noqa: E402
 import adaptive  # noqa: E402
@@ -933,19 +934,91 @@ def eval_delete(case_id: int) -> dict:
 
 # --- web calling --------------------------------------------------------
 
+@app.api_route("/api/web-call/ticket", methods=["GET", "POST"])
+async def web_call_ticket(request: Request) -> dict:
+    """Issue a single-use ticket (TTL 30s) for browser calling."""
+    if not webcall_gate.WEBCALL_PUBLIC:
+        auth.require_auth(request)
+    client_ip = webcall_gate.get_real_client_ip(request)
+    mode = request.query_params.get("mode", "customer")
+    agent_id_raw = request.query_params.get("agent")
+    agent_id = int(agent_id_raw) if agent_id_raw and agent_id_raw.isdigit() else None
+    try:
+        token = await webcall_gate.gate.issue_ticket(client_ip, mode=mode, agent_id=agent_id)
+        return {"ticket": token, "ttl": 30, "expiresIn": 30}
+    except PermissionError as e:
+        raise HTTPException(429, str(e))
+    except ValueError as e:
+        raise HTTPException(402, str(e))
+
+
 @app.websocket("/api/web-call/ws")
 async def web_call(ws: WebSocket) -> None:
     """Talk to the agent from the browser. One socket per call."""
-    await ws.accept()
-    agent_id = ws.query_params.get("agent")
-    assistant = ws.query_params.get("mode") == "assistant"
+    client_ip = webcall_gate.get_real_client_ip(ws)
+    origin = ws.headers.get("origin")
+
+    # 1. Origin check
+    if not webcall_gate.gate.check_origin(origin):
+        await ws.close(code=webcall_gate.WS_CLOSE_FORBIDDEN_ORIGIN)
+        return
+
+    # 2. Daily budget check
+    if not await webcall_gate.gate.check_budget_ok():
+        await ws.close(code=webcall_gate.WS_CLOSE_BUDGET_EXCEEDED)
+        return
+
+    # 3. Rate limit check
+    if not await webcall_gate.gate.check_rate_limit(client_ip):
+        await ws.close(code=webcall_gate.WS_CLOSE_RATE_LIMITED)
+        return
+
+    # 4. Ticket verification
+    ticket_token = ws.query_params.get("ticket")
+    subprotocol_selected = None
+    protocols = ws.headers.get("sec-websocket-protocol", "").split(",")
+    for proto in protocols:
+        proto = proto.strip()
+        if proto.startswith("vf-ticket."):
+            ticket_token = proto.split(".", 1)[1]
+            subprotocol_selected = proto
+            break
+
+    await ws.accept(subprotocol=subprotocol_selected)
+
+    if not ticket_token:
+        try:
+            init_msg = await asyncio.wait_for(ws.receive(), timeout=5.0)
+            if init_msg.get("type") == "websocket.receive" and "text" in init_msg:
+                import json
+                init_data = json.loads(init_msg["text"])
+                ticket_token = init_data.get("ticket")
+        except Exception:
+            ticket_token = None
+
+    ticket_data = await webcall_gate.gate.consume_ticket(ticket_token, client_ip)
+    if not ticket_data:
+        await ws.close(code=webcall_gate.WS_CLOSE_INVALID_TICKET)
+        return
+
+    agent_id = ticket_data.get("agent_id") or ws.query_params.get("agent")
+    mode = ticket_data.get("mode") or ws.query_params.get("mode")
+    assistant = mode == "assistant"
     if assistant and not await _owner_ok(ws):
         await ws.send_json({"type": "error", "text": "Assistant mode needs the owner PIN "
                             "(ASSISTANT_PIN in backend/.env) when used from another device."})
         await ws.close()
         return
+
     session = webcall.Session(int(agent_id) if agent_id else None,
                               caller_key=ws.query_params.get("caller"), assistant=assistant)
+
+    # 5. Concurrent slot acquisition
+    if not await webcall_gate.gate.acquire_slot(session.id, client_ip):
+        await ws.close(code=webcall_gate.WS_CLOSE_SERVER_BUSY)
+        return
+
+    call_start_time = time.time()
     session.open_record()
     await ws.send_json(
         {"type": "connected", "callId": session.id, "agent": session.agent.get("name", "")}
@@ -954,9 +1027,32 @@ async def web_call(ws: WebSocket) -> None:
     try:
         await webcall.speak(ws, session, session.greeting)
         while True:
-            message = await ws.receive()
+            # Duration limit check
+            elapsed = time.time() - call_start_time
+            if elapsed > webcall_gate.MAX_WEBCALL_DURATION_SECONDS:
+                await ws.send_json({"type": "ended", "reason": "duration_limit"})
+                await ws.close(code=webcall_gate.WS_CLOSE_DURATION_EXCEEDED)
+                break
+
+            # Idle timeout
+            try:
+                message = await asyncio.wait_for(ws.receive(), timeout=webcall_gate.WEBCALL_IDLE_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                await ws.send_json({"type": "ended", "reason": "idle_timeout"})
+                await ws.close()
+                break
+
             if message.get("type") == "websocket.disconnect":
                 break
+
+            # Frame size safeguard
+            if "bytes" in message and len(message["bytes"]) > webcall_gate.MAX_FRAME_SIZE_BYTES:
+                await ws.close(code=webcall_gate.WS_CLOSE_FRAME_TOO_LARGE)
+                break
+            if "text" in message and len(message["text"].encode()) > webcall_gate.MAX_FRAME_SIZE_BYTES:
+                await ws.close(code=webcall_gate.WS_CLOSE_FRAME_TOO_LARGE)
+                break
+
             if "text" in message:
                 try:
                     import json
@@ -976,13 +1072,11 @@ async def web_call(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
+        duration_sec = time.time() - call_start_time
+        await webcall_gate.gate.release_slot(session.id, duration_sec)
         session.close_record()
-        # Analysis, stitched recording and text record — as their own task, not
-        # awaited here. This handler can be cancelled the moment the socket
-        # goes, and an await in its `finally` died with it: the call kept its
-        # segments but never got a summary, an mp3 or a text record.
         task = asyncio.create_task(_finalize(session))
-        _finalizing.add(task)  # a bare task can be garbage-collected mid-run
+        _finalizing.add(task)
         task.add_done_callback(_finalizing.discard)
 
 
