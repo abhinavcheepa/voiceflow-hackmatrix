@@ -74,9 +74,40 @@ def _init_models():
         logger.error("Failed to initialize OpenVoice v2: %s", e, exc_info=True)
 
 
-def is_available() -> bool:
+def missing() -> str | None:
+    """Returns None if cloning dependencies and model weights are ready, else reason string."""
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        return "torch is not installed"
+
     ckpt = _CHECKPOINTS_DIR / "converter" / "checkpoint.pth"
-    return ckpt.exists()
+    if not ckpt.exists():
+        return f"OpenVoice v2 checkpoint not found at {ckpt}"
+    return None
+
+
+def is_available() -> bool:
+    return missing() is None
+
+
+def enroll(clips: list[bytes]) -> str:
+    """Enrol one or more audio clips as a new cloned voice profile."""
+    if not clips:
+        raise ValueError("No audio clips provided for voice cloning")
+    cid = hashlib.sha256(b"".join(clips)).hexdigest()[:16]
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp.write(clips[0])
+        tmp_path = tmp.name
+    try:
+        enroll_sample(tmp_path, cid)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    return cid
 
 
 def list_clones() -> list[dict]:
@@ -120,6 +151,9 @@ def delete_clone(clone_id: str) -> bool:
         out_pt.unlink()
         return True
     return False
+
+
+delete = delete_clone
 
 
 def _get_target_se(clone_id: str):

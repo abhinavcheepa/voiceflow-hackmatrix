@@ -30,7 +30,7 @@ def _fake(monkeypatch, convert_ok=True):
     monkeypatch.setattr(cloning, "enroll", lambda clips: calls.setdefault("enroll", clips) and "abc123")
     monkeypatch.setattr(cloning, "delete", lambda cid: calls.setdefault("deleted", cid))
 
-    def convert(base, cid):
+    def convert(base, cid, *args, **kwargs):
         if not convert_ok:
             raise RuntimeError("torch exploded")
         calls["convert"] = (base, cid)
