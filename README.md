@@ -75,29 +75,31 @@ The web bridge listens on port **8100** by default (`wa-bridge/index.js`, starte
   - `wa-bridge` container routes to: `BACKEND_URL=http://backend:8000`
 - **Run & Link:**
   1. `docker compose up -d`
-  2. Open **`http://localhost:5174/app/whatsapp`** (served by Caddy).
+  2. Open **`http://localhost/app/whatsapp`** (served by Caddy on port 80).
   3. Scan the QR code with WhatsApp (*Settings &rarr; Linked Devices &rarr; Link a Device*) or view terminal QR via `docker compose logs -f wa-bridge`.
 
 #### Mode B: Local Run without Docker (Development)
+Configure environment variables in your `.env` file (or set them in PowerShell):
 - **1. Start Web Bridge (`wa-bridge/index.js`):**
-  ```bash
+  ```powershell
   cd wa-bridge
-  # Environment
-  export BRIDGE_PORT=8100
-  export BACKEND_URL=http://127.0.0.1:8000
-  export BRIDGE_SECRET=your_strong_secret_32_chars
+  # In PowerShell (or configure in .env):
+  $env:BRIDGE_PORT="8100"
+  $env:BACKEND_URL="http://127.0.0.1:8000"
+  $env:BRIDGE_SECRET="your_strong_secret_32_chars"
   npm start
   ```
 - **2. Start Backend (`backend/`):**
-  ```bash
+  ```powershell
   cd backend
-  export WHATSAPP_PROVIDER=web
-  export WA_BRIDGE_URL=http://127.0.0.1:8100
-  export BRIDGE_SECRET=your_strong_secret_32_chars
+  # In PowerShell (or configure in .env):
+  $env:WHATSAPP_PROVIDER="web"
+  $env:WA_BRIDGE_URL="http://127.0.0.1:8100"
+  $env:BRIDGE_SECRET="your_strong_secret_32_chars"
   uvicorn main:app --port 8000
   ```
 - **3. Start Frontend & Link:**
-  Open **`http://localhost:5174/app/whatsapp`** to view connection status and scan the QR code.
+  Open **`http://localhost:5174/app/whatsapp`** (Vite dev server) to view connection status and scan the QR code.
 
 
 <details>
