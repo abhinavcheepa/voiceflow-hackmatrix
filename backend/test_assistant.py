@@ -231,8 +231,17 @@ def test_speech_cleanup_matches_what_the_voice_misread():
     assert say("Naam batayein.Ji, bataiye.(Waiting for your details).") == "Naam batayein. Ji, bataiye."
     assert say("Bill BILL-0001, ₹700, Ravi ko bhejun?") == "Bill 1, 700 rupaye, Ravi ko bhejun?"
     assert say("Spelling V-O-I-C-E hai, VICE FLOW nahi") == "Spelling Voice hai, Vice Flow nahi"
-    assert say("GST 18% aur AI, 4.5 kg") == "GST 18% aur AI, 4.5 kg"  # acronyms and decimals kept
+    assert say("GST 18% aur AI, 4.5 kg") == "GST 18 percent aur AI, 4.5 kg"  # spoken converts % to percent; acronyms and decimals kept
     assert say("जल्दी जल्दी भेजो।ठीक") == "जल्दी जल्दी भेजो। ठीक"
+
+
+def test_stored_and_displayed_text_keeps_percentage():
+    """Text stored in DB or formatted for display/WhatsApp keeps literal '18%', not '18 percent'."""
+    raw = "Total bill amount with GST 18% is ₹700"
+    msg_id = db.add_message("919999999999", "us", "text", raw)
+    assert msg_id is not None
+    msgs = db.messages_for("919999999999")
+    assert any("GST 18%" in m and "18 percent" not in m for m in msgs)
 
 
 def test_primed_whisper_reciting_its_vocab_is_dropped():
