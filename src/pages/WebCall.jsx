@@ -371,6 +371,27 @@ export default function WebCall() {
     const key = callerKey();
     if (key) params.set("caller", key);
 
+    let sessionToken = store.get("vf_owner_token") || "";
+    if (assistant && pin) {
+      try {
+        const authRes = await fetch(`${API || ""}/api/assistant/auth`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pin }),
+        });
+        if (authRes.ok) {
+          const authData = await authRes.json();
+          sessionToken = authData.token || "";
+          store.set("vf_owner_token", sessionToken);
+        } else {
+          const errData = await authRes.json().catch(() => ({}));
+          setError(errData.detail || "Authentication failed. Invalid PIN or rate limited.");
+          setStatus("idle");
+          return;
+        }
+      } catch (_) {}
+    }
+
     let ticket = "";
     try {
       const ticketRes = await fetch(`${API || ""}/api/web-call/ticket?${params}`);
@@ -458,9 +479,8 @@ export default function WebCall() {
     };
 
     socket.onopen = () => {
-      // The PIN goes in the first message, not the URL, so it never lands in
-      // a proxy or server log. The backend only asks for it off this machine.
-      if (assistant && pin) socket.send(JSON.stringify({ type: "auth", pin }));
+      // Session token goes in the first message (never URL query, and never raw PIN).
+      if (assistant && sessionToken) socket.send(JSON.stringify({ type: "auth", token: sessionToken }));
       setStatus("greeting");
       noiseFloor.current = null;
       // Open the mic now. It used to wait for the greeting audio to finish,
@@ -567,7 +587,7 @@ export default function WebCall() {
                 store.set("vf_owner_pin", e.target.value);
               }}
               disabled={live}
-              placeholder="ASSISTANT_PIN from backend/.env"
+              placeholder="ASSISTANT_PIN (minimum 8 characters)"
               className="mt-1.5 w-full rounded-xl border border-line bg-panel-2 px-3.5 py-2.5 text-sm text-white outline-none focus:border-violet/50 disabled:opacity-50"
             />
           </label>

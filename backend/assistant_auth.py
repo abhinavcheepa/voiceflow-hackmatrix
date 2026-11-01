@@ -21,7 +21,7 @@ from typing import Optional, Tuple, Dict, List, Set, Any
 
 log = logging.getLogger("voiceflow.assistant.auth")
 
-MIN_PIN_LENGTH = 6
+MIN_PIN_LENGTH = 8
 SESSION_TTL_SECONDS = 3600  # 1 hour
 MAX_FAILURES_BEFORE_LOCKOUT = 5
 BASE_LOCKOUT_SECONDS = 30
@@ -33,7 +33,10 @@ KNOWN_DEFAULTS = {
     "000000",
     "111111",
     "12345678",
+    "00000000",
+    "11111111",
     "654321",
+    "87654321",
     "password",
     "admin",
     "default",
@@ -167,27 +170,21 @@ class AssistantAuthManager:
         """
         now = time.time()
 
-        # 1. Check global rate limit (failed attempts in past 60s)
-        self._global_failures = [t for t in self._global_failures if now - t <= 60.0]
-        if len(self._global_failures) >= GLOBAL_MAX_FAILURES_PER_MINUTE:
-            log.warning("Assistant PIN global failed attempt cap reached (%d/min)", len(self._global_failures))
-            return False, None, 60, GENERIC_ERROR_MESSAGE
-
-        # 2. Check IP lockout
+        # 1. Check IP lockout
         if ip in self._ip_lockouts:
             until, count = self._ip_lockouts[ip]
             if now < until:
-                retry_after = max(1, max(1, int(until - now + 0.99)))
+                retry_after = max(1, int(until - now + 0.99))
                 log.warning("Assistant PIN auth rejected: IP %s is locked out (%ds remaining)", mask_ip(ip), retry_after)
                 return False, None, retry_after, GENERIC_ERROR_MESSAGE
             else:
                 del self._ip_lockouts[ip]
 
-        # 3. Check client identity lockout
+        # 2. Check client identity lockout
         if identity and identity in self._identity_lockouts:
             until, count = self._identity_lockouts[identity]
             if now < until:
-                retry_after = max(1, max(1, int(until - now + 0.99)))
+                retry_after = max(1, int(until - now + 0.99))
                 log.warning(
                     "Assistant PIN auth rejected: identity %s is locked out (%ds remaining)",
                     mask_identifier(identity),
@@ -197,11 +194,17 @@ class AssistantAuthManager:
             else:
                 del self._identity_lockouts[identity]
 
-        # 4. Verify PIN constant time
+        # 3. Verify PIN constant time
         configured = self.get_configured_pin()
         match = verify_pin_constant_time(candidate_pin, configured)
 
         if not match:
+            # 4. Check global rate limit (failed attempts in past 60s)
+            self._global_failures = [t for t in self._global_failures if now - t <= 60.0]
+            if len(self._global_failures) >= GLOBAL_MAX_FAILURES_PER_MINUTE:
+                log.warning("Assistant PIN global failed attempt cap reached (%d/min); throttling failed attempts", len(self._global_failures))
+                return False, None, 60, GENERIC_ERROR_MESSAGE
+
             # Record failed attempt
             self._global_failures.append(now)
 
@@ -216,13 +219,15 @@ class AssistantAuthManager:
                 ident_attempts.append(now)
                 self._failed_identity_attempts[identity] = ident_attempts
 
-            fail_count = len(ip_attempts)
-            retry_after = 1
+            ip_fail_count = len(ip_attempts)
+            ident_fail_count = len(self._failed_identity_attempts.get(identity, [])) if identity else 0
+            is_locked = (ip_fail_count >= MAX_FAILURES_BEFORE_LOCKOUT) or (ident_fail_count >= MAX_FAILURES_BEFORE_LOCKOUT)
+            fail_count = max(ip_fail_count, ident_fail_count)
 
-            if fail_count >= MAX_FAILURES_BEFORE_LOCKOUT:
-                # Calculate exponential backoff lockout
-                prev_lockouts = self._ip_lockout_counts.get(ip, 0)
-                new_lockout_count = prev_lockouts + 1
+            if is_locked:
+                prev_ip_lockouts = self._ip_lockout_counts.get(ip, 0)
+                prev_ident_lockouts = self._identity_lockout_counts.get(identity, 0) if identity else 0
+                new_lockout_count = max(prev_ip_lockouts, prev_ident_lockouts) + 1
                 self._ip_lockout_counts[ip] = new_lockout_count
                 lockout_duration = min(
                     BASE_LOCKOUT_SECONDS * (2 ** (new_lockout_count - 1)),
@@ -241,7 +246,6 @@ class AssistantAuthManager:
                     fail_count,
                 )
             else:
-                # Backoff delay calculation for non-lockout failures
                 retry_after = min(2 ** (fail_count - 1), 10)
                 log.warning(
                     "Assistant PIN auth failed for IP %s (attempt %d/%d)",
@@ -295,6 +299,17 @@ class AssistantAuthManager:
             self._sessions.pop(clean_token, None)
             return False
         return True
+
+    def get_session_remaining_ttl(self, token: Optional[str]) -> int:
+        """Get remaining TTL in seconds for a valid session token, or 0 if expired/invalid."""
+        if not token or not isinstance(token, str):
+            return 0
+        clean_token = token.strip()
+        session = self._sessions.get(clean_token)
+        if not session:
+            return 0
+        rem = session["expires_at"] - time.time()
+        return max(0, int(rem)) if rem > 0 else 0
 
     def revoke_session_token(self, token: Optional[str]) -> bool:
         """Revoke a session token upon logout."""

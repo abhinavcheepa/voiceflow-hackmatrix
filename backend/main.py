@@ -1131,36 +1131,23 @@ async def _owner_ok(ws: WebSocket) -> bool:
     if not isinstance(first, dict) or first.get("type") != "auth":
         return False
 
-    # 1. Session token authentication
+    # Session token authentication ONLY (raw PIN acceptance is removed on WebSocket)
     token = first.get("token")
-    if token:
-        token_str = str(token).strip()
-        if assistant_auth.auth_manager.verify_session_token(token_str):
-            return True
+    if not token:
         if hasattr(ws, "send_json"):
-            await ws.send_json({"type": "error", "text": assistant_auth.GENERIC_ERROR_MESSAGE, "retry_after": 5})
+            await ws.send_json({
+                "type": "error",
+                "text": "WebSocket requires a session token. Obtain one via POST /api/assistant/auth first.",
+                "retry_after": 5,
+            })
         return False
 
-    # 2. PIN authentication
-    candidate_pin = first.get("pin")
-    client_ip = origin or "unknown"
-    identity = first.get("identity") or first.get("phone")
-
-    success, session_token, retry_after, error_msg = assistant_auth.auth_manager.authenticate(
-        str(candidate_pin) if candidate_pin is not None else None,
-        ip=client_ip,
-        identity=str(identity) if identity else None,
-    )
-
-    if success:
-        if hasattr(ws, "send_json"):
-            await ws.send_json(
-                {"type": "authenticated", "token": session_token, "expires_in": assistant_auth.SESSION_TTL_SECONDS}
-            )
+    token_str = str(token).strip()
+    if assistant_auth.auth_manager.verify_session_token(token_str):
         return True
 
     if hasattr(ws, "send_json"):
-        await ws.send_json({"type": "error", "text": error_msg, "retry_after": retry_after})
+        await ws.send_json({"type": "error", "text": assistant_auth.GENERIC_ERROR_MESSAGE, "retry_after": 5})
     return False
 
 @app.post("/api/assistant/auth")
@@ -1187,13 +1174,17 @@ async def assistant_auth_endpoint(request: Request, payload: dict = Body(...)) -
 
 @app.get("/api/assistant/status")
 async def assistant_status_endpoint(request: Request, authorization: str | None = Header(default=None)) -> dict:
-    """Check whether remote assistant features are enabled and verify token."""
+    """Check session authentication status. Never leaks whether PIN is unset, lengths, or lockouts to unauthenticated callers."""
     token = None
     if authorization and authorization.startswith("Bearer "):
         token = authorization[7:].strip()
+
+    if not token or not assistant_auth.auth_manager.verify_session_token(token):
+        return {"authenticated": False}
+
     return {
-        "remote_enabled": assistant_auth.auth_manager.is_pin_configured(),
-        "token_valid": assistant_auth.auth_manager.verify_session_token(token) if token else False,
+        "authenticated": True,
+        "expires_in": assistant_auth.auth_manager.get_session_remaining_ttl(token),
     }
 
 

@@ -151,6 +151,8 @@ takes the name and time and says it will confirm.
 Pick an agent, press call, talk. Same pipeline a phone caller gets. The browser
 decides when you've stopped speaking and sends that turn.
 
+Includes **Owner Assistant mode** ("Jarvis" mode). For remote access (e.g. from a phone on Wi-Fi), it requires configuring `ASSISTANT_PIN` in `backend/.env` (minimum 8 characters, alphanumeric recommended). The frontend exchanges the PIN via `POST /api/assistant/auth` for an ephemeral session token; raw PIN is never accepted over WebSockets or URLs.
+
 Half-duplex — the agent finishes before it listens again. Interrupting
 mid-sentence needs the streaming media loop that isn't built yet.
 

@@ -184,13 +184,13 @@ def test_5_pause_resume_enforcement():
     assert db.auto_reply_global() is False
 
     # Verify whatsapp auto_reply_block reports pause
-    block_reason = db.auto_reply_block("+918817882519")
+    block_reason = db.auto_reply_block("+919999900001")
     print(f"Check auto_reply_block while paused -> '{block_reason}'")
     assert block_reason is not None
 
     # Simulate inbound WhatsApp message while paused
     test_msg = {
-        "from": "+918817882519",
+        "from": "+919999900001",
         "name": "Test Customer",
         "type": "text",
         "text": "Can I book a demo?",
@@ -204,7 +204,7 @@ def test_5_pause_resume_enforcement():
             """SELECT m.* FROM messages m
                JOIN conversations c ON c.id = m.conversation_id
                WHERE c.phone = ? ORDER BY m.id DESC LIMIT 1""",
-            (db.normalize_phone('+918817882519'),),
+            (db.normalize_phone('+919999900001'),),
         ).fetchone()
     print(f"Stored message while paused: direction='{row['sender']}', text='{row['body']}', needs_reply={row['needs_reply']}")
     assert row["sender"] == "them"
@@ -221,7 +221,7 @@ def test_5_pause_resume_enforcement():
     assert worker.automation_enabled() is True
     assert db.auto_reply_global() is True
 
-    block_reason_after = db.auto_reply_block("+918817882519")
+    block_reason_after = db.auto_reply_block("+919999900001")
     print(f"Check auto_reply_block after resume -> '{block_reason_after}'")
     assert block_reason_after is None
     print("[PASS] TEST 5 PASSED")
