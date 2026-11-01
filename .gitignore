@@ -33,3 +33,5 @@ docs/MITS_FE_Faculty_Database.md
 backend/recordings/
 screenshots/
 *.bak
+*.db-wal
+*.db-shm

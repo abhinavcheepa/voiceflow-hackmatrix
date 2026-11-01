@@ -4,8 +4,11 @@ Plain sqlite3 — no ORM. One file on disk, one connection per request.
 Swap the DSN for Postgres when there's a reason to; nothing here needs it yet.
 """
 
+import logging
 import os
 import sqlite3
+
+log = logging.getLogger("voiceflow.db")
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -279,6 +282,10 @@ SUCCESS_OUTCOMES = ("Booked", "Lead captured", "Answered")
 def connect():
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
     try:
         yield conn
         conn.commit()
@@ -321,23 +328,99 @@ MIGRATIONS = [
 ]
 
 
+def check_foreign_keys_safe() -> list:
+    """Run PRAGMA foreign_key_check at startup; log any violations without crashing."""
+    try:
+        with connect() as conn:
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                log.warning("Database foreign key integrity warning: %d violation(s) detected: %s",
+                            len(violations), [tuple(v) for v in violations])
+            return violations
+    except Exception as e:
+        log.warning("Could not run foreign_key_check: %s", e)
+        return []
+
+
 def _migrate(conn) -> None:
-    for table, column, coltype in MIGRATIONS:
-        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-        if column not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
-    # UNIQUE can't be added by ALTER, so the dedupe index is created here.
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msgs_wa_id ON messages(wa_id)")
+    # 1. Ensure schema_version table exists
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL,
+            description TEXT NOT NULL
+        )
+    """)
+
+    # 2. Check current version
+    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    current_version = row[0] if row and row[0] is not None else 0
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Baseline version 1: Legacy columns and unique wa_id index
+    if current_version < 1:
+        for table, column, coltype in MIGRATIONS:
+            existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msgs_wa_id ON messages(wa_id)")
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at, description) VALUES (1, ?, ?)",
+            (now, "Baseline schema with legacy columns and unique wa_id index")
+        )
+        current_version = 1
+
+    # Version 2: High-performance lookup indexes
+    if current_version < 2:
+        # Calls indexes
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_phone ON calls(phone)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_started ON calls(started_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_caller_key ON calls(caller_key)")
+
+        # Messages indexes
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv_id ON messages(conversation_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_needs_reply ON messages(created_at) WHERE needs_reply = 1")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)")
+
+        # Contacts index
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_last_seen ON contacts(last_seen_at)")
+
+        # Campaign targets index
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_campaign_targets_lookup ON campaign_targets(campaign_id, status)")
+
+        # KB chunks index
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_kb_chunks_agent_doc ON kb_chunks(agent_id, doc_id)")
+
+        # Bills index
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bills_customer_phone ON bills(customer_phone)")
+
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at, description) VALUES (2, ?, ?)",
+            (now, "High-performance lookup indexes on calls, messages, contacts, campaigns, kb, bills")
+        )
+        current_version = 2
 
 
 def init() -> None:
-    with connect() as conn:
-        # WAL mode: allows concurrent readers while a writer holds the lock.
-        # Critical for a single-worker uvicorn serving both API reads and the
-        # background worker writing jobs — without it, readers block on writes.
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript(SCHEMA)
-        _migrate(conn)
+    # Use isolation_level=None with BEGIN IMMEDIATE to serialize concurrent startup
+    raw_conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    raw_conn.execute("PRAGMA busy_timeout = 5000")
+    raw_conn.execute("PRAGMA journal_mode = WAL")
+    raw_conn.execute("PRAGMA synchronous = NORMAL")
+    raw_conn.execute("PRAGMA foreign_keys = ON")
+    raw_conn.executescript(SCHEMA)
+    raw_conn.execute("BEGIN IMMEDIATE")
+    try:
+        _migrate(raw_conn)
+        raw_conn.execute("COMMIT")
+    except Exception:
+        raw_conn.execute("ROLLBACK")
+        raise
+    finally:
+        raw_conn.close()
+
+    check_foreign_keys_safe()
     ensure_default_agent()
 
 
@@ -783,6 +866,12 @@ def delete_agent(agent_id: int) -> None:
         # Never delete the last one — calls would have no persona to fall back to.
         if conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0] <= 1:
             raise ValueError("Cannot delete the only agent")
+        conn.execute("UPDATE campaigns SET agent_id = NULL WHERE agent_id = ?", (agent_id,))
+        conn.execute("DELETE FROM learned_answers WHERE agent_id = ?", (agent_id,))
+        conn.execute("DELETE FROM eval_runs WHERE case_id IN (SELECT id FROM eval_cases WHERE agent_id = ?)", (agent_id,))
+        conn.execute("DELETE FROM eval_cases WHERE agent_id = ?", (agent_id,))
+        conn.execute("UPDATE calls SET agent_id = NULL WHERE agent_id = ?", (agent_id,))
+        conn.execute("UPDATE conversations SET agent_id = NULL WHERE agent_id = ?", (agent_id,))
         conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
         if not conn.execute("SELECT 1 FROM agents WHERE is_default = 1").fetchone():
             conn.execute("UPDATE agents SET is_default = 1 WHERE id = (SELECT MIN(id) FROM agents)")
