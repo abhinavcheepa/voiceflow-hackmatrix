@@ -12,6 +12,9 @@ text back, written in the owner's style. Both are logged to the dashboard.
 import asyncio
 import logging
 import os
+import random
+import time
+from datetime import datetime, timezone
 
 import httpx
 
@@ -34,6 +37,54 @@ VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 # "meta" = official Cloud API (needs business KYC).
 # "web"  = the local wa-bridge driving WhatsApp Web (no KYC, against WhatsApp's
 #          terms, ban risk — use a dedicated number).
+
+class WhatsAppRateLimiter:
+    def __init__(self):
+        self._last_reply_by_number: dict[str, float] = {}
+        self._global_send_times: list[float] = []
+        self._daily_sends: dict[str, int] = {}
+
+    def reset(self):
+        self._last_reply_by_number.clear()
+        self._global_send_times.clear()
+        self._daily_sends.clear()
+
+    def check(self, phone: str) -> str | None:
+        now = time.time()
+        norm = db.normalize_phone(phone)
+        cooldown_sec = float(os.getenv("REPLY_COOLDOWN_SECONDS", "10"))
+        if cooldown_sec > 0 and norm in self._last_reply_by_number:
+            elapsed = now - self._last_reply_by_number[norm]
+            if elapsed < cooldown_sec:
+                return f"per-number cooldown active ({elapsed:.1f}s < {cooldown_sec}s)"
+
+        max_per_min = int(os.getenv("MAX_GLOBAL_SENDS_PER_MINUTE", "30"))
+        if max_per_min > 0:
+            one_min_ago = now - 60.0
+            self._global_send_times = [t for t in self._global_send_times if t > one_min_ago]
+            if len(self._global_send_times) >= max_per_min:
+                return f"global sends/min cap reached ({len(self._global_send_times)} >= {max_per_min})"
+
+        max_daily = int(os.getenv("MAX_DAILY_AUTO_REPLIES", "500"))
+        if max_daily > 0:
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            today_count = self._daily_sends.get(today_str, 0)
+            if today_count >= max_daily:
+                return f"daily auto-reply cap reached ({today_count} >= {max_daily})"
+
+        return None
+
+    def record_send(self, phone: str):
+        now = time.time()
+        norm = db.normalize_phone(phone)
+        self._last_reply_by_number[norm] = now
+        self._global_send_times.append(now)
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._daily_sends[today_str] = self._daily_sends.get(today_str, 0) + 1
+
+
+rate_limiter = WhatsAppRateLimiter()
+
 PROVIDER = (os.getenv("WHATSAPP_PROVIDER") or "meta").lower()
 
 
@@ -206,6 +257,21 @@ async def handle(message: dict) -> None:
 
         language = brain.detect_language(incoming)
 
+        # Check for groups, broadcasts, status updates - never auto-replied
+        is_group_or_broadcast = (
+            message.get("is_group", False)
+            or message.get("is_broadcast", False)
+            or "@g.us" in sender
+            or "-g.us" in sender
+            or "@broadcast" in sender
+            or "@newsletter" in sender
+            or message.get("type") in ("status", "broadcast")
+            or sender == "status@broadcast"
+        )
+        if is_group_or_broadcast:
+            log.info("ignoring group/broadcast/status update from %s", sender)
+            return
+
         # Check for opt-out / STOP keywords (ISSUE-15)
         import opt_out
         if opt_out.is_opt_out_keyword(incoming):
@@ -225,16 +291,15 @@ async def handle(message: dict) -> None:
             db.add_message(sender, "us", "text", opt_out.ACK_RESUBSCRIBE_TEXT, name=name, language=language)
             return
 
-        # The message is recorded whatever happens next. Only the *reply* is
-        # switchable — turning auto-reply off must never lose a customer's
-        # message, just leave it for the owner to answer.
-        #
-        # needs_reply survives a crash or restart between here and the send,
-        # which used to drop the reply with no trace at all.
+        # The message is recorded whatever happens next.
+        # Everyone else (not auto-replied or on allowlist): message is stored and shown with needs_reply=True!
+        # NO LLM call, NO send, NO TTS.
         blocked = db.auto_reply_block(sender)
+        is_paused = not db.auto_reply_global() or db.get_setting("automation_enabled", "on") != "on"
+        msg_needs_reply = False if (db.is_opted_out(sender) or is_paused) else True
         message_id = db.add_message(
             sender, "them", "voice" if is_voice else "text", incoming,
-            name=name, language=language, needs_reply=blocked is None,
+            name=name, language=language, needs_reply=msg_needs_reply,
             wa_id=wa_id,
         )
 
@@ -279,6 +344,19 @@ async def reply_to(sender: str, name: str | None, incoming: str, is_voice: bool,
     Separate from handle() so the startup catch-up can reuse it without storing
     the customer's message a second time.
     """
+    # Rate limits: per-number cooldown, global sends/min, daily send cap
+    rate_err = rate_limiter.check(sender)
+    if rate_err:
+        log.warning("rate limit throttled reply to %s: %s", sender, rate_err)
+        return
+
+    # Random typing delay (2-6s default, env-configurable)
+    delay_min = float(os.getenv("TYPING_DELAY_MIN", "2.0"))
+    delay_max = float(os.getenv("TYPING_DELAY_MAX", "6.0"))
+    if delay_max > 0 and delay_max >= delay_min:
+        delay = random.uniform(delay_min, delay_max)
+        if delay > 0:
+            await asyncio.sleep(delay)
     # WhatsApp gives us the sender's profile name; pass it through so the
     # agent can greet them properly instead of guessing.
     # WhatsApp replies draw on the default agent's knowledge base, if any, and
@@ -308,6 +386,7 @@ async def reply_to(sender: str, name: str | None, incoming: str, is_voice: bool,
         db.add_message(sender, "us", "text", answer, name=name, language=language)
 
     events.broadcast("message_update", {"phone": sender, "direction": "us", "name": name})
+    rate_limiter.record_send(sender)
 
     # Answered — nothing left to pick up on the next startup.
     if message_id:

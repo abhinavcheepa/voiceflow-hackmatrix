@@ -15,6 +15,7 @@ def setup_clean_db(tmp_path, monkeypatch):
     db.init()
     # Enable global auto reply for tests
     db.set_auto_reply_global(True)
+    db.set_allowlist(['919876543210'])
     yield
 
 

@@ -22,9 +22,9 @@ def clean_db(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("kw", [
-    "STOP", "stop", "Unsubscribe", "cancel", "QUIT", "halt",
-    "band karo", "mat bhejo", "rok do", "message mat bhejo", "nahi chahiye",
-    "रुको", "बंद करो", "मत भेजो", "रोक दो"
+    "STOP", "stop", "Unsubscribe", "QUIT", "optout",
+    "band karo", "mat bhejo", "message mat bhejo",
+    "रुको", "बंद करो", "मत भेजो"
 ])
 @pytest.mark.anyio
 async def test_inbound_stop_keywords_trigger_opt_out(kw):
@@ -55,67 +55,94 @@ async def test_inbound_stop_keywords_trigger_opt_out(kw):
         assert row[0] == 0
 
 
+@pytest.mark.parametrize("phrase", [
+    "cancel my appointment",
+    "nahi chahiye receipt",
+    "rok do gaadi yaha pe",
+    "please halt the process for today",
+    "end of conversation, thank you"
+])
+@pytest.mark.anyio
+async def test_ambiguous_phrases_do_not_trigger_opt_out(phrase):
+    """Conversational phrases containing ambiguous words must NOT trigger opt-out."""
+    phone = "919999888802"
+    assert db.is_opted_out(phone) is False
+
+    msg = {
+        "id": f"wamid.MSG_{hash(phrase)}",
+        "from": phone,
+        "type": "text",
+        "text": phrase,
+    }
+
+    with patch("whatsapp.reply_to", new_callable=AsyncMock):
+        await whatsapp.handle(msg)
+
+    # Must NOT be in suppression list
+    assert db.is_opted_out(phone) is False
+    assert opt_out.is_opt_out_keyword(phrase) is False
+
+
 @pytest.mark.anyio
 async def test_suppression_table_blocks_subsequent_auto_replies():
     """Once opted out, incoming messages are stored but auto-reply is blocked."""
-    phone = "919999888802"
-    db.opt_out(phone, reason="unit_test")
+    phone = "919999888803"
+    db.opt_out(phone, reason="user_unsubscribed")
     assert db.is_opted_out(phone) is True
 
-    # Verify auto_reply_block diagnoses the suppression list
+    # Check db auto_reply_block helper
     block_reason = db.auto_reply_block(phone)
     assert block_reason is not None
-    assert "opted out" in block_reason.lower() or "suppression" in block_reason.lower()
+    assert "suppression list" in block_reason or "opted out" in block_reason
 
+    # Send incoming normal message
     msg = {
-        "id": "wamid.AFTER_OPTOUT_1",
+        "id": "wamid.NORMAL_AFTER_OPTOUT",
         "from": phone,
         "type": "text",
-        "text": "What are your store hours?",
+        "text": "Hello, do you have fresh mangoes?",
     }
 
     with patch("whatsapp.reply_to", new_callable=AsyncMock) as mock_reply:
         await whatsapp.handle(msg)
-        # reply_to must NOT be called for suppressed sender
-        mock_reply.assert_not_called()
+        # reply_to must NOT be called for opted-out users
+        assert not mock_reply.called
 
-    # Message must still be recorded in conversation history for the human owner
-    with db.connect() as conn:
-        rows = conn.execute("SELECT body FROM messages WHERE conversation_id = (SELECT id FROM conversations WHERE phone = ?)", (phone,)).fetchall()
-        assert any("What are your store hours?" in r[0] for r in rows)
+    # Message must be stored in database for human review
+    history = db.messages_for(phone)
+    assert any("Hello, do you have fresh mangoes?" in m for m in history)
 
 
 @pytest.mark.anyio
-async def test_suppression_table_skips_campaign_dialing():
-    """Campaign targets matching opted-out numbers in suppression list are skipped without dialing."""
-    opted_out_phone = "919999888803"
-    valid_phone = "919999888804"
+async def test_suppression_table_skips_campaign_dialing(monkeypatch):
+    """Campaign execution automatically skips opted-out contacts."""
+    monkeypatch.setenv("CAMPAIGN_GAP_SECONDS", "0")
+    phone_ok = "919999888804"
+    phone_optout = "919999888805"
+    db.opt_out(phone_optout, reason="user_unsubscribed")
+    assert db.is_opted_out(phone_optout) is True
 
-    db.opt_out(opted_out_phone, reason="pre_optout")
-
-    cid = db.create_campaign("Promo Campaign", None, [
-        {"name": "Suppressed Lead", "phone": opted_out_phone},
-        {"name": "Valid Lead", "phone": valid_phone},
-    ])
+    targets = [
+        {"name": "Customer 1", "phone": phone_ok},
+        {"name": "Customer 2", "phone": phone_optout},
+    ]
+    cid = db.create_campaign("Winter Offer", None, targets)
     db.set_campaign_status(cid, "running")
 
-    with patch("vapi.configured", return_value=True), patch("vapi.create_call", new_callable=AsyncMock) as mock_vapi:
-        mock_vapi.return_value = {"id": "call_12345"}
-        # Run campaign
+    with patch("vapi.configured", return_value=True), patch("vapi.create_call", new_callable=AsyncMock) as mock_call:
+        mock_call.return_value = {"id": "call-123"}
         await main._run_campaign(cid)
 
-        # Only the valid target should have been dialed
-        assert mock_vapi.call_count == 1
-        dialed_phone = mock_vapi.call_args[0][0]
-        assert dialed_phone == valid_phone
+        # Verify only the active contact was dialed
+        assert mock_call.call_count == 1
+        assert mock_call.call_args[0][0] == phone_ok
 
-    targets = db.get_campaign_targets(cid)
-    t_opt = next(t for t in targets if t["phone"] == opted_out_phone)
-    t_val = next(t for t in targets if t["phone"] == valid_phone)
-
-    assert t_opt["status"] == "opted_out"
-    assert "suppression" in t_opt["error"].lower() or "opted out" in t_opt["error"].lower()
-    assert t_val["status"] == "called"
+    # Target table shows opted_out status for suppressed phone
+    with db.connect() as conn:
+        rows = conn.execute("SELECT phone, status FROM campaign_targets WHERE campaign_id = ?", (cid,)).fetchall()
+        st_map = {r[0]: r[1] for r in rows}
+        assert st_map[phone_ok] == "called"
+        assert st_map[phone_optout] == "opted_out"
 
 
 @pytest.mark.anyio
@@ -164,10 +191,18 @@ async def test_resubscribe_start_keyword_restores_service(kw):
 
 
 def test_opt_out_normalizes_phone_across_formats():
-    """Opt-out suppression matches numbers across local, international, and spaced formats."""
-    # Opt out with spaced format
-    db.opt_out("09876543210")
-    # Must match canonical 919876543210 and with + prefix
-    assert db.is_opted_out("919876543210") is True
-    assert db.is_opted_out("+91 98765 43210") is True
+    """Opt-out suppression matches numbers across local, international, and @c.us variants."""
+    # Stored via +91 with spaces
+    db.opt_out("+91 98765 43210")
+
+    # Only 1 normalized row must be in the DB
+    with db.connect() as conn:
+        rows = conn.execute("SELECT phone FROM opt_outs").fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == "919876543210"
+
+    # All variants hit the same row
+    assert db.is_opted_out("09876543210") is True
+    assert db.is_opted_out("+919876543210") is True
+    assert db.is_opted_out("919876543210@c.us") is True
     assert db.is_opted_out("9876543210") is True

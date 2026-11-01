@@ -356,6 +356,62 @@ async def whatsapp_web_incoming(
     return {"ok": True}
 
 
+@app.get("/api/whatsapp/status")
+async def whatsapp_status(request: Request) -> dict:
+    """Auth-protected status endpoint for WhatsApp connection status."""
+    auth.require_auth(request)
+    provider = whatsapp.PROVIDER
+    bridge_reachable = False
+    qr_state = "none"
+
+    if provider == "web":
+        try:
+            st = await whatsapp_web.status()
+            s_status = st.get("status")
+            if s_status == "offline":
+                bridge_reachable = False
+                qr_state = "offline"
+            else:
+                bridge_reachable = True
+                if s_status in ("ready", "connected"):
+                    qr_state = "scanned"
+                elif st.get("qr") or s_status == "qr":
+                    qr_state = "waiting"
+                else:
+                    qr_state = s_status or "none"
+        except Exception:
+            bridge_reachable = False
+            qr_state = "offline"
+    else:
+        bridge_reachable = True
+        qr_state = "scanned" if whatsapp.configured() else "none"
+
+    last_incoming_time = None
+    with db.connect() as conn:
+        row = conn.execute("SELECT MAX(created_at) FROM messages WHERE sender = 'them'").fetchone()
+        if row and row[0]:
+            last_incoming_time = row[0]
+
+    return {
+        "provider": provider,
+        "bridge_reachable": bridge_reachable,
+        "qr_state": qr_state,
+        "last_incoming_time": last_incoming_time,
+    }
+
+
+@app.post("/api/whatsapp/allowlist")
+def allowlist_add(request: Request, phone: str = Body(..., embed=True)) -> dict:
+    auth.require_auth(request)
+    return {"allowlist": db.add_to_allowlist(phone)}
+
+
+@app.delete("/api/whatsapp/allowlist/{phone}")
+def allowlist_remove(request: Request, phone: str) -> dict:
+    auth.require_auth(request)
+    return {"allowlist": db.remove_from_allowlist(phone)}
+
+
 @app.get("/api/whatsapp/link")
 async def whatsapp_link() -> dict:
     """Connection state for the dashboard: whether a QR needs scanning."""
@@ -1015,13 +1071,14 @@ async def web_call_ticket(request: Request) -> dict:
 
     # Owner/assistant mode verification: Host header and IP must both be loopback
     if mode in ("assistant", "owner"):
+        loopback_set = _get_loopback_set()
         host_hdr = request.headers.get("host", "").split(":")[0].strip().lower()
-        is_host_loopback = host_hdr in _LOOPBACK
+        is_host_loopback = host_hdr in loopback_set
         fwd = request.headers.get("x-forwarded-for", "")
         is_direct_local = (
-            client_ip in _LOOPBACK
+            client_ip in loopback_set
             and is_host_loopback
-            and (not fwd or all(p.strip() in _LOOPBACK for p in fwd.split(",")))
+            and (not fwd or all(p.strip() in loopback_set for p in fwd.split(",")))
         )
         if not is_direct_local:
             auth_header = request.headers.get("authorization", "")
@@ -1185,7 +1242,16 @@ async def web_call(ws: WebSocket) -> None:
 
 _finalizing: set[asyncio.Task] = set()
 
-_LOOPBACK = {"127.0.0.1", "::1", "localhost", "testclient", "testserver"}
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+def _get_loopback_set() -> set[str]:
+    """In production, strictly loopback addresses (127.0.0.1, ::1, localhost).
+    testclient/testserver are excluded from production.
+    """
+    if os.getenv("ENV", "").lower() == "production":
+        return _LOOPBACK
+    return {"127.0.0.1", "::1", "localhost", "testclient", "testserver"}
 
 
 async def _owner_ok(ws: WebSocket) -> bool:
@@ -1197,11 +1263,12 @@ async def _owner_ok(ws: WebSocket) -> bool:
     the first message MUST carry a valid session token.
     Private/Docker addresses do NOT grant owner mode by themselves.
     """
+    loopback_set = _get_loopback_set()
     host_hdr = ws.headers.get("host", "").split(":")[0].strip().lower()
-    is_host_loopback = host_hdr in _LOOPBACK
+    is_host_loopback = host_hdr in loopback_set
     real_ip = webcall_gate.get_real_client_ip(ws)
     fwd = ws.headers.get("x-forwarded-for", "")
-    if real_ip in _LOOPBACK and is_host_loopback and (not fwd or all(p.strip() in _LOOPBACK for p in fwd.split(","))):
+    if real_ip in loopback_set and is_host_loopback and (not fwd or all(p.strip() in loopback_set for p in fwd.split(","))):
         return True
 
     if not assistant_auth.auth_manager.is_pin_configured():

@@ -124,7 +124,7 @@ def test_started_chat_is_answered_by_the_chosen_agent_with_its_goal(monkeypatch)
     assert sent == [("919876543210", "Namaste, payment ke baare mein")]
     assert db.conversation_brief("919876543210") == {"agent_id": collector["id"],
                                                      "goal": "collect the pending Rs 4800"}
-    assert db.auto_reply_block("919876543210") is None  # allowlist was extended
+    assert db.auto_reply_block("919876543210") is not None  # outbound-by-name does NOT extend allowlist
 
     # Their reply is answered by Collections, steering toward the goal.
     seen = {}
@@ -260,10 +260,22 @@ def test_auto_reply_settings_change_settings_and_send_nothing(monkeypatch):
     _wa(monkeypatch)
     db.set_allowlist(["9000000001"])
     ctx = {"owner": True, "_turn": 1}
+    # Turn 1: confirmation guard prompts the owner
     out = _run("auto_reply_settings", {"action": "allow", "phone": "99999 00001"}, ctx)
-    assert "Ho gaya" in out and not sent
+    assert "NOT SENT YET" in out or "pakka" in out
+    # Turn 2: owner says yes -> applied
+    ctx["_turn"] = 2
+    out2 = _run("auto_reply_settings", {"action": "allow", "phone": "99999 00001"}, ctx)
+    assert "Ho gaya" in out2 and not sent
     assert db.auto_reply_block("919999900001") is None
-    _run("auto_reply_settings", {"action": "block", "phone": "99999 00001"}, ctx)
+
+    # Block also uses confirmation guard
+    ctx["_turn"] = 3
+    out3 = _run("auto_reply_settings", {"action": "block", "phone": "99999 00001"}, ctx)
+    assert "NOT SENT YET" in out3 or "pakka" in out3
+    ctx["_turn"] = 4
+    out4 = _run("auto_reply_settings", {"action": "block", "phone": "99999 00001"}, ctx)
+    assert "Ho gaya" in out4
     assert db.auto_reply_block("919999900001") is not None
     assert db.get_allowlist()  # never emptied — empty would mean "reply to everyone"
     assert "Only these numbers" in _run("auto_reply_settings", {"action": "status"}, ctx)

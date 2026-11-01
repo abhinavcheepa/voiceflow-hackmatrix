@@ -171,6 +171,7 @@ def test_4_worker_persistence_and_atomic_claim():
 def test_5_pause_resume_enforcement():
     print("\n--- TEST 5: System pause/resume controls enforcement ---")
     headers = {"Authorization": f"Bearer {auth.API_TOKEN}"}
+    db.add_to_allowlist("+919999900001")
 
     # Pause automation via /api/system/controls
     r_pause = client.post(

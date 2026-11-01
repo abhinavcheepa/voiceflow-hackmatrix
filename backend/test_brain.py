@@ -126,7 +126,8 @@ def test_pending_replies_ignores_old_messages():
     assert not [r for r in db.pending_replies() if r["phone"] == phone]
 
 
-def test_reply_needs_all_three_switches():
+def test_reply_needs_all_three_switches(monkeypatch):
+    monkeypatch.setenv('AUTO_REPLY_MODE', 'all')
     """Global, allowlist and per-thread must all agree before the agent speaks —
     this is what keeps a personal number from answering friends."""
     db.init()
@@ -194,7 +195,8 @@ def test_a_call_can_be_ended_after_it_was_opened():
     assert row["started_at"] == "2026-01-01T00:00:00+00:00", row
 
 
-def test_blocked_reply_says_which_switch_stopped_it():
+def test_blocked_reply_says_which_switch_stopped_it(monkeypatch):
+    monkeypatch.setenv('AUTO_REPLY_MODE', 'all')
     """Three switches can each stop a reply. Silence about which one is the bug.
 
     "WhatsApp isn't replying" cost hours more than once because nothing in the

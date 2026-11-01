@@ -257,3 +257,18 @@ def test_wa_bridge_incoming_ignores_allow_unsigned_in_production(monkeypatch):
     res = client.post("/api/whatsapp/web/incoming", json=payload)
     assert res.status_code == 401
     assert "unset" in res.json()["detail"].lower()
+
+
+def test_production_loopback_excludes_testclient_and_testserver(monkeypatch):
+    """In production (ENV=production), testserver/testclient are excluded from _LOOPBACK set."""
+    monkeypatch.setenv("ENV", "production")
+    client = TestClient(app)
+    # Even if peer IP is 127.0.0.1, Host: testserver is not in production loopback set
+    with patch("webcall_gate.get_real_client_ip", return_value="127.0.0.1"):
+        res = client.post("/api/web-call/ticket?mode=assistant")
+        assert res.status_code == 403
+        assert "session token" in res.json()["detail"].lower()
+
+        # True loopback Host 127.0.0.1 is accepted
+        res_ok = client.post("/api/web-call/ticket?mode=assistant", headers={"Host": "127.0.0.1"})
+        assert res_ok.status_code == 200

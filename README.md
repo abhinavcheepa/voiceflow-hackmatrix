@@ -60,9 +60,44 @@ is live. Stop everything with `.\start.ps1 -Stop`.
 Open **http://localhost:5174/app**.
 
 ### Connect WhatsApp (Local Web Bridge)
-1. In `.env`: set `WHATSAPP_PROVIDER=web` and `BRIDGE_SECRET=your_strong_secret_32_chars`.
-2. Start containers: `docker compose up -d` and open `http://localhost:8000/app/whatsapp` (or scan QR in bridge log).
-3. Scan the QR code once with WhatsApp on your phone — messages and voice notes now sync automatically.
+
+> [!WARNING]
+> **Spare Number Required:** Always use a dedicated business SIM or spare number with WhatsApp Web automation. Do **not** link your primary personal phone number. WhatsApp Web automation carries a risk of temporary or permanent phone number flags from Meta anti-spam systems.
+
+The web bridge listens on port **8100** by default (`wa-bridge/index.js`, started via `npm start`).
+
+#### Mode A: Docker Compose (Production)
+- **Environment variables in `.env`:**
+  - `WHATSAPP_PROVIDER=web`
+  - `BRIDGE_SECRET=your_strong_secret_32_chars`
+- **Network routing in `docker-compose.yml`:**
+  - `backend` container connects to: `WA_BRIDGE_URL=http://wa-bridge:8100`
+  - `wa-bridge` container routes to: `BACKEND_URL=http://backend:8000`
+- **Run & Link:**
+  1. `docker compose up -d`
+  2. Open **`http://localhost:5174/app/whatsapp`** (served by Caddy).
+  3. Scan the QR code with WhatsApp (*Settings &rarr; Linked Devices &rarr; Link a Device*) or view terminal QR via `docker compose logs -f wa-bridge`.
+
+#### Mode B: Local Run without Docker (Development)
+- **1. Start Web Bridge (`wa-bridge/index.js`):**
+  ```bash
+  cd wa-bridge
+  # Environment
+  export BRIDGE_PORT=8100
+  export BACKEND_URL=http://127.0.0.1:8000
+  export BRIDGE_SECRET=your_strong_secret_32_chars
+  npm start
+  ```
+- **2. Start Backend (`backend/`):**
+  ```bash
+  cd backend
+  export WHATSAPP_PROVIDER=web
+  export WA_BRIDGE_URL=http://127.0.0.1:8100
+  export BRIDGE_SECRET=your_strong_secret_32_chars
+  uvicorn main:app --port 8000
+  ```
+- **3. Start Frontend & Link:**
+  Open **`http://localhost:5174/app/whatsapp`** to view connection status and scan the QR code.
 
 
 <details>

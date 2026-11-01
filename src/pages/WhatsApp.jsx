@@ -144,6 +144,7 @@ function Bubble({ m }) {
 export default function WhatsApp() {
   const { data: conversations, error, reload } = useApi("/api/conversations", [], 5000);
   const { data: link, reload: reloadLink } = useApi("/api/whatsapp/link", null, 5000);
+  const { data: waStatus, reload: reloadWaStatus } = useApi("/api/whatsapp/status", null, 5000);
   const { data: autoReply, reload: reloadAuto } = useApi("/api/whatsapp/auto-reply", null, 0);
   const [activeId, setActiveId] = useState(null);
   const [draft, setDraft] = useState("");
@@ -250,6 +251,26 @@ export default function WhatsApp() {
               >
                 <RefreshCw className={`size-3.5 ${importing ? "animate-spin" : ""}`} />
               </button>
+            )}
+          </div>
+          {/* Bridge & Provider Status */}
+          <div className="mt-3 flex flex-wrap items-center gap-1.5 text-[10px]">
+            <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-medium ${
+              waStatus?.bridge_reachable ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" : "bg-rose-500/10 text-rose-400 border border-rose-500/20"
+            }`}>
+              <span className={`size-1.5 rounded-full ${waStatus?.bridge_reachable ? "bg-emerald-400" : "bg-rose-400"}`} />
+              Bridge: {waStatus?.bridge_reachable ? "Online" : "Offline"}
+            </span>
+            <span className="px-2 py-0.5 rounded-full bg-panel-2 text-dim border border-line">
+              Provider: {waStatus?.provider || "web"}
+            </span>
+            <span className="px-2 py-0.5 rounded-full bg-panel-2 text-dim border border-line">
+              QR: {waStatus?.qr_state || "none"}
+            </span>
+            {waStatus?.last_incoming_time && (
+              <span className="px-2 py-0.5 rounded-full bg-panel-2 text-dim border border-line" title={waStatus.last_incoming_time}>
+                Last In: {new Date(waStatus.last_incoming_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              </span>
             )}
           </div>
           {imported && (

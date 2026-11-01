@@ -538,10 +538,11 @@ def _owner_schemas() -> list[dict]:
             "agent_name": {"type": "string", "enum": agents, "description": "Which agent talks. Default: the default agent"}},
            ["phone", "goal", "opening_message"]),
         fn("auto_reply_settings",
-           "Control which WhatsApp numbers the agent answers automatically. allow = the agent "
-           "replies to this person; block = stop replying to them; status = what is set; "
+           "Control which WhatsApp numbers the agent answers automatically. allow = add to allowlist; "
+           "remove/block = remove from allowlist / stop replying; status = view current allowlist; "
            "all_on/all_off = master switch. Changes settings only — sends nothing.",
-           {"action": {"type": "string", "enum": ["allow", "block", "status", "all_on", "all_off"]},
+           {"action": {"type": "string", "enum": ["allow", "remove", "block", "status", "all_on", "all_off"]},
+            "name": person,
             "phone": phone},
            ["action"]),
         fn("find_contact", "Look up a saved person's WhatsApp number by name.",
@@ -860,34 +861,37 @@ def _recent_activity(args: dict, ctx: dict) -> str:
 
 
 def _auto_reply_settings(args: dict, ctx: dict) -> str:
-    """Who the agent answers on WhatsApp. Pure settings — nothing is sent.
-
-    The owner once asked to "allow this number" and, with no tool for it, the
-    model "set it up" by messaging that number instead.
-    """
+    """Who the agent answers on WhatsApp. Pure settings — nothing is sent."""
+    import os
     action = args.get("action") or "status"
     if action == "status":
         allow = db.get_allowlist()
-        return ("Auto-reply is " + ("ON" if db.auto_reply_global() else "OFF") + " overall. "
+        mode = os.getenv("AUTO_REPLY_MODE", "allowlist").strip().lower()
+        return ("Auto-reply is " + ("ON" if db.auto_reply_global() else "OFF") + f" overall (mode: {mode}). "
                 + (f"Only these numbers get replies: {', '.join(_spoken(db.normalize_phone(a)) for a in allow)}."
-                   if allow else "Every number gets replies (no allowlist)."))
+                   if allow else ("No numbers in allowlist (nobody gets replies)." if mode == "allowlist" else "Every number gets replies (no allowlist).")))
     if action in ("all_on", "all_off"):
         db.set_auto_reply_global(action == "all_on")
         return "Ho gaya — auto-reply ab sabke liye " + ("chalu" if action == "all_on" else "band") + " hai."
     phone, who, bad = _resolve(args, ctx)
     if bad:
         return bad
-    if action == "allow":
-        allow = db.get_allowlist()
-        if allow and not db.allowed(phone):
-            db.set_allowlist([*allow, phone])
-        db.set_thread_auto_reply(phone, True)
+    if action in ("allow", "add"):
+        ask = f"{who} ko allowlist mein jodna hai — pakka?"
+        if gate := _confirm(ctx, "auto_reply_settings", args, f"allowlist:allow:{phone}", ask):
+            return gate
+        db.add_to_allowlist(phone)
+        db.set_auto_reply_for(phone, True)
         note = "" if db.auto_reply_global() else " Lekin auto-reply abhi sabke liye band hai — chalu karna ho to boliye."
         return f"Ho gaya — {who} ke messages ka jawab ab agent khud dega.{note}"
-    # "block": switch this thread off. The allowlist is left alone on purpose —
-    # removing its last number would empty it, and an empty list means EVERYONE.
-    db.set_thread_auto_reply(phone, False)
-    return f"Ho gaya — {who} ko ab agent jawab nahi dega; wo aapke liye rukega."
+    if action in ("remove", "block", "hatao"):
+        ask = f"{who} ko allowlist se hatana hai — pakka?"
+        if gate := _confirm(ctx, "auto_reply_settings", args, f"allowlist:remove:{phone}", ask):
+            return gate
+        db.remove_from_allowlist(phone)
+        db.set_auto_reply_for(phone, False)
+        return f"Ho gaya — {who} ko ab agent jawab nahi dega; wo aapke liye rukega."
+    return f"Unknown action '{action}'." 
 
 
 _OWNER_HANDLERS = {

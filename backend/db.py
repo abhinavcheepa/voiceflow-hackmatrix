@@ -734,28 +734,66 @@ def _digits(s: str) -> str:
 
 def get_allowlist() -> list[str]:
     raw = get_setting(ALLOWLIST_KEY, "")
-    return [n for n in (_digits(p) for p in raw.split(",")) if n]
+    nums = [normalize_phone(p) for p in raw.split(",") if p.strip()]
+    seen = set()
+    res = []
+    for n in nums:
+        if n and n not in seen:
+            seen.add(n)
+            res.append(n)
+    return res
 
 
 def set_allowlist(numbers: list[str]) -> list[str]:
-    cleaned = [n for n in (_digits(p) for p in numbers) if n]
+    cleaned = []
+    seen = set()
+    for p in numbers:
+        norm = normalize_phone(p)
+        if norm and norm not in seen:
+            seen.add(norm)
+            cleaned.append(norm)
     set_setting(ALLOWLIST_KEY, ",".join(cleaned))
     return cleaned
 
 
-def allowed(phone: str) -> bool:
-    """Empty allowlist means everyone — normal for a business number.
+def add_to_allowlist(phone: str) -> list[str]:
+    norm = normalize_phone(phone)
+    current = get_allowlist()
+    if norm and norm not in current:
+        current.append(norm)
+        set_allowlist(current)
+    return current
 
-    Set it when the agent runs on a number that also carries personal chats,
-    so friends don't get answered by a bot.
+
+def remove_from_allowlist(phone: str) -> list[str]:
+    norm = normalize_phone(phone)
+    current = [n for n in get_allowlist() if n != norm]
+    set_allowlist(current)
+    return current
+
+
+def allowed(phone: str) -> bool:
+    """Check whether phone is permitted to receive an automated reply.
+
+    AUTO_REPLY_MODE: 'allowlist' | 'all', default 'allowlist'.
+    In allowlist mode (default), auto-reply goes ONLY to numbers on the allowlist.
+    In 'all' mode, empty allowlist means everyone receives auto-replies.
     """
+    mode = os.getenv("AUTO_REPLY_MODE", "allowlist").strip().lower()
     allow = get_allowlist()
+    norm = normalize_phone(phone)
+    if not norm:
+        return False
+    if mode == "all":
+        if not allow:
+            return True
+        tail = norm[-10:] if len(norm) >= 10 else norm
+        return norm in allow or any((a[-10:] if len(a) >= 10 else a) == tail for a in allow)
+    # Default: allowlist mode
     if not allow:
-        return True
-    # Compare on the last 10 digits: the same person appears as 9812345678,
-    # 919812345678 and +91 98123 45678 depending on where the number came from.
-    tail = _digits(phone)[-10:]
-    return any(a[-10:] == tail for a in allow)
+        return False
+    tail = norm[-10:] if len(norm) >= 10 else norm
+    return norm in allow or any((a[-10:] if len(a) >= 10 else a) == tail for a in allow)
 
 
 def auto_reply_global() -> bool:
@@ -777,8 +815,14 @@ def set_auto_reply_for(phone: str, enabled: bool) -> None:
 
 
 def auto_reply_block(phone: str) -> str | None:
+    # 1. Suppression list always beats allowlist
     if is_opted_out(phone):
         return f"{phone} has opted out (suppression list)"
+
+    # 2. Groups, broadcasts, status updates are never auto-replied
+    raw_lower = (phone or "").lower()
+    if "@g.us" in raw_lower or "-g.us" in raw_lower or "@broadcast" in raw_lower or "@newsletter" in raw_lower or raw_lower == "status@broadcast":
+        return f"{phone} is a group, broadcast, or status update"
     """Why this number gets no auto-reply, or None if it does.
 
     Three switches can each stop a reply, and for a long time all three failed
@@ -1791,8 +1835,7 @@ def assign_conversation(phone: str, agent_id: int | None, goal: str, name: str |
             "UPDATE conversations SET agent_id = ?, goal = ?, auto_reply = 1 WHERE phone = ?",
             (agent_id, goal or None, phone),
         )
-    if get_allowlist() and not allowed(phone):
-        set_allowlist([*get_allowlist(), phone])
+# Outbound-by-name does NOT add to allowlist
 
 
 def conversation_brief(phone: str) -> dict:

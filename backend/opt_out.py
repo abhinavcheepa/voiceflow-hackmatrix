@@ -11,16 +11,21 @@ import re
 
 log = logging.getLogger("voiceflow.opt_out")
 
+# Unambiguous opt-out keywords (whole message match only, no substrings).
+# Ambiguous words like 'cancel', 'end', 'halt', 'nahi chahiye', 'rok do' are excluded
+# to avoid misinterpreting conversational phrases like "cancel my appointment"
+# or "nahi chahiye receipt".
 OPTOUT_KEYWORDS = {
     # English
-    "stop", "unsubscribe", "cancel", "end", "quit", "optout", "opt-out", "halt",
+    "stop", "unsubscribe", "quit", "optout", "opt-out",
     # Hinglish
-    "band karo", "band kar do", "band kr do", "mat bhejo", "rok do", "message mat bhejo",
-    "msg mat bhejo", "msg mat karo", "nahi chahiye", "kripya band karein", "kripya band karo",
+    "band karo", "band kar do", "band kr do", "mat bhejo", "message mat bhejo",
+    "msg mat bhejo", "msg mat karo", "kripya band karein", "kripya band karo",
     # Hindi (Devanagari)
-    "रुको", "बंद करो", "मत भेजो", "रोक दो", "समाप्त", "संदेश मत भेजो", "बंद कर दीजिए", "रोकें"
+    "रुको", "बंद करो", "मत भेजो", "समाप्त", "संदेश मत भेजो", "बंद कर दीजिए", "रोकें"
 }
 
+# Unambiguous resubscribe keywords (whole message match only).
 RESUBSCRIBE_KEYWORDS = {
     # English
     "start", "unstop", "subscribe", "resume",
@@ -50,26 +55,20 @@ def _clean_text(text: str) -> str:
 
 
 def is_opt_out_keyword(text: str) -> bool:
-    """Return True if incoming message expresses an unsubscribe / STOP intent."""
+    """Return True if incoming message strictly matches an unsubscribe / STOP keyword.
+    
+    Matches the entire normalized message, preventing false positives on sentences
+    like 'cancel my appointment' or 'nahi chahiye receipt'.
+    """
     clean = _clean_text(text)
     if not clean:
         return False
-    if clean in OPTOUT_KEYWORDS:
-        return True
-    for kw in OPTOUT_KEYWORDS:
-        if clean == kw or clean.startswith(kw + " ") or clean.endswith(" " + kw):
-            return True
-    return False
+    return clean in OPTOUT_KEYWORDS
 
 
 def is_resubscribe_keyword(text: str) -> bool:
-    """Return True if incoming message expresses a resubscribe / START intent."""
+    """Return True if incoming message strictly matches a resubscribe / START keyword."""
     clean = _clean_text(text)
     if not clean:
         return False
-    if clean in RESUBSCRIBE_KEYWORDS:
-        return True
-    for kw in RESUBSCRIBE_KEYWORDS:
-        if clean == kw or clean.startswith(kw + " ") or clean.endswith(" " + kw):
-            return True
-    return False
+    return clean in RESUBSCRIBE_KEYWORDS
