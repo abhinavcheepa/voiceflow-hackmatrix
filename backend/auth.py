@@ -39,6 +39,8 @@ _OPEN_PATHS = frozenset({
     "/api/whatsapp/webhook",      # Verified via Meta verify token / signature
     "/api/whatsapp/web/incoming", # Verified via X-Bridge-Token
     "/api/web-call/ticket",       # Guarded by webcall_gate based on WEBCALL_PUBLIC
+    "/api/assistant/auth",        # Authenticated via ASSISTANT_PIN in assistant_auth
+    "/api/assistant/status",      # Verified via session token in assistant_auth
 })
 
 _OPEN_PREFIXES: tuple[str, ...] = ()

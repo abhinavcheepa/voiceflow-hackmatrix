@@ -58,6 +58,7 @@ import webcall_gate  # noqa: E402
 import whatsapp  # noqa: E402
 import whatsapp_web  # noqa: E402
 import adaptive  # noqa: E402
+import assistant_auth  # noqa: E402
 import auth
 from auth import TokenAuthMiddleware  # noqa: E402
 import events  # noqa: E402
@@ -109,6 +110,7 @@ async def startup() -> None:
     if auth.IS_PROD and not auth.API_TOKEN:
         raise RuntimeError("FATAL: API_TOKEN must be configured when ENV=production")
     db.init()
+    assistant_auth.auth_manager.check_startup()
     # Anything that arrived while we were down, or whose reply threw, still
     # deserves an answer — once now, then on a timer.
     asyncio.create_task(whatsapp.answer_pending())
@@ -1107,27 +1109,93 @@ async def _owner_ok(ws: WebSocket) -> bool:
     so it is not open to whoever reaches the port.
 
     On this machine (directly, or through the Vite proxy from this machine):
-    yes. From anywhere else — a phone on the Wi-Fi — the first message must
-    carry ASSISTANT_PIN; with no PIN configured, remote use is refused.
+    yes. From anywhere else ? a phone on the Wi-Fi ? the first message must
+    carry a valid session token or ASSISTANT_PIN; with no PIN configured, remote use is refused.
     """
     origin = ws.client.host if ws.client else ""
-    # X-Forwarded-For is only believed when the hop itself is local (our Vite
-    # proxy); from anyone else it's a header they could simply type.
     fwd = ws.headers.get("x-forwarded-for", "")
     if origin in _LOOPBACK and fwd:
         origin = fwd.split(",")[0].strip()
     if origin in _LOOPBACK:
         return True
-    pin = os.getenv("ASSISTANT_PIN", "")
-    if not pin:
+
+    if not assistant_auth.auth_manager.is_pin_configured():
+        log.warning("Remote assistant connection rejected: ASSISTANT_PIN is unset, invalid, or default.")
         return False
+
     try:
         first = await asyncio.wait_for(ws.receive_json(), timeout=15)
     except Exception:  # noqa: BLE001 - timeout, bad json, disconnect: all a no
         return False
-    import hmac
 
-    return first.get("type") == "auth" and hmac.compare_digest(str(first.get("pin", "")), pin)
+    if not isinstance(first, dict) or first.get("type") != "auth":
+        return False
+
+    # 1. Session token authentication
+    token = first.get("token")
+    if token:
+        token_str = str(token).strip()
+        if assistant_auth.auth_manager.verify_session_token(token_str):
+            return True
+        if hasattr(ws, "send_json"):
+            await ws.send_json({"type": "error", "text": assistant_auth.GENERIC_ERROR_MESSAGE, "retry_after": 5})
+        return False
+
+    # 2. PIN authentication
+    candidate_pin = first.get("pin")
+    client_ip = origin or "unknown"
+    identity = first.get("identity") or first.get("phone")
+
+    success, session_token, retry_after, error_msg = assistant_auth.auth_manager.authenticate(
+        str(candidate_pin) if candidate_pin is not None else None,
+        ip=client_ip,
+        identity=str(identity) if identity else None,
+    )
+
+    if success:
+        if hasattr(ws, "send_json"):
+            await ws.send_json(
+                {"type": "authenticated", "token": session_token, "expires_in": assistant_auth.SESSION_TTL_SECONDS}
+            )
+        return True
+
+    if hasattr(ws, "send_json"):
+        await ws.send_json({"type": "error", "text": error_msg, "retry_after": retry_after})
+    return False
+
+@app.post("/api/assistant/auth")
+async def assistant_auth_endpoint(request: Request, payload: dict = Body(...)) -> dict:
+    """Exchange ASSISTANT_PIN for a short-lived random session token."""
+    client_ip = webcall_gate.get_real_client_ip(request)
+    pin = payload.get("pin")
+    identity = payload.get("identity") or payload.get("phone")
+    success, token, retry_after, error_msg = assistant_auth.auth_manager.authenticate(
+        pin, ip=client_ip, identity=str(identity) if identity else None
+    )
+    if not success:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": error_msg, "retry_after": retry_after},
+            headers={"Retry-After": str(retry_after)},
+        )
+    return {
+        "status": "ok",
+        "token": token,
+        "expires_in": assistant_auth.SESSION_TTL_SECONDS,
+    }
+
+
+@app.get("/api/assistant/status")
+async def assistant_status_endpoint(request: Request, authorization: str | None = Header(default=None)) -> dict:
+    """Check whether remote assistant features are enabled and verify token."""
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:].strip()
+    return {
+        "remote_enabled": assistant_auth.auth_manager.is_pin_configured(),
+        "token_valid": assistant_auth.auth_manager.verify_session_token(token) if token else False,
+    }
+
 
 
 async def _finalize(session) -> None:

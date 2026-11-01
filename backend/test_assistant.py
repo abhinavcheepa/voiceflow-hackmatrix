@@ -165,10 +165,10 @@ def test_assistant_access(monkeypatch):
     # Someone hitting the port directly can't claim to be local.
     assert not ok(FakeWS("192.168.1.9", {"x-forwarded-for": "127.0.0.1"}))
 
-    monkeypatch.setenv("ASSISTANT_PIN", "4321")
+    monkeypatch.setenv("ASSISTANT_PIN", "432100")
     phone = {"x-forwarded-for": "192.168.1.9"}
-    assert ok(FakeWS("127.0.0.1", phone, {"type": "auth", "pin": "4321"}))
-    assert not ok(FakeWS("127.0.0.1", phone, {"type": "auth", "pin": "0000"}))
+    assert ok(FakeWS("127.0.0.1", phone, {"type": "auth", "pin": "432100"}))
+    assert not ok(FakeWS("127.0.0.1", phone, {"type": "auth", "pin": "000000"}))
     assert not ok(FakeWS("127.0.0.1", phone, None))
 
 
