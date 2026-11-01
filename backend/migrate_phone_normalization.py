@@ -238,6 +238,9 @@ def plan_and_migrate(db_path: str, dry_run: bool = True) -> dict:
                     update_conv_fields["assigned"] = pick_conv_attr("assigned")
                 if "goal" in conv_cols:
                     update_conv_fields["goal"] = pick_conv_attr("goal")
+                if "needs_reply" in conv_cols:
+                    nr_vals = [r["needs_reply"] for r in rows if r["needs_reply"] is not None]
+                    update_conv_fields["needs_reply"] = 1 if (1 in nr_vals or True in nr_vals) else 0
                 if "updated_at" in conv_cols:
                     all_updated = [r["updated_at"] for r in rows if r["updated_at"]]
                     update_conv_fields["updated_at"] = max(all_updated) if all_updated else survivor["updated_at"]

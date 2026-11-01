@@ -963,18 +963,18 @@ async def web_call(ws: WebSocket) -> None:
         await ws.close(code=webcall_gate.WS_CLOSE_FORBIDDEN_ORIGIN)
         return
 
-    # 2. Daily budget check
-    if not await webcall_gate.gate.check_budget_ok():
+    # 2. Daily budget check (global and per-IP)
+    if not await webcall_gate.gate.check_budget_ok(client_ip):
         await ws.close(code=webcall_gate.WS_CLOSE_BUDGET_EXCEEDED)
         return
 
-    # 3. Rate limit check
-    if not await webcall_gate.gate.check_rate_limit(client_ip):
+    # 3. WS connect rate limit check (separate from ticket-issue rate limit)
+    if not await webcall_gate.gate.check_ws_rate_limit(client_ip):
         await ws.close(code=webcall_gate.WS_CLOSE_RATE_LIMITED)
         return
 
-    # 4. Ticket verification
-    ticket_token = ws.query_params.get("ticket")
+    # 4. Ticket verification (subprotocol or first message ONLY - never from query string)
+    ticket_token = None
     subprotocol_selected = None
     protocols = ws.headers.get("sec-websocket-protocol", "").split(",")
     for proto in protocols:
@@ -1013,12 +1013,15 @@ async def web_call(ws: WebSocket) -> None:
     session = webcall.Session(int(agent_id) if agent_id else None,
                               caller_key=ws.query_params.get("caller"), assistant=assistant)
 
+    slot_acquired = False
     # 5. Concurrent slot acquisition
     if not await webcall_gate.gate.acquire_slot(session.id, client_ip):
         await ws.close(code=webcall_gate.WS_CLOSE_SERVER_BUSY)
         return
+    slot_acquired = True
 
     call_start_time = time.time()
+    frame_times: list[float] = []
     session.open_record()
     await ws.send_json(
         {"type": "connected", "callId": session.id, "agent": session.agent.get("name", "")}
@@ -1044,6 +1047,19 @@ async def web_call(ws: WebSocket) -> None:
 
             if message.get("type") == "websocket.disconnect":
                 break
+
+            if (time.time() - call_start_time) > webcall_gate.MAX_WEBCALL_DURATION_SECONDS:
+                await ws.send_json({"type": "ended", "reason": "duration_limit"})
+                await ws.close(code=webcall_gate.WS_CLOSE_DURATION_EXCEEDED)
+                break
+
+            # Frame rate cap safeguard
+            now_frame = time.time()
+            frame_times = [t for t in frame_times if now_frame - t <= 1.0]
+            if len(frame_times) >= webcall_gate.MAX_FRAME_RATE_PER_SEC:
+                await ws.close(code=webcall_gate.WS_CLOSE_FRAME_TOO_LARGE)
+                break
+            frame_times.append(now_frame)
 
             # Frame size safeguard
             if "bytes" in message and len(message["bytes"]) > webcall_gate.MAX_FRAME_SIZE_BYTES:
@@ -1072,8 +1088,9 @@ async def web_call(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        duration_sec = time.time() - call_start_time
-        await webcall_gate.gate.release_slot(session.id, duration_sec)
+        if slot_acquired:
+            duration_sec = time.time() - call_start_time
+            await webcall_gate.gate.release_slot(session.id, client_ip, duration_sec)
         session.close_record()
         task = asyncio.create_task(_finalize(session))
         _finalizing.add(task)

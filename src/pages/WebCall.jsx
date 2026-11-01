@@ -382,7 +382,7 @@ export default function WebCall() {
       // ticket fetch fallback
     }
 
-    if (ticket) params.set("ticket", ticket);
+    // Ticket is sent via subprotocol ONLY, never in the URL query string
     const subprotocols = ticket ? ["vf-ticket." + ticket] : [];
     const socket = subprotocols.length
       ? new WebSocket(`${WS_BASE}?${params}`, subprotocols)

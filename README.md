@@ -321,3 +321,14 @@ The phone acts as your mobile dashboard and remote control. All business logic (
 - **Automation Switch**: Tap **Automation Active / Paused** in the top navigation bar to instantly freeze or resume all automated auto-replies, sweeps, and scheduled worker jobs server-wide.
 - **Live SSE Status**: The green pulsing badge indicates a live Server-Sent Events connection. When waking up your phone, the app automatically verifies connection and fetches fresh updates.
 
+
+---
+
+## WebCall Security & Architecture
+
+VoiceFlow includes an in-depth security and resource gate for browser web calls (`backend/webcall_gate.py`):
+- **Single-use Cryptographic Tickets**: Minted via `/api/web-call/ticket` (TTL 30s) and exchanged strictly via WebSocket subprotocol (`vf-ticket.<token>`) or the first JSON frame. Tickets are **never** passed in the URL query string, preventing exposure in server logs.
+- **Separate Rate Limiting**: Independent sliding windows for ticket minting and WebSocket connections.
+- **Daily Budget & Concurrency Protections**: Global call limits (10 concurrent), call duration timeouts (5 min), idle timeouts (60s), frame size limits (1MB), frame-rate caps (25 frames/s), and global / per-IP daily minute budgets.
+- **Persona Isolation**: Customer web calls run in an unprivileged context; owner-only tools (`send_whatsapp`, `auto_reply_settings`, `start_chat`) are strictly unreachable.
+- See [ARCHITECTURE.md](file:///c:/Users/PC/Desktop/all%20hacathon%20project/voiceflow-hackmatrix/ARCHITECTURE.md) for full architectural specifications, state lifecycle, and clustered scaling proposals.
