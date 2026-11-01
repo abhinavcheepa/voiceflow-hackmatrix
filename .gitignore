@@ -13,6 +13,9 @@ __pycache__/
 # wa-bridge — holds the linked WhatsApp session; leaking it hands over the number
 .session/
 .wwebjs_cache/
+.wwebjs_auth/
+wa-bridge/.wwebjs_auth/
+wa-bridge/.wwebjs_cache/
 bridge*.log
 bridge*.err
 stdout.log
@@ -20,6 +23,8 @@ stdout.log
 # local voice cloning — model weights, and the owner's voice embedding (biometric, never commit)
 backend/models/
 backend/voices/
+backend/clones/
+backend/openvoice/
 
 # runtime logs — carry customer phone numbers
 *.log
@@ -29,9 +34,13 @@ backend/mits_knowledge.md
 backend/load_mits_agent.py
 docs/MITS_FE_Faculty_Database.md
 
-# call recordings and text records — customers' voices and words
+# call recordings, uploads and patches — customers' voices, files and diffs
 backend/recordings/
+recordings/
+backend/uploads/
+uploads/
 screenshots/
 *.bak
 *.db-wal
 *.db-shm
+*.patch
