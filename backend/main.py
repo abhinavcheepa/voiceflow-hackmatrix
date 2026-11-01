@@ -1155,9 +1155,11 @@ async def assistant_auth_endpoint(request: Request, payload: dict = Body(...)) -
     """Exchange ASSISTANT_PIN for a short-lived random session token."""
     client_ip = webcall_gate.get_real_client_ip(request)
     pin = payload.get("pin")
-    identity = payload.get("identity") or payload.get("phone")
+    # Identity is strictly None on unauthenticated HTTP endpoints: unauthenticated clients
+    # cannot specify an identity (e.g. owner phone) to cause a denial-of-service/lockout against another user.
+    # Identity tracking is reserved for authenticated/tamper-proof channels (e.g. verified WhatsApp sender phone).
     success, token, retry_after, error_msg = assistant_auth.auth_manager.authenticate(
-        pin, ip=client_ip, identity=str(identity) if identity else None
+        pin, ip=client_ip, identity=None
     )
     if not success:
         return JSONResponse(

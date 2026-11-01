@@ -76,7 +76,7 @@ def test_migration_apply_merges_duplicates_and_repoints_messages(tmp_path):
     migration_db = str(tmp_path / "apply_merge.db")
     conn = sqlite3.connect(migration_db)
     conn.execute("CREATE TABLE contacts (id INTEGER PRIMARY KEY, name TEXT, phone TEXT UNIQUE, created_at TEXT, last_seen_at TEXT)")
-    conn.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY, name TEXT, phone TEXT UNIQUE, language TEXT, updated_at TEXT)")
+    conn.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY, name TEXT, phone TEXT UNIQUE, language TEXT, updated_at TEXT, auto_reply INTEGER NOT NULL DEFAULT 1)")
     conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INTEGER, sender TEXT, kind TEXT, body TEXT, created_at TEXT)")
     conn.execute("CREATE TABLE calls (id TEXT PRIMARY KEY, phone TEXT)")
 
@@ -84,9 +84,9 @@ def test_migration_apply_merges_duplicates_and_repoints_messages(tmp_path):
     conn.execute("INSERT INTO contacts VALUES (1, 'Rohan Early', '+919876543210', '2026-01-01', '2026-01-02')")
     conn.execute("INSERT INTO contacts VALUES (2, 'Rohan Late', '09876543210', '2026-01-03', '2026-01-04')")
 
-    # 2 duplicate conversations with messages
-    conn.execute("INSERT INTO conversations VALUES (10, 'Rohan Early', '+919876543210', 'Hindi', '2026-01-01')")
-    conn.execute("INSERT INTO conversations VALUES (20, 'Rohan Late', '09876543210', 'Hindi', '2026-01-05')")
+    # 2 duplicate conversations with messages (#10 has auto_reply=1, #20 has auto_reply=0)
+    conn.execute("INSERT INTO conversations VALUES (10, 'Rohan Early', '+919876543210', 'Hindi', '2026-01-01', 1)")
+    conn.execute("INSERT INTO conversations VALUES (20, 'Rohan Late', '09876543210', 'Hindi', '2026-01-05', 0)")
     conn.execute("INSERT INTO messages VALUES (101, 10, 'them', 'text', 'msg from early conv', '2026-01-01')")
     conn.execute("INSERT INTO messages VALUES (102, 20, 'them', 'text', 'msg from late conv', '2026-01-05')")
     conn.commit()
@@ -106,11 +106,12 @@ def test_migration_apply_merges_duplicates_and_repoints_messages(tmp_path):
     assert contacts[0][2] == "919876543210"
     assert contacts[0][3] == "2026-01-04"  # merged latest seen
 
-    convs = conn.execute("SELECT id, phone, updated_at FROM conversations").fetchall()
+    convs = conn.execute("SELECT id, phone, updated_at, auto_reply FROM conversations").fetchall()
     assert len(convs) == 1
     assert convs[0][0] == 10
     assert convs[0][1] == "919876543210"
     assert convs[0][2] == "2026-01-05"  # merged latest updated
+    assert convs[0][3] == 0  # auto_reply=0 wins on conflict (protective flag preserved)
 
     # Both messages must now point to conv 10
     messages = conn.execute("SELECT id, conversation_id FROM messages ORDER BY id").fetchall()

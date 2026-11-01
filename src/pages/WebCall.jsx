@@ -54,6 +54,31 @@ const store = {
   },
 };
 
+/** sessionStorage for ephemeral sensitive auth credentials (cleared on tab close). */
+const sessionStore = {
+  get: (k) => {
+    try {
+      return sessionStorage.getItem(k) ?? "";
+    } catch {
+      return "";
+    }
+  },
+  set: (k, v) => {
+    try {
+      sessionStorage.setItem(k, v);
+    } catch {
+      /* ignored */
+    }
+  },
+  remove: (k) => {
+    try {
+      sessionStorage.removeItem(k);
+    } catch {
+      /* ignored */
+    }
+  },
+};
+
 /** Stable per-browser id, so the agent remembers this caller next time. */
 function callerKey() {
   try {
@@ -371,7 +396,7 @@ export default function WebCall() {
     const key = callerKey();
     if (key) params.set("caller", key);
 
-    let sessionToken = store.get("vf_owner_token") || "";
+    let sessionToken = sessionStore.get("vf_owner_token") || "";
     if (assistant && pin) {
       try {
         const authRes = await fetch(`${API || ""}/api/assistant/auth`, {
@@ -382,7 +407,7 @@ export default function WebCall() {
         if (authRes.ok) {
           const authData = await authRes.json();
           sessionToken = authData.token || "";
-          store.set("vf_owner_token", sessionToken);
+          sessionStore.set("vf_owner_token", sessionToken);
         } else {
           const errData = await authRes.json().catch(() => ({}));
           setError(errData.detail || "Authentication failed. Invalid PIN or rate limited.");
