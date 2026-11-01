@@ -229,23 +229,95 @@ def test_assistant_add_and_remove_with_confirmation():
 
 @pytest.mark.anyio
 async def test_outbound_by_name_does_not_add_to_allowlist():
-    """Starting a chat or messaging a contact does NOT silently add them to the allowlist."""
+    """Starting a chat or messaging a contact asks 'allow auto-reply for <name> too?'
+    and ONLY adds them to the allowlist on an explicit yes."""
     db.touch_contact("919888877777", "Sunita")
     db.set_allowlist(["919000000001"])
 
     ctx = {"owner": True, "_turn": 1}
     with patch("whatsapp.send_text", new_callable=AsyncMock), \
          patch("whatsapp.configured", return_value=True):
-        # Turn 1: parks
+        # Turn 1: parks initial send
         res1 = await tools.run("start_whatsapp_chat", {"name": "Sunita", "goal": "Consultation", "opening_message": "Namaste Sunita ji"}, ctx)
         assert "NOT SENT YET" in res1
-        # Turn 2: confirms
+
+        # Turn 2: owner says yes to outbound send
         ctx["_turn"] = 2
         res2 = await tools.approve_pending(ctx)
         assert "Ho gaya" in res2
+        # Assistant asks follow-up: allow auto-reply for Sunita too?
+        assert "Allow auto-reply for Sunita" in res2
 
-    # Sunita must NOT be in the allowlist
+    # Before explicit yes, Sunita is NOT in allowlist
     assert "919888877777" not in db.get_allowlist()
+
+    # Turn 3: Owner explicitly says yes to allowlist follow-up
+    ctx["_turn"] = 3
+    res3 = await tools.approve_pending(ctx)
+    assert "Ho gaya" in res3
+    assert "jawab ab agent khud dega" in res3
+
+    # Now Sunita is in allowlist
+    assert "919888877777" in db.get_allowlist()
+
+
+def test_owner_phone_exempt_from_allowlist(monkeypatch):
+    """The owner's personal number (OWNER_PHONE) is always exempt from the allowlist."""
+    owner_num = "919999000000"
+    monkeypatch.setenv("OWNER_PHONE", "+91 99990 00000")
+    monkeypatch.setenv("AUTO_REPLY_MODE", "allowlist")
+    db.set_allowlist(["919111111111"])
+
+    # Stranger not on allowlist is blocked
+    assert db.allowed("919222222222") is False
+
+    # Owner number is exempt and allowed
+    assert db.allowed(owner_num) is True
+    assert db.auto_reply_block(owner_num) is None
+
+
+@pytest.mark.anyio
+async def test_meta_provider_path_enforces_allowlist(monkeypatch):
+    """Meta Cloud API provider path routes through whatsapp.handle() and enforces allowlist."""
+    monkeypatch.setenv("WHATSAPP_PROVIDER", "meta")
+    monkeypatch.setenv("AUTO_REPLY_MODE", "allowlist")
+    phone_allowed = "919876543210"
+    phone_blocked = "919555544444"
+    db.set_allowlist([phone_allowed])
+
+    # Meta webhook payload structure
+    meta_payload_blocked = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "WHATSAPP_BUSINESS_ACCOUNT_ID",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {"display_phone_number": "15550234567", "phone_number_id": "123456123"},
+                    "contacts": [{"profile": {"name": "Blocked Contact"}, "wa_id": phone_blocked}],
+                    "messages": [{
+                        "from": phone_blocked,
+                        "id": "wamid.META_BLOCKED_01",
+                        "timestamp": "1600000000",
+                        "text": {"body": "Inquiring about prices"},
+                        "type": "text"
+                    }]
+                },
+                "field": "messages"
+            }]
+        }]
+    }
+
+    parsed = whatsapp.parse(meta_payload_blocked)
+    assert len(parsed) == 1
+    assert parsed[0]["from"] == phone_blocked
+
+    with patch("brain.reply", new_callable=AsyncMock) as mock_llm, \
+         patch("whatsapp.send_text", new_callable=AsyncMock) as mock_send:
+        await whatsapp.handle(parsed[0])
+        # Assert LLM and send were NOT called for unallowlisted contact on Meta path
+        assert not mock_llm.called
+        assert not mock_send.called
 
 
 def test_whatsapp_status_endpoint_auth_protected(auth_headers):

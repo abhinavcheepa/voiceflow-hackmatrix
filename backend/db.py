@@ -778,12 +778,16 @@ def allowed(phone: str) -> bool:
     AUTO_REPLY_MODE: 'allowlist' | 'all', default 'allowlist'.
     In allowlist mode (default), auto-reply goes ONLY to numbers on the allowlist.
     In 'all' mode, empty allowlist means everyone receives auto-replies.
+    The owner's number (OWNER_PHONE) is always exempt from the allowlist.
     """
-    mode = os.getenv("AUTO_REPLY_MODE", "allowlist").strip().lower()
-    allow = get_allowlist()
     norm = normalize_phone(phone)
     if not norm:
         return False
+    owner = normalize_phone(os.getenv("OWNER_PHONE", ""))
+    if owner and norm == owner:
+        return True
+    mode = os.getenv("AUTO_REPLY_MODE", "allowlist").strip().lower()
+    allow = get_allowlist()
     if mode == "all":
         if not allow:
             return True

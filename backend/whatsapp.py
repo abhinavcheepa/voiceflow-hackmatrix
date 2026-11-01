@@ -58,14 +58,14 @@ class WhatsAppRateLimiter:
             if elapsed < cooldown_sec:
                 return f"per-number cooldown active ({elapsed:.1f}s < {cooldown_sec}s)"
 
-        max_per_min = int(os.getenv("MAX_GLOBAL_SENDS_PER_MINUTE", "30"))
+        max_per_min = int(os.getenv("MAX_GLOBAL_SENDS_PER_MINUTE", "10"))
         if max_per_min > 0:
             one_min_ago = now - 60.0
             self._global_send_times = [t for t in self._global_send_times if t > one_min_ago]
             if len(self._global_send_times) >= max_per_min:
                 return f"global sends/min cap reached ({len(self._global_send_times)} >= {max_per_min})"
 
-        max_daily = int(os.getenv("MAX_DAILY_AUTO_REPLIES", "500"))
+        max_daily = int(os.getenv("MAX_DAILY_AUTO_REPLIES", "100"))
         if max_daily > 0:
             today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             today_count = self._daily_sends.get(today_str, 0)

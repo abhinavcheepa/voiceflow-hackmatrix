@@ -85,15 +85,18 @@ async def test_ambiguous_phrases_do_not_trigger_opt_out(phrase):
 
 @pytest.mark.anyio
 async def test_suppression_table_blocks_subsequent_auto_replies():
-    """Once opted out, incoming messages are stored but auto-reply is blocked."""
+    """Once opted out, incoming messages are stored but auto-reply is blocked.
+    The number is BOTH allowlisted and opted out to prove suppression beats allowlist."""
     phone = "919999888803"
+    db.set_allowlist([phone])
+    assert db.allowed(phone) is True
+
     db.opt_out(phone, reason="user_unsubscribed")
     assert db.is_opted_out(phone) is True
 
-    # Check db auto_reply_block helper
+    # Check db auto_reply_block helper: must return suppression list reason, NOT None
     block_reason = db.auto_reply_block(phone)
-    assert block_reason is not None
-    assert "suppression list" in block_reason or "opted out" in block_reason
+    assert block_reason == f"{phone} has opted out (suppression list)"
 
     # Send incoming normal message
     msg = {

@@ -600,7 +600,8 @@ async def approve_pending(ctx: dict) -> str | None:
     result = run(pending["name"], pending["args"], ctx)
     if inspect.isawaitable(result):
         result = await result
-    ctx.pop("_pending", None)
+    if ctx.get("_pending") == pending:
+        ctx.pop("_pending", None)
     ctx.pop("_approved", None)
     return result
 
@@ -775,6 +776,19 @@ async def _send_whatsapp(args: dict, ctx: dict) -> str:
                         f'{who} ko ye message bhejun: "{text}"?'):
         return gate
     await _deliver(phone, text, ctx, args.get("name"))
+    import time
+    contact_name = args.get("name")
+    if contact_name and not db.allowed(phone):
+        ask = f"Allow auto-reply for {contact_name} too?"
+        ctx["_pending"] = {
+            "key": f"allowlist:allow:{phone}",
+            "turn": ctx.get("_turn", 0),
+            "name": "auto_reply_settings",
+            "args": {"action": "allow", "phone": phone, "name": contact_name},
+            "ask": ask,
+            "ts": time.time(),
+        }
+        return f"Bhej diya — {who} ko message chala gaya. {ask}"
     return f"Bhej diya — {who} ko message chala gaya."
 
 
@@ -834,6 +848,19 @@ async def _start_whatsapp_chat(args: dict, ctx: dict) -> str:
         return gate
     db.assign_conversation(phone, agent.get("id"), goal, args.get("name"))
     await _deliver(phone, opening, ctx, args.get("name"))
+    import time
+    if not db.allowed(phone):
+        ask = f"Allow auto-reply for {who} too?"
+        ctx["_pending"] = {
+            "key": f"allowlist:allow:{phone}",
+            "turn": ctx.get("_turn", 0),
+            "name": "auto_reply_settings",
+            "args": {"action": "allow", "phone": phone, "name": who},
+            "ask": ask,
+            "ts": time.time(),
+        }
+        return (f"Ho gaya — {agent.get('name', 'agent')} ne {who} se WhatsApp par baat "
+                f"shuru kar di. {ask}")
     note = "" if db.auto_reply_global() else (
         " Dhyan dein: auto-reply abhi band hai, isliye unke jawab aapke liye rukenge.")
     return (f"Ho gaya — {agent.get('name', 'agent')} ne {who} se WhatsApp par baat "
