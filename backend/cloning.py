@@ -94,6 +94,20 @@ def is_available() -> bool:
     return missing() is None
 
 
+def _normalize_audio_to_wav(data: bytes) -> bytes:
+    """Normalize input audio data (WebM, OGG, MP3, WAV) into standard 16kHz mono PCM WAV."""
+    try:
+        from pydub import AudioSegment
+        seg = AudioSegment.from_file(io.BytesIO(data))
+        seg = seg.set_channels(1).set_frame_rate(16000)
+        out = io.BytesIO()
+        seg.export(out, format="wav")
+        return out.getvalue()
+    except Exception as e:
+        logger.debug("Audio normalization fallback: %s", e)
+        return data
+
+
 def enroll(clips: list[bytes]) -> str:
     """Enrol one or more audio clips as a new cloned voice profile."""
     if not clips:
@@ -103,8 +117,9 @@ def enroll(clips: list[bytes]) -> str:
     tmp_paths: list[str] = []
     try:
         for c in clips:
+            wav_bytes = _normalize_audio_to_wav(c)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(c)
+                tmp.write(wav_bytes)
                 tmp_paths.append(tmp.name)
         enroll_samples(tmp_paths, cid)
     finally:

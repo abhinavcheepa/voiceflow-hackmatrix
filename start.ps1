@@ -67,7 +67,7 @@ Stop-Ours "*voiceflow-ai*"   # never leave two copies fighting over a port
 Start-Sleep -Milliseconds 800
 
 # -- backend ------------------------------------------------------------ 
-Start-Process -FilePath $python -ArgumentList "-m", "uvicorn", "main:app", "--port", "8000" `
+Start-Process -FilePath $python -ArgumentList "-m", "uvicorn", "main:app", "--port", "8000", "--reload" `
     -WorkingDirectory (Join-Path $root "backend") -WindowStyle Hidden
 $backendUp = Wait-For "http://127.0.0.1:8000/health" @{}
 
