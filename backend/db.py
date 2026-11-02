@@ -1639,6 +1639,37 @@ def finalize_bill(bill_id: int) -> dict | None:
     return get_bill(bill_id)
 
 
+def update_bill(bill_id: int, total: float | None = None, item_name: str | None = None,
+                customer_name: str | None = None, customer_phone: str | None = None) -> dict | None:
+    """Update total, items, or customer on an existing bill without changing its ID."""
+    with connect() as conn:
+        if customer_phone:
+            customer_phone = normalize_phone(customer_phone)
+        if customer_name is not None and customer_phone is not None:
+            conn.execute("UPDATE bills SET customer_name = ?, customer_phone = ? WHERE id = ?",
+                         (customer_name, customer_phone, bill_id))
+        elif customer_name is not None:
+            conn.execute("UPDATE bills SET customer_name = ? WHERE id = ?", (customer_name, bill_id))
+        elif customer_phone is not None:
+            conn.execute("UPDATE bills SET customer_phone = ? WHERE id = ?", (customer_phone, bill_id))
+
+        if total is not None:
+            conn.execute("DELETE FROM bill_items WHERE bill_id = ?", (bill_id,))
+            name = item_name or ("Stationery included" if (item_name and "stationery" in item_name.lower()) else (item_name or "Bill amount"))
+            conn.execute(
+                """INSERT INTO bill_items (bill_id, item_name, quantity, rate, gst_percent, amount)
+                   VALUES (?, ?, 1, ?, 0, ?)""",
+                (bill_id, name, float(total), float(total)),
+            )
+            conn.execute(
+                "UPDATE bills SET subtotal = ?, gst_total = 0, total = ?, status = 'final' WHERE id = ?",
+                (float(total), float(total), bill_id),
+            )
+        elif item_name is not None:
+            conn.execute("UPDATE bill_items SET item_name = ? WHERE bill_id = ?", (item_name, bill_id))
+    return get_bill(bill_id)
+
+
 def get_bill(bill_id: int) -> dict | None:
     with connect() as conn:
         r = conn.execute("SELECT * FROM bills WHERE id = ?", (bill_id,)).fetchone()

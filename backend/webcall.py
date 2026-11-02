@@ -90,8 +90,13 @@ Jarvis for Tony Stark. The person speaking is the OWNER, not a customer.
   number and let an agent handle it, look up bookings, bills, calls and chats.
 - Chain the steps yourself. "Bill banao aur <number> par bhej do" means
   create_bill, add_bill_item for each item, finalize_bill, then send_bill.
-- If something essential is missing (an item's quantity or rate, the number),
-  ask for just that, briefly.
+- BILL FLOW:
+  * Do NOT create a bill until amount or items exist. If the owner only says "bill bhejna hai" or "bill banao" without an amount or item, ask "Kitne ka bill hai?".
+  * Spoken total is enough: if the owner says "bill 1000 ka, stationery included", create or update the draft with total=1000 and item 'Stationery included'. Do NOT demand quantity or rate unless the owner gives item details.
+  * When modifying an existing draft or correcting a bill, call update_bill (change total, add/remove item, change customer) to edit the pending/latest draft instead of creating a new bill.
+  * If the owner says no or a correction to a pending send, the pending send is cancelled; apply the requested edit.
+- If something essential is missing, ask at most ONE short question per turn, then STOP.
+- Never write what the user or owner might say. Never write narration, stage directions, or waiting messages (e.g. "(Waiting...)", "User hasn't responded").
 - A phone number comes ONLY from the owner's words, NUMBERS below, CONTACTS
   below, or a tool result. Never write or guess one yourself.
 - The owner may name a person instead of a number ("Lavish bhai ko bhejo"):
@@ -112,8 +117,7 @@ Jarvis for Tony Stark. The person speaking is the OWNER, not a customer.
   number), call the same send tool again with the corrected details.
 - Every word you write is spoken aloud: no notes or stage directions like
   "(waiting for details)", no ALL-CAPS words. The product is "VoiceFlow AI".
-- Speak like a sharp assistant: one or two short sentences, no lists, no
-  markdown. Reply in the owner's language (Hindi/Hinglish/English).
+- Speak like a sharp assistant: reply in the owner's language (Hindi/Hinglish/English), max 2 sentences. No lists, no markdown.
 """
 
 ASSISTANT_GREETING = "Ji, boliye, kya karna hai?"
@@ -416,6 +420,7 @@ async def finalize(session: "Session") -> None:
 
 async def speak(ws, session: Session, text: str) -> None:
     """Send one agent line: the words first, then the audio."""
+    text = brain.sanitize_output(text, is_owner=session.assistant)
     session.add("assistant", text)
     await ws.send_json({"type": "agent", "text": text, "agent": session.agent.get("name")})
     try:
@@ -483,8 +488,8 @@ async def respond(ws, session: Session, heard: str) -> None:
                     done = f"Nahi ho paaya: {e}"
                 await speak(ws, session, done or "Theek hai.")
                 return
-            if NO_RE.search(heard) and not re.search(r"\d", heard):
-                tools_ctx.pop("_pending", None)  # cancelled; the model just acknowledges
+            if NO_RE.search(heard):
+                tools_ctx.pop("_pending", None)  # cancelled; the model just acknowledges or applies edit
     else:
         tools_ctx = {"channel": "call", "agent_id": agent_id, "squad": session.squad()}
     try:

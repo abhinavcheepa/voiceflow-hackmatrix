@@ -221,19 +221,70 @@ def _escalate_to_human(args: dict, ctx: dict) -> str:
 def _create_bill(args: dict, ctx: dict) -> str:
     name = (args.get("customer_name") or ctx.get("name") or "").strip()
     phone = (args.get("customer_phone") or ctx.get("phone") or "").strip()
+    total = float(args.get("total") or args.get("amount") or 0)
+    item_name = (args.get("item_name") or args.get("description") or "").strip()
+
+    # Rule (a): Do not create a bill until an amount or items exist.
+    if total <= 0 and not item_name and not name:
+        return "Amount missing. Ask the owner 'Kitne ka bill hai?' before creating the bill."
+
     bill = db.create_bill(
         customer_name=name or None,
         customer_phone=phone or None,
         agent_id=ctx.get("agent_id"),
         channel=ctx.get("channel", "call"),
     )
-    # Store the bill id in ctx so subsequent add_bill_item calls find it.
     ctx["_active_bill_id"] = bill["id"]
+
+    # Rule (b): A spoken total is enough: creates or updates draft with total and one line item.
+    if total > 0:
+        desc = item_name or ("Stationery included" if "stationery" in item_name.lower() else "Bill item")
+        db.add_bill_item(bill["id"], desc, quantity=1, rate=total, gst_percent=0)
+        db.finalize_bill(bill["id"])
+        return f"Bill {bill['billNumber']} created for ₹{total:.0f} ({desc})" + (f" for {name}" if name else "") + "."
+
     return (
         f"Bill {bill['billNumber']} started"
         + (f" for {name}" if name else "")
         + ". Now ask the customer what items to add. For each item, ask name, quantity, and rate."
     )
+
+
+def _update_bill(args: dict, ctx: dict) -> str:
+    """Rule (c): Edit the pending or latest draft instead of creating a new bill."""
+    wanted = (args.get("bill_number") or "").strip().upper()
+    bill_id = None
+    if wanted:
+        match = next((b for b in db.get_bills(200) if b["billNumber"].upper() == wanted), None)
+        if match:
+            bill_id = match["id"]
+    if not bill_id:
+        bill_id = ctx.get("_active_bill_id")
+    if not bill_id:
+        drafts = [b for b in db.get_bills(10) if b.get("status") in ("draft", "final")]
+        if drafts:
+            bill_id = drafts[0]["id"]
+    if not bill_id:
+        return "No bill found to update. Ask 'Kitne ka bill hai?' first."
+
+    total = args.get("total") or args.get("amount")
+    item_name = (args.get("item_name") or args.get("description") or "").strip()
+    cust_name = (args.get("customer_name") or "").strip()
+    cust_phone = (args.get("customer_phone") or "").strip()
+
+    updated = db.update_bill(
+        bill_id=bill_id,
+        total=float(total) if total is not None else None,
+        item_name=item_name or None,
+        customer_name=cust_name or None,
+        customer_phone=cust_phone or None,
+    )
+    if not updated:
+        return "Could not update bill."
+
+    ctx["_active_bill_id"] = updated["id"]
+    desc = item_name or ("Stationery included" if (item_name and "stationery" in item_name.lower()) else "updated")
+    return f"Bill {updated['billNumber']} updated: Total ₹{updated['total']:.0f} ({desc})."
 
 
 def _add_bill_item(args: dict, ctx: dict) -> str:
@@ -551,12 +602,29 @@ def _owner_schemas() -> list[dict]:
            "calls (with summaries), WhatsApp chats, or low stock.",
            {"kind": {"type": "string", "enum": ["bookings", "bills", "calls", "whatsapp", "low_stock"]}},
            ["kind"]),
+        fn("update_bill", "Update the pending or latest draft bill: change total amount, item name, or customer.",
+           {"bill_number": {"type": "string", "description": "e.g. BILL-0002; omit for latest/active draft"},
+            "total": {"type": "number", "description": "New total amount in rupees (e.g. 1000)"},
+            "item_name": {"type": "string", "description": "New item name or description (e.g. 'Stationery included')"},
+            "customer_name": person,
+            "customer_phone": phone},
+           []),
     ]
 
 
 def _spoken(phone: str) -> str:
     """Grouped for reading aloud: 919812345678 -> '91 98123 45678'."""
     return f"{phone[:-10]} {phone[-10:-5]} {phone[-5:]}".strip()
+
+
+def _mask_phone(phone: str) -> str:
+    """Masked for reading aloud and display: first 2 + last 4 digits (e.g. 98****3210)."""
+    digits = db._digits(phone)
+    if len(digits) >= 10:
+        return f"{digits[-10:-8]}****{digits[-4:]}"
+    elif len(digits) >= 6:
+        return f"{digits[:2]}****{digits[-4:]}"
+    return phone
 
 
 def _confirm(ctx: dict, name: str, args: dict, key: str, ask: str) -> str | None:
@@ -813,17 +881,25 @@ async def _send_bill(args: dict, ctx: dict) -> str:
         match = next((b for b in db.get_bills(200) if b["billNumber"].upper() == wanted), None)
         bill = db.get_bill(match["id"]) if match else None
     else:
-        bill_id = ctx.get("_active_bill_id") or next(iter(b["id"] for b in db.get_bills(1)), None)
+        bill_id = ctx.get("_active_bill_id")
         bill = db.get_bill(bill_id) if bill_id else None
     if not bill:
-        return "No such bill. Make one first (create_bill, add_bill_item, finalize_bill)."
+        return "No bill has been created yet. Ask the owner 'Kitne ka bill hai?' first."
     if bill["status"] == "draft":
         return "That bill is still open — call finalize_bill first, then send it."
     if err := _whatsapp_ready():
         return err
+
+    # Read-back: 'Bill BILL-000X, 1000 rupaye, Shivam Gupta ko bhejun?' with phone shown masked (first 2 + last 4)
+    masked_phone = _mask_phone(phone)
+    target_desc = who
+    if who and masked_phone not in who:
+        target_desc = f"{who} ({masked_phone})"
+    ask_msg = f"Bill {bill['billNumber']}, {int(bill['total'])} rupaye, {target_desc} ko bhejun?"
+
     if gate := _confirm(ctx, "send_bill", {**args, "bill_number": bill["billNumber"]},
                         f"bill:{phone}:{bill['billNumber']}",
-                        f"Bill {bill['billNumber']}, ₹{bill['total']:.0f}, {who} ko bhejun?"):
+                        ask_msg):
         return gate
     await _deliver(phone, _bill_text(bill), ctx, args.get("name"))
     return f"Bhej diya — bill {bill['billNumber']} (₹{bill['total']:.0f}) {who} ko."
@@ -928,6 +1004,7 @@ _OWNER_HANDLERS = {
     "recent_activity": _recent_activity,
     "find_contact": _find_contact,
     "auto_reply_settings": _auto_reply_settings,
+    "update_bill": _update_bill,
 }
 
 
@@ -948,7 +1025,7 @@ _HANDLERS = {
 # Tools that change real records. In a dry run (evals/simulations) they are
 # described, not executed — a test conversation must never create a booking.
 MUTATING = {"book_appointment", "escalate_to_human", "create_bill", "add_bill_item",
-            "finalize_bill", "add_stock_entry"}
+            "finalize_bill", "add_stock_entry", "update_bill"}
 
 
 def run(name: str, args: dict, ctx: dict) -> str:

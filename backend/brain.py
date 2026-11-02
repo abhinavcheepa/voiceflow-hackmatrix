@@ -779,6 +779,79 @@ def fix_gender(text: str, gender: str) -> str:
     return text
 
 
+def sanitize_output(text: str, is_owner: bool = False) -> str:
+    """Sanitize model output before speaking or sending.
+
+    Strips reasoning blocks (<think>), stage directions and narration in
+    parentheses like (Waiting...), lines starting with User / Assistant / Note,
+    inline narration ('User hasn't responded yet', 'Aapka jawab ka intezaar'),
+    and deduplicates repeated sentences. Caps owner assistant output at 2 sentences.
+    """
+    if not text:
+        return ""
+    # 1. Strip think / reasoning blocks from gpt-oss / deepseek
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"\[thinking.*?\]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\[thought.*?\]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\[reasoning.*?\]", "", text, flags=re.IGNORECASE)
+
+    # 2. Strip stage directions in parentheses/brackets and trailing dots
+    def clean_paren(m: re.Match) -> str:
+        content = m.group(1).strip()
+        if re.search(r"\d", content):
+            return m.group(0)  # Keep masked phone e.g. (98****3210)
+        if re.search(
+            r"(waiting|wait|intezaar|pause|silent|silence|thinking|thought|note|action|direction|aside|user|assistant|details)",
+            content,
+            re.IGNORECASE,
+        ):
+            return " "
+        if len(content.split()) <= 6:
+            return " "
+        return m.group(0)
+
+    text = re.sub(r"\(([^)]*)\)(?:\.{1,3})?", clean_paren, text)
+
+    # 3. Strip inline narration phrases
+    text = re.sub(
+        r"\bUser\s+(?:hasn't|has\s+not|didn't|did\s+not)\s+(?:respond|answer|reply)(?:ed)?(?:\s+yet)?\.?",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(?:Aapka|Aapke)\s+jawab\s+ka\s+intezaar(?:\s+kar\s+rahi\s+hoon|\s+kar\s+rahe\s+hain|\s+hai)?\.?",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # 4. Strip lines or prefixes starting with User , Assistant:, Note:, System:
+    text = re.sub(r"(?m)^\s*(?:User\s+.*|Assistant\s*:.*|Note\s*:.*|System\s*:.*)$", " ", text)
+    text = re.sub(r"\b(?:Assistant|Note|System)\s*:\s*", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bUser\s*:\s*.*?(?=\n|[.!?]|$)", " ", text, flags=re.IGNORECASE)
+
+    # 5. Split sentences and deduplicate
+    raw_sentences = re.split(r"(?<=[.!?।])\s+|\n+", text)
+    seen = set()
+    cleaned_sentences = []
+    for s in raw_sentences:
+        s_clean = re.sub(r"\s+", " ", s).strip()
+        if not s_clean:
+            continue
+        norm = re.sub(r"[^\w\s]", "", s_clean.lower()).strip()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        cleaned_sentences.append(s_clean)
+
+    if is_owner and len(cleaned_sentences) > 2:
+        cleaned_sentences = cleaned_sentences[:2]
+
+    res = " ".join(cleaned_sentences).strip()
+    return re.sub(r"\s{2,}", " ", res)
+
+
 # Tools the agent can call to actually DO something, not just talk. This is
 # Vapi's "Tools" capability rebuilt on our stack: the model emits a tool call,
 # we run real code (write a booking, flag an escalation), feed the result back,
@@ -789,16 +862,16 @@ def _tool_schemas() -> list[dict]:
     return tools.SCHEMAS
 
 
-def _chat_body(provider: dict, messages: list[dict], with_tools: bool | list[dict]) -> dict:
+def _chat_body(provider: dict, messages: list[dict], with_tools: bool | list[dict], is_owner: bool = False) -> dict:
     """`with_tools` is False, True (the standard set) or this turn's own list."""
     body = {
         "model": provider["model"],
         "messages": messages,
-        "temperature": 0.6,
+        "temperature": 0.2 if is_owner else 0.6,
         # Counted against the per-minute budget as *requested*, not as used —
         # Groq's own 429 reads "Limit 6000, Used 6000, Requested 500". Asking
         # for headroom nobody spends is how a call runs out of budget.
-        "max_tokens": MAX_REPLY_TOKENS,
+        "max_tokens": min(MAX_REPLY_TOKENS, 180) if is_owner else MAX_REPLY_TOKENS,
     }
     if with_tools:
         body["tools"] = with_tools if isinstance(with_tools, list) else _tool_schemas()
@@ -811,7 +884,7 @@ def _chat_body(provider: dict, messages: list[dict], with_tools: bool | list[dic
     return body
 
 
-async def _chat_once(messages: list[dict], with_tools: bool | list[dict]) -> dict:
+async def _chat_once(messages: list[dict], with_tools: bool | list[dict], is_owner: bool = False) -> dict:
     """One completion, with provider failover. Returns the raw assistant message
     (which may carry tool_calls).
 
@@ -828,7 +901,7 @@ async def _chat_once(messages: list[dict], with_tools: bool | list[dict]) -> dic
             continue
         url = f"{p['base']}/chat/completions"
         headers = {"Authorization": f"Bearer {p['key']}", "Content-Type": "application/json"}
-        body = _chat_body(p, messages, with_tools)
+        body = _chat_body(p, messages, with_tools, is_owner=is_owner)
         try:
             r = await http().post(url, headers=headers, json=body, timeout=60)
             if r.status_code == 429:
@@ -909,20 +982,18 @@ async def reply(phone: str, message: str, history: list[dict] | None = None,
 
     # Per-turn list: the transfer tool exists only when there is a squad.
     use_tools = tools_mod.schemas(tools_ctx) if tools_ctx is not None else False
-    # Bill creation needs multiple tool rounds (create → add item → add item →
-    # finalize), so allow up to 4 rounds instead of the original 2. Each round
-    # is one LLM call, so this still bounds latency.
-    # The owner chains actions in one breath ("bill banao, do item, bhej do"):
-    # create, add, add, finalize, send is five rounds. Customers rarely need more
-    # than a couple, and every round is a model call on the per-minute budget.
-    rounds = 8 if (tools_ctx or {}).get("owner") else 4
+    is_owner = bool((tools_ctx or {}).get("owner"))
+    # Max iterations is 4 for tool-call rounds only. Each round is one LLM call.
+    # When the model returns text with no tool call, the turn ends immediately
+    # and that single message is returned. Texts are never concatenated across iterations.
+    rounds = 4
     for _round in range(rounds):
-        msg = await _chat_once(messages, with_tools=use_tools)
+        msg = await _chat_once(messages, with_tools=use_tools, is_owner=is_owner)
         calls = msg.get("tool_calls")
         if not calls:
             answer = (msg.get("content") or "").strip()
             if answer:
-                return fix_gender(answer, gender)
+                return sanitize_output(fix_gender(answer, gender), is_owner=is_owner)
             # An empty reply with nothing to run means the budget was spent on
             # reasoning — fail loudly so the caller hears the fallback, not silence.
             raise RuntimeError(
