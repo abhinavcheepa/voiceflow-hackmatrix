@@ -376,7 +376,7 @@ export default function WebCall() {
 
     try {
       stream.current = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
     } catch {
       setError("Microphone access denied. Allow it in the browser and try again.");
@@ -697,8 +697,13 @@ export default function WebCall() {
                 <div className="absolute inset-y-0 left-1/2 w-px bg-white/40" />
               </div>
               <p className="mt-1.5 text-center text-[11px] text-dim">
-                Mic level — speak past the line to be heard
+                Mic level — speak past the threshold line to be heard
               </p>
+              {status === "listening" && level.rms < level.speechBar * 0.5 && (
+                <p className="mt-1 text-center text-xs font-medium text-amber-400">
+                  Speak closer — mic volume too low
+                </p>
+              )}
             </div>
           )}
         </div>

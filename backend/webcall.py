@@ -315,24 +315,55 @@ DONE_RE = re.compile(r"ho gaya|ho gayi|kar diya|kar di\b|bhej diya|allow|band ka
 _PHONE_IN_TEXT = re.compile(r"\d[\d\s-]{8,}\d")
 
 
+STT_NAME_HINTS = os.getenv("STT_NAME_HINTS", "1").strip().lower() in ("1", "true", "yes")
+
+
 def stt_vocab(agent: dict, with_contacts: bool = False) -> str:
     """Words speech-to-text should expect: the product, the business, the
     agents and — for the owner — the people they message by name."""
     names = ["VoiceFlow AI", "WhatsApp", BUSINESS_NAME, OWNER_NAME, agent.get("name") or ""]
     names += [a["name"] for a in db.get_agents()]
     if with_contacts:
-        for c in db.get_contacts(limit=80):
-            name = re.sub(r"[^\w\s]", " ", c.get("name") or "").strip()
-            # Real names only: not a number, not a long business/channel title.
-            if (name and name.lower() != "unknown" and not any(ch.isdigit() for ch in name)
-                    and len(name.split()) <= 3 and len(name) <= 24):
-                names.append(name)
+        names += ["bill", "rupaye", "rupees", "bhejo", "invoice", "payment", "stock", "stationery", "order", "delivery", "chair"]
+        if STT_NAME_HINTS:
+            for c in db.get_contacts(limit=80):
+                name = re.sub(r"[^\w\s]", " ", c.get("name") or "").strip()
+                # Real names only: not a number, not a long business/channel title.
+                if (name and name.lower() != "unknown" and not any(ch.isdigit() for ch in name)
+                        and len(name.split()) <= 3 and len(name) <= 24):
+                    names.append(name)
     out, seen = [], set()
     for n in names:
         if n and n.lower() not in seen:
             seen.add(n.lower())
             out.append(n)
     return ", ".join(out)
+
+
+def check_phone_number_query(heard: str) -> str | None:
+    """Phone number question: state last 4 digits only, never full number by voice."""
+    m = re.search(r"([A-Za-z\u0900-\u097F\s]+?)\s+(?:ka|ki|ke)?\s*(?:phone|mobile|contact)?\s*(?:number|no)\s*(?:kya|batao|bataiye|de do|hai)", heard, re.I)
+    if m:
+        target = m.group(1).strip()
+        target = re.sub(r"^(?:bhai|ji|mujhe|zara|please)\s+", "", target, flags=re.I).strip()
+        if target:
+            hits = tools.find_contacts(target)
+            if hits:
+                _, n, p = hits[0]
+                digits = db._digits(p)
+                last4 = digits[-4:] if len(digits) >= 4 else digits
+                return f"{n} ka number 91 XXXXX {last4} par khatam hota hai, poora number dashboard mein hai."
+            return f"{target} naam ka contact nahi mila, number bataiye ya contact add karein."
+    return None
+
+
+def is_send_turn(heard: str) -> bool:
+    """True if the owner is asking or claiming about sending something."""
+    return bool(re.search(
+        r"\b(?:bhej|bhejo|bheja|bhejun|send|sent|sending|deliver|delivered|message|msg|whatsapp|wa)\b",
+        heard,
+        re.IGNORECASE,
+    ))
 
 
 def invented_number(text: str, session: "Session") -> bool:
@@ -418,18 +449,25 @@ async def finalize(session: "Session") -> None:
             log.debug("learning extraction skipped for %s: %s", session.id, e)
 
 
-async def speak(ws, session: Session, text: str) -> None:
+async def speak(ws, session: Session, text: str, stt_ms: int = 0) -> None:
     """Send one agent line: the words first, then the audio."""
     text = brain.sanitize_output(text, is_owner=session.assistant)
     session.add("assistant", text)
     await ws.send_json({"type": "agent", "text": text, "agent": session.agent.get("name")})
+    tts_ms = 0
     try:
+        t_tts_0 = time.perf_counter()
         audio = await voice.synthesize(text, session.voice_language)
+        tts_ms = int((time.perf_counter() - t_tts_0) * 1000)
         session.recorder.add("agent", audio, voice.OUTPUT_EXT)
         await ws.send_bytes(audio)
     except Exception as e:  # noqa: BLE001 - a call without audio still beats a dropped call
         log.warning("TTS failed on %s: %s", session.id, mask_error(e))
         await ws.send_json({"type": "warning", "text": "Voice abhi available nahi hai."})
+
+    prompt_toks = brain.last_turn_stats.get("prompt_tokens", 0)
+    llm_stat = brain.last_turn_stats.get("llm_status", "none")
+    log.info("TURN: stt_ms=%d prompt_tokens=%d llm_status=%s tts_ms=%d", stt_ms, prompt_toks, llm_stat, tts_ms)
 
 
 async def handle_turn(ws, session: Session, audio: bytes) -> None:
@@ -440,6 +478,7 @@ async def handle_turn(ws, session: Session, audio: bytes) -> None:
 
     await ws.send_json({"type": "thinking"})
 
+    t_stt_0 = time.perf_counter()
     try:
         heard = await brain.transcribe(
             audio,
@@ -451,18 +490,21 @@ async def handle_turn(ws, session: Session, audio: bytes) -> None:
         log.warning("STT failed on %s: %s", session.id, mask_error(e))
         await ws.send_json({"type": "error", "text": "Abhi thodi takleef hai, thodi der mein try karein."})
         return
+    stt_ms = int((time.perf_counter() - t_stt_0) * 1000)
 
     if not heard.strip():
-        await ws.send_json({"type": "idle"})
+        log.info("STT returned empty or rejected audio on %s (%d ms); asking to repeat with NO LLM call", session.id, stt_ms)
+        await ws.send_json({"type": "caller", "text": "...", "language": session.language})
+        await speak(ws, session, "Awaaz saaf nahi aayi, dobara bolein.", stt_ms=stt_ms)
         return
 
     # Only turns that held speech go into the recording — noise blobs that
     # transcribed to nothing would just be dead air in the file.
     session.recorder.add("caller", audio, "webm")
-    await respond(ws, session, heard)
+    await respond(ws, session, heard, stt_ms=stt_ms)
 
 
-async def respond(ws, session: Session, heard: str) -> None:
+async def respond(ws, session: Session, heard: str, stt_ms: int = 0) -> None:
     """Answer one caller turn — spoken (after transcription) or typed."""
     heard = heard.strip()[:2000]
     if not heard:
@@ -472,11 +514,17 @@ async def respond(ws, session: Session, heard: str) -> None:
     session.add("user", heard)
     await ws.send_json({"type": "caller", "text": heard, "language": session.language})
 
+    # Direct phone number inquiry intent
+    if session.assistant and (phone_ans := check_phone_number_query(heard)):
+        await speak(ws, session, phone_ans, stt_ms=stt_ms)
+        return
+
     agent_id = session.agent.get("id")
     if session.assistant:
         tools_ctx = session.tools_ctx
         tools_ctx["_turn"] += 1
         tools_ctx["_heard_numbers"] = list(session.numbers)  # what a send may use
+        tools_ctx["_heard_text"] = heard
         if tools_ctx.get("_pending"):
             # The owner is answering a read-back. A plain yes runs exactly what
             # was read out — not left to the model, which tended to ask again
@@ -486,21 +534,22 @@ async def respond(ws, session: Session, heard: str) -> None:
                     done = await tools.approve_pending(tools_ctx)
                 except Exception as e:  # noqa: BLE001
                     done = f"Nahi ho paaya: {e}"
-                await speak(ws, session, done or "Theek hai.")
+                await speak(ws, session, done or "Theek hai.", stt_ms=stt_ms)
                 return
             if NO_RE.search(heard):
                 tools_ctx.pop("_pending", None)  # cancelled; the model just acknowledges or applies edit
     else:
         tools_ctx = {"channel": "call", "agent_id": agent_id, "squad": session.squad()}
     try:
-        # Retrieve using the last couple of user turns, not just this one. A
-        # follow-up answer like "Computer Science and Engineering" to the agent's
-        # "which department?" carries no "faculty/count" intent on its own, so on
-        # its own it retrieved the wrong chunks. Joining the recent user turns
-        # keeps the original question's keywords in the retrieval query.
-        recent_user = [m["content"] for m in session.history if m["role"] == "user"][-2:]
-        retrieval_query = " ".join(recent_user) or heard
-        kb_context = kb.context_block(agent_id, retrieval_query)
+        # Context trimming: owner assistant gets capped history and no KB dump
+        if session.assistant:
+            history_turns = session.history[-4:] if len(session.history) > 4 else session.history[:-1]
+            kb_context = ""
+        else:
+            history_turns = session.history[:-1]
+            recent_user = [m["content"] for m in session.history if m["role"] == "user"][-2:]
+            retrieval_query = " ".join(recent_user) or heard
+            kb_context = kb.context_block(agent_id, retrieval_query)
         prompt = session.prompt
         if session.assistant and (p := tools_ctx.get("_pending")):
             # Still waiting for a yes, and this wasn't one: it may be a fix
@@ -510,7 +559,7 @@ async def respond(ws, session: Session, heard: str) -> None:
         if session.assistant and (hints := tools.contact_hints(heard)):
             prompt += "\nCONTACTS the owner may mean (saved): " + ", ".join(
                 f"{name} = {phone[-10:-5]} {phone[-5:]}" for name, phone in hints)
-        answer = await brain.reply("", heard, history=session.history[:-1],
+        answer = await brain.reply("", heard, history=history_turns,
                                    prompt=prompt, kb_context=kb_context,
                                    tools_ctx=tools_ctx, agent_id=agent_id)
     except Exception as e:  # noqa: BLE001
@@ -520,17 +569,16 @@ async def respond(ws, session: Session, heard: str) -> None:
         log.warning("LLM failed on %s: %s", session.id, masked_err)
         await ws.send_json({"type": "error", "text": "Abhi thodi takleef hai, thodi der mein try karein."})
         fallback_msg = os.getenv("WEBCALL_FALLBACK") or LLM_FALLBACK_TEXT
-        await speak(ws, session, fallback_msg)
+        await speak(ws, session, fallback_msg, stt_ms=stt_ms)
         return
 
     # An outward action parked this turn: speak its exact question, whatever
     # the model wrote — it has claimed "sent" over a NOT SENT YET before.
     if session.assistant and (p := tools_ctx.get("_pending")) and p["turn"] == tools_ctx["_turn"]:
         answer = p["ask"]
-    elif (session.assistant and SENT_CLAIM_RE.search(answer)
+    elif (session.assistant and is_send_turn(heard) and SENT_CLAIM_RE.search(answer)
           and tools_ctx.get("_delivered_turn") != tools_ctx["_turn"]):
-        # It said "bhej diya" but nothing went out this turn — it once told the
-        # owner a message was sent when no tool had even run.
+        # It said "bhej diya" on a send turn but nothing went out this turn
         answer = brain.fix_gender(NOT_SENT, brain.agent_gender())
     elif session.assistant and invented_number(answer, session):
         # A number the owner never said and no contact has — it once offered
@@ -541,7 +589,7 @@ async def respond(ws, session: Session, heard: str) -> None:
         # Something was done but the reply doesn't say so ("aur kuch?").
         answer = f"{done[-1]} {answer}"
 
-    await speak(ws, session, answer)
+    await speak(ws, session, answer, stt_ms=stt_ms)
 
     # Handoff: the old agent has said "connecting you"; the new one picks up
     # with the same history, so the caller never repeats themselves.

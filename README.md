@@ -35,6 +35,7 @@ calls need hardware that isn't set up yet — see [Telephony](#telephony).
 
 Understand where audio, transcripts, and customer messages flow:
 - **With `GROQ_API_KEY` and `STT_PROVIDER=auto`**: Caller audio recordings and transcribed conversational turns are transmitted to Groq's cloud infrastructure (`api.groq.com`) for speech-to-text and LLM generation.
+- **STT Name Hints (`STT_NAME_HINTS=1`)**: When enabled (default on), saved contact names and common business terms are passed as a Whisper prompt hint to improve speech recognition accuracy for the owner assistant. If disabled (`STT_NAME_HINTS=0`), contact names are omitted from the STT provider prompt.
 - **With `STT_PROVIDER=local` and a local LLM**: Audio transcription runs strictly on your machine's CPU via `faster-whisper`, and replies are generated on-premise without outbound data transfer.
 - **Speech Synthesis (TTS)**: Microsoft Edge TTS (`VOICE_PROVIDER=edge`) connects to Microsoft's cloud endpoints (`speech.platform.bing.com`) to synthesize spoken replies into MP3 audio. Not all data stays local unless a local offline TTS engine is installed.
 

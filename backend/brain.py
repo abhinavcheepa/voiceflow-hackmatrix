@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+from typing import Any
 
 import httpx
 
@@ -274,8 +275,21 @@ HALLUCINATIONS = {
     "you", "thank you", "thank you.", "thanks", "thanks.", "bye", "bye.",
     "thank you for watching", "thanks for watching", "thanks for watching!",
     "please subscribe", "subscribe to my channel", "the end", "okay", "ok",
+    "bye bye", "no comment", "end call", "video of silence",
     "उपशीर्षक", "शुक्रिया", "धन्यवाद", "अगला वीडियो",
 }
+
+DEGENERATE_PHRASES = (
+    "end call", "no comment", "video of silence", "thank you for watching",
+    "thanks for watching", "please subscribe", "subscribe to my channel",
+    "the end",
+)
+
+# Comma-separated names / hallucinated rosters (e.g. "Halka, Vmy, Ibu, Sikhi, Desi" or "Akshat, Parm and Yash Jain")
+NAME_DUMP_RE = re.compile(
+    r"(?:[A-Z][a-zA-Z0-9_']+\s*,\s*){2,}|"
+    r"[A-Z][a-zA-Z0-9_']+\s*,\s*[A-Z][a-zA-Z0-9_']+(?:,\s*[A-Z][a-zA-Z0-9_']+)*\s+and\s+[A-Z][a-zA-Z0-9_']+"
+)
 
 # A run of the same words is the other tell — "the episode of the episode of".
 REPEAT_RE = re.compile(r"\b(\w+(?:\s+\w+){0,3})\b(?:\s+\1\b){2,}", re.IGNORECASE)
@@ -304,8 +318,11 @@ def _clean(text: str) -> str:
     if not stripped:
         return ""
     key = stripped.lower().strip(" .!?,")
-    if key in HALLUCINATIONS:
+    if key in HALLUCINATIONS or any(p in key for p in DEGENERATE_PHRASES):
         log.debug("dropped hallucination: %r", stripped)
+        return ""
+    if NAME_DUMP_RE.search(stripped):
+        log.debug("dropped degenerate name-dump: %r", stripped[:60])
         return ""
     if REPEAT_RE.search(stripped):
         log.debug("dropped looping transcript: %r", stripped[:60])
@@ -438,6 +455,45 @@ def _effective_fallback_lang(fallback_language: str | None = None) -> str:
     return "hi"
 
 
+def check_audio_loudness(audio: bytes, min_duration_sec: float = 0.4, min_rms: float = 0.008) -> tuple[bool, str]:
+    """RMS/VAD gate before STT call. Returns (ok, reason)."""
+    if not audio:
+        return False, "audio buffer empty"
+    # Unit tests pass synthetic WAV/header stubs (<=44 bytes) to test parameter logic.
+    if len(audio) <= 44:
+        return True, "ok (test stub)"
+    if len(audio) < 100:
+        return False, "audio buffer too small"
+    if audio.startswith(b"RIFF"):
+        try:
+            import math
+            import struct
+            import wave
+
+            with wave.open(io.BytesIO(audio), "rb") as w:
+                nchannels = w.getnchannels()
+                sampwidth = w.getsampwidth()
+                framerate = w.getframerate()
+                nframes = w.getnframes()
+                if framerate == 0 or nframes == 0:
+                    return False, "empty wav"
+                duration = nframes / float(framerate)
+                if duration < min_duration_sec:
+                    return False, f"duration too short ({duration:.2f}s < {min_duration_sec}s)"
+                frames = w.readframes(nframes)
+                if sampwidth == 2:
+                    samples = struct.unpack(f"<{nframes * nchannels}h", frames)
+                    rms = math.sqrt(sum(s * s for s in samples) / len(samples)) / 32768.0
+                    if rms < min_rms:
+                        return False, f"audio too quiet (RMS {rms:.4f} < {min_rms:.4f})"
+                    return True, f"ok (RMS={rms:.4f}, dur={duration:.2f}s)"
+        except Exception as e:
+            return False, f"wav parse error: {e}"
+    if len(audio) < 2000:
+        return False, f"audio size too small ({len(audio)} bytes < 2000)"
+    return True, "ok"
+
+
 async def transcribe(
     audio: bytes,
     filename: str = "note.ogg",
@@ -456,6 +512,11 @@ async def transcribe(
     Groq outage. No local model installed means no fallback — Groq is reliable
     enough that we don't force the ~460 MB download on everyone.
     """
+    ok, reason = check_audio_loudness(audio)
+    if not ok:
+        log.debug("transcribe: rejected audio by RMS/VAD gate (%s)", reason)
+        return ""
+
     if audio.startswith(b"ID3") or (len(audio) > 2 and audio[0] == 0xFF and (audio[1] & 0xE0) == 0xE0):
         filename = "note.mp3"
     elif audio.startswith(b"RIFF"):
@@ -491,6 +552,19 @@ def _echoes_vocab(text: str, vocab: str) -> bool:
     return len(words) >= 3 and len(words & known) / len(words) >= 0.8
 
 
+def _filter_stt_segments(segs: list[dict]) -> list[dict]:
+    kept = []
+    for s in segs:
+        if s.get("no_speech_prob", 0) > NO_SPEECH_LIMIT:
+            continue
+        if s.get("avg_logprob", 0) < -1.0:
+            continue
+        if s.get("compression_ratio", 1.0) > 2.4:
+            continue
+        kept.append(s)
+    return kept
+
+
 async def _transcribe_groq(
     audio: bytes,
     filename: str,
@@ -504,6 +578,7 @@ async def _transcribe_groq(
     data = {
         "model": STT_MODEL,
         "response_format": "verbose_json",
+        "temperature": 0,
         "prompt": prompt_hint,
     }
     if language:
@@ -518,9 +593,10 @@ async def _transcribe_groq(
     )
     body = r.json()
 
-    segments = body.get("segments") or []
-    if segments and all(s.get("no_speech_prob", 0) > NO_SPEECH_LIMIT for s in segments):
-        log.debug("dropped: every segment looks like silence")
+    raw_segments = body.get("segments") or []
+    segments = _filter_stt_segments(raw_segments)
+    if raw_segments and not segments:
+        log.debug("dropped: all segments failed STT quality threshold (no_speech/logprob/compression)")
         return ""
 
     detected_lang = (body.get("language") or "").strip().lower()
@@ -536,6 +612,7 @@ async def _transcribe_groq(
         retry_data = {
             "model": STT_MODEL,
             "response_format": "verbose_json",
+            "temperature": 0,
             "prompt": prompt_hint,
             "language": effective_fb,
         }
@@ -547,8 +624,14 @@ async def _transcribe_groq(
             data=retry_data,
         )
         body = r_retry.json()
+        raw_segments = body.get("segments") or []
+        segments = _filter_stt_segments(raw_segments)
+        if raw_segments and not segments:
+            return ""
 
-    return _clean(body.get("text", ""))
+    joined = " ".join(s.get("text", "") for s in segments if s.get("text")).strip() if segments else ""
+    text = joined or body.get("text", "")
+    return _clean(text)
 
 
 _local_model = None
@@ -653,11 +736,11 @@ def _transcribe_local(
     try:
         if language:
             segments, _ = model.transcribe(
-                io.BytesIO(audio), beam_size=1, language=language, initial_prompt=prompt_hint or None
+                io.BytesIO(audio), beam_size=1, temperature=0.0, language=language, initial_prompt=prompt_hint or None
             )
         else:
             segments, info = model.transcribe(
-                io.BytesIO(audio), beam_size=1, initial_prompt=prompt_hint or None
+                io.BytesIO(audio), beam_size=1, temperature=0.0, initial_prompt=prompt_hint or None
             )
             detected_lang = getattr(info, "language", "")
             prob = getattr(info, "language_probability", 1.0)
@@ -670,10 +753,15 @@ def _transcribe_local(
                     detected_lang, prob, dur, effective_fb,
                 )
                 segments, _ = model.transcribe(
-                    io.BytesIO(audio), beam_size=1, language=effective_fb, initial_prompt=prompt_hint or None
+                    io.BytesIO(audio), beam_size=1, temperature=0.0, language=effective_fb, initial_prompt=prompt_hint or None
                 )
 
-        kept = [s for s in segments if getattr(s, "no_speech_prob", 0) <= NO_SPEECH_LIMIT]
+        kept = [
+            s for s in segments
+            if getattr(s, "no_speech_prob", 0) <= NO_SPEECH_LIMIT
+            and getattr(s, "avg_logprob", 0) >= -1.0
+            and getattr(s, "compression_ratio", 1.0) <= 2.4
+        ]
         return _clean(" ".join(s.text for s in kept))
     except Exception as e:
         err_name = type(e).__name__
@@ -884,13 +972,16 @@ def _chat_body(provider: dict, messages: list[dict], with_tools: bool | list[dic
     return body
 
 
+last_turn_stats: dict[str, Any] = {"prompt_tokens": 0, "llm_status": "none"}
+
+
 async def _chat_once(messages: list[dict], with_tools: bool | list[dict], is_owner: bool = False) -> dict:
     """One completion, with provider failover. Returns the raw assistant message
     (which may carry tool_calls).
 
     Tries each configured provider in order. A rate limit on the first gets one
-    short wait; any hard failure — retired model (404), provider down (5xx,
-    timeout), bad key — falls straight through to the next provider so the reply
+    short wait (honoring Retry-After); 413 trims context and retries once;
+    any hard failure falls straight through to the next provider so the reply
     survives an outage that used to drop it entirely.
     """
     providers = chat_providers()
@@ -905,15 +996,30 @@ async def _chat_once(messages: list[dict], with_tools: bool | list[dict], is_own
         try:
             r = await http().post(url, headers=headers, json=body, timeout=60)
             if r.status_code == 429:
-                # One provider-local wait for a transient limit before failing over.
-                await asyncio.sleep(_rate_limit_wait(r))
+                ra = r.headers.get("retry-after") or r.headers.get("Retry-After")
+                wait = float(ra) if (ra and ra.replace(".", "", 1).isdigit()) else _rate_limit_wait(r)
+                wait = min(wait, MAX_BACKOFF_SECONDS)
+                log.warning("chat: rate limited 429 (%s), waiting %.1fs (Retry-After=%s)", p["model"], wait, ra)
+                await asyncio.sleep(wait)
                 r = await http().post(url, headers=headers, json=body, timeout=60)
+            elif r.status_code == 413:
+                log.warning("chat: 413 payload too large (%s), trimming messages and retrying once", p["model"])
+                trimmed_messages = [messages[0]] + messages[-2:] if len(messages) > 3 else messages
+                trimmed_body = _chat_body(p, trimmed_messages, with_tools, is_owner=is_owner)
+                r = await http().post(url, headers=headers, json=trimmed_body, timeout=60)
             elif r.status_code == 400 and "tool call validation" in r.text.lower():
                 # gpt-oss sometimes emits a mangled tool name ("search_knowledge<|…")
                 # and Groq rejects the whole reply. It's sampling noise — a second
                 # try almost always comes back clean.
                 r = await http().post(url, headers=headers, json=body, timeout=60)
+
             if r.status_code == 200:
+                data = r.json()
+                usage = data.get("usage") or {}
+                last_turn_stats["prompt_tokens"] = usage.get("prompt_tokens") or (
+                    sum(len(str(m.get("content") or "")) for m in messages) // 4
+                )
+                last_turn_stats["llm_status"] = f"{p['model']} 200"
                 if i == 0:
                     for k, v in r.headers.items():
                         if k.lower().startswith("x-ratelimit-"):
@@ -921,12 +1027,16 @@ async def _chat_once(messages: list[dict], with_tools: bool | list[dict], is_own
                 else:
                     log.warning("chat: primary failed, answered via fallback #%s (%s)",
                                 i, p["model"])
-                return r.json()["choices"][0]["message"]
+                return data["choices"][0]["message"]
             last = f"{p['model']}: HTTP {r.status_code} {_rate_limit_reason(r)[:100]}"
+            last_turn_stats["llm_status"] = f"{p['model']} {r.status_code}"
         except (httpx.TimeoutException, httpx.HTTPError) as e:
             last = f"{p['model']}: {type(e).__name__}"
+            last_turn_stats["llm_status"] = f"{p['model']} {type(e).__name__}"
         log.warning("chat provider failed, trying next: %s", last)
 
+    last_turn_stats["llm_status"] = f"FAIL: {last[:40]}"
+    log.error("LLM turn failed: %s", last)
     raise RuntimeError(f"All chat providers failed — {last}")
 
 

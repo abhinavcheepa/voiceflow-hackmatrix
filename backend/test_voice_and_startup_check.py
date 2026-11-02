@@ -112,7 +112,7 @@ async def test_webcall_llm_failure_does_not_blame_mic(monkeypatch):
     session = webcall.Session()
 
     spoken_texts = []
-    async def mock_speak(ws, sess, text):
+    async def mock_speak(ws, sess, text, *args, **kwargs):
         spoken_texts.append(text)
 
     monkeypatch.setattr(webcall, "speak", mock_speak)

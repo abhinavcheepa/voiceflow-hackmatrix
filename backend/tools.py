@@ -228,6 +228,12 @@ def _create_bill(args: dict, ctx: dict) -> str:
     if total <= 0 and not item_name and not name:
         return "Amount missing. Ask the owner 'Kitne ka bill hai?' before creating the bill."
 
+    # Customer name resolution first
+    if name and not phone:
+        hits = find_contacts(name)
+        if hits:
+            name, phone = hits[0][1], hits[0][2]
+
     bill = db.create_bill(
         customer_name=name or None,
         customer_phone=phone or None,
@@ -271,6 +277,31 @@ def _update_bill(args: dict, ctx: dict) -> str:
     item_name = (args.get("item_name") or args.get("description") or "").strip()
     cust_name = (args.get("customer_name") or "").strip()
     cust_phone = (args.get("customer_phone") or "").strip()
+
+    # Resolve customer by name if name given without phone
+    if cust_name and not cust_phone:
+        hits = find_contacts(cust_name)
+        if hits:
+            cust_name, cust_phone = hits[0][1], hits[0][2]
+        else:
+            return (f"{cust_name} naam ka contact nahi mila, number bataiye ya contact add karein. "
+                    f"No saved contact matches '{cust_name}'.")
+
+    # Mismatch check: when total != sum(items) on multiple items
+    bill = db.get_bill(bill_id)
+    if bill and total is not None:
+        items = bill.get("items") or []
+        items_sum = sum(float(i.get("amount") or (i.get("rate", 0) * i.get("quantity", 1))) for i in items)
+        float_total = float(total)
+        if items_sum > 0 and len(items) >= 2 and abs(float_total - items_sum) > 0.01:
+            diff = float_total - items_sum
+            other_reason = args.get("reason") or args.get("other_charges")
+            if other_reason or "other charges" in item_name.lower():
+                charge_name = other_reason or (item_name if item_name else "Other charges")
+                db.add_bill_item(bill_id, charge_name, quantity=1, rate=abs(diff), gst_percent=0)
+                db.finalize_bill(bill_id)
+                return f"Bill {bill['billNumber']} finalized: Total ₹{float_total:.0f} (including {charge_name} ₹{abs(diff):.0f})."
+            return f"Items ka jod {int(items_sum):,} hai, total {int(float_total):,} — {int(abs(diff)):,} aur kis cheez ke?"
 
     updated = db.update_bill(
         bill_id=bill_id,
@@ -535,13 +566,39 @@ def _transfer_schema(squad: list[dict]) -> dict:
     }
 
 
-def schemas(ctx: dict | None) -> list[dict]:
+def owner_schemas_for_turn(heard: str = "") -> list[dict]:
+    all_schemas = _owner_schemas()
+    if not heard:
+        return all_schemas
+    h = heard.lower()
+    is_bill = bool(re.search(r"bill|banao|rupaye|rupees|amount|total|item|invoice|stationery|cement|kharcha", h))
+    is_stock = bool(re.search(r"stock|maal|inventory", h))
+    is_msg = bool(re.search(r"send|bhej|message|msg|whatsapp|wa|chat", h))
+    is_contact = bool(re.search(r"contact|number|phone|naam|name", h))
+
+    needed = set()
+    if is_bill:
+        needed |= {"create_bill", "update_bill", "add_bill_item", "finalize_bill", "send_bill", "find_contact"}
+    if is_stock:
+        needed |= {"add_stock_entry", "check_stock"}
+    if is_msg:
+        needed |= {"send_whatsapp", "start_whatsapp_chat", "find_contact", "auto_reply_settings"}
+    if is_contact:
+        needed |= {"find_contact"}
+
+    if not needed:
+        return all_schemas
+    return [s for s in all_schemas if s["function"]["name"] in needed]
+
+
+def schemas(ctx: dict | None, heard: str = "") -> list[dict]:
     """Tools offered on this turn. Transfer appears only when there is someone
     to transfer to — a tool that can never work just invites the model to try."""
     ctx = ctx or {}
     squad = ctx.get("squad")
+    heard_text = heard or ctx.get("_heard_text", "")
     return (SCHEMAS + ([_transfer_schema(squad)] if squad else [])
-            + (_owner_schemas() if ctx.get("owner") else []))
+            + (owner_schemas_for_turn(heard_text) if ctx.get("owner") else []))
 
 
 def _transfer_to_agent(args: dict, ctx: dict) -> str:
@@ -799,7 +856,8 @@ def _resolve(args: dict, ctx: dict) -> tuple[str, str, str | None]:
         return "", "", "Ask the owner who it is for — a name or a number."
     hits = find_contacts(who)
     if not hits:
-        return "", "", (f"No saved contact matches '{who}'. Ask the owner for the number, then "
+        return "", "", (f"{who} naam ka contact nahi mila, number bataiye ya contact add karein. "
+                        f"No saved contact matches '{who}'. Ask the owner for the number, then "
                         f"call again with the number AND name='{who}' — it gets saved for next time.")
     if len(hits) > 1 and hits[0][0] - hits[1][0] < 0.05:
         options = "; ".join(f"{n} ({_spoken(p)})" for _, n, p in hits)
@@ -809,8 +867,16 @@ def _resolve(args: dict, ctx: dict) -> tuple[str, str, str | None]:
 
 
 def _find_contact(args: dict, ctx: dict) -> str:
-    hits = find_contacts(args.get("name") or "")
-    return "\n".join(f"{n}: {_spoken(p)}" for _, n, p in hits) or "No saved contact by that name."
+    name = (args.get("name") or "").strip()
+    hits = find_contacts(name)
+    if not hits:
+        return f"{name} naam ka contact nahi mila, number bataiye ya contact add karein. No saved contact by that name."
+    lines = []
+    for _, n, p in hits:
+        digits = db._digits(p)
+        last4 = digits[-4:] if len(digits) >= 4 else digits
+        lines.append(f"{n} ka number 91 XXXXX {last4} par khatam hota hai, poora number dashboard mein hai.")
+    return "\n".join(lines)
 
 
 def _whatsapp_ready() -> str | None:
