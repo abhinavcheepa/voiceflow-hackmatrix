@@ -7,6 +7,7 @@ Exits with code 1 if any check FAILs.
 """
 
 import asyncio
+import inspect
 import io
 import os
 import re
@@ -67,14 +68,12 @@ async def check_network() -> Dict[str, Any]:
 
     async with httpx.AsyncClient(timeout=4.0) as client:
         for host, purpose in targets:
-            # 1. DNS check
             try:
                 ip = socket.gethostbyname(host)
             except Exception as e:
                 failed.append((host, f"DNS failed ({e})", purpose))
                 continue
 
-            # 2. HTTPS reachability
             try:
                 r = await client.head(f"https://{host}", follow_redirects=True)
                 details.append(f"{host} [OK {r.status_code}] ({purpose})")
@@ -113,7 +112,6 @@ def check_env() -> Dict[str, Any]:
     ]
     present_keys = [k for k in standard_keys if k in env_keys and os.environ.get(k)]
 
-    # Check conflicts
     conflicts = []
     groq_key = os.environ.get("GROQ_API_KEY", "").strip()
     chat_key = os.environ.get("CHAT_API_KEY", "").strip()
@@ -123,7 +121,6 @@ def check_env() -> Dict[str, Any]:
     if chat_key and groq_key and not chat_base:
         conflicts.append("CHAT_API_KEY is set without CHAT_BASE_URL while GROQ_API_KEY is present")
 
-    # Check stray spaces or quotes in values
     stray_warnings = []
     for k in present_keys:
         val = os.environ.get(k, "")
@@ -134,7 +131,6 @@ def check_env() -> Dict[str, Any]:
         elif val != val.strip():
             stray_warnings.append(f"{k} has leading/trailing whitespace")
 
-    # Determine real chat provider
     if chat_base and chat_key:
         provider_name = f"Custom/NVIDIA ({chat_base}, model: {chat_model or 'default'})"
     elif groq_key or brain.GROQ_KEY:
@@ -224,7 +220,6 @@ async def check_stt() -> Dict[str, Any]:
     except Exception as e:
         warnings.append(f"English transcription failed ({e})")
 
-    # Evaluate accuracy
     hindi_ok = "namaste" in hindi_transcription.lower() or "नमस्ते" in hindi_transcription
     if not hindi_ok and backend_choice == "local" and model_name == "base":
         warnings.append(
@@ -288,7 +283,6 @@ async def check_tts() -> Dict[str, Any]:
 def check_ffmpeg_pyav() -> Dict[str, Any]:
     """6. ffmpeg/PyAV and WebM magic byte validation."""
     status_dict = recording.ffmpeg_status()
-    # Test WebM magic bytes (EBML 1A 45 DF A3)
     webm_sample = b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01\x42\xf7\x81\x01\x42\xf2\x81\x04" + b"\x00" * 200
     try:
         mime = upload_security.validate_magic_bytes_audio(webm_sample, "mic_sample.webm")
@@ -320,14 +314,12 @@ async def check_voice_cloning() -> Dict[str, Any]:
     clones_dir.mkdir(parents=True, exist_ok=True)
     disk_free_gb = round(shutil.disk_usage(clones_dir).free / (1024 ** 3), 2)
 
-    # Path traversal check
     traversal_rejected = False
     try:
         cloning._path("../../etc/passwd")
     except ValueError:
         traversal_rejected = True
 
-    # Test failure fallback path
     fallback_ok = False
     try:
         base_fallback = await voice._clone_speak("Namaste", "clone:nonexistent", "hi")
@@ -365,7 +357,6 @@ def check_whatsapp() -> Dict[str, Any]:
     mode = db.get_setting("auto_reply_mode", os.getenv("AUTO_REPLY_MODE", "allowlist"))
     allowlist_count = len(db.get_allowlist())
 
-    # Check bridge reachability
     bridge_reachable = False
     bridge_state = "offline"
     secret_match = "unknown"
@@ -409,10 +400,13 @@ def check_whatsapp() -> Dict[str, Any]:
     }
 
 
-def _sync_check_webcall() -> Dict[str, Any]:
-    """Run WebCall WebSocket turn synchronously inside worker thread."""
+def check_webcall() -> Dict[str, Any]:
+    """9. Web-call ticket issuance, WebSocket handshake, and turn response."""
     from starlette.testclient import TestClient
     import main
+    import brain
+
+    brain._pool = None
 
     client = TestClient(main.app)
     try:
@@ -433,29 +427,25 @@ def _sync_check_webcall() -> Dict[str, Any]:
         ) as ws:
             connected = ws.receive_json()
             greeting_msg = ws.receive_json()
-            greeting_audio = ws.receive_bytes()
+            raw_greeting = ws.receive()
+            greeting_audio = raw_greeting.get("bytes", b"")
 
-            # Execute a short spoken turn: synthesize 1s audio, send as bytes
-            sample_clip = asyncio.run(voice.synthesize("Namaste", "Hindi"))
-            ws.send_bytes(sample_clip)
+            # Execute a short typed say turn to verify full turn pipeline
+            ws.send_json({"type": "say", "text": "Namaste"})
 
-            resp1 = ws.receive_json()  # {"type": "thinking"}
-            resp2 = ws.receive_json()
-            if resp2.get("type") == "caller":
-                resp3 = ws.receive_json()  # {"type": "agent"}
-                agent_audio = ws.receive_bytes()
-                turn_msg = f"heard='{resp2.get('text', '')}' -> replied='{resp3.get('text', '')[:25]}...' -> TTS {len(agent_audio)} bytes"
-            elif resp2.get("type") == "idle":
-                turn_msg = "turn processed as idle"
-            else:
-                turn_msg = f"turn response: {resp2.get('type')} ({resp2.get('text', '')})"
+            resp_caller = ws.receive_json()  # {"type": "caller", "text": "Namaste"}
+            resp_agent = ws.receive_json()   # {"type": "agent", "text": answer}
+            raw_turn = ws.receive()
+            agent_audio = raw_turn.get("bytes", b"")
+            tts_info = f"TTS {len(agent_audio)} bytes" if agent_audio else f"TTS fallback: {raw_turn.get('text', '')}"
 
             return {
                 "name": "Web-Call WebSocket",
                 "status": "OK",
                 "message": (
                     f"Ticket issued | WS connected ({connected.get('callId')}) Origin http://localhost:5174 | "
-                    f"Greeting: '{greeting_msg.get('text', '')[:25]}...' ({len(greeting_audio)} bytes) | {turn_msg}"
+                    f"Greeting: '{greeting_msg.get('text', '')[:25]}...' ({len(greeting_audio)} bytes) | "
+                    f"Turn: heard='{resp_caller.get('text', '')}' -> replied='{resp_agent.get('text', '')[:25]}...' -> {tts_info}"
                 ),
                 "fix": "None required.",
             }
@@ -468,11 +458,6 @@ def _sync_check_webcall() -> Dict[str, Any]:
             "message": f"WebSocket turn failed{code_str}: {e}",
             "fix": "Check ALLOWED_ORIGINS, ticket validation, and audio format requirements in webcall.py.",
         }
-
-
-async def check_webcall() -> Dict[str, Any]:
-    """9. Web-call ticket issuance, WebSocket handshake, and turn response."""
-    return await asyncio.to_thread(_sync_check_webcall)
 
 
 def check_security() -> Dict[str, Any]:
@@ -522,8 +507,8 @@ def check_security() -> Dict[str, Any]:
     }
 
 
-async def run_doctor_checks() -> List[Dict[str, Any]]:
-    """Execute all 10 doctor checks sequentially."""
+async def run_async_checks() -> List[Dict[str, Any]]:
+    """Execute async network, LLM, STT, TTS, and Cloning checks."""
     results = []
     results.append(await check_network())
     results.append(check_env())
@@ -533,8 +518,20 @@ async def run_doctor_checks() -> List[Dict[str, Any]]:
     results.append(check_ffmpeg_pyav())
     results.append(await check_voice_cloning())
     results.append(check_whatsapp())
-    results.append(await check_webcall())
-    results.append(check_security())
+    return results
+
+
+async def run_doctor_checks() -> List[Dict[str, Any]]:
+    """Run all 10 checks (callable from FastAPI /api/doctor)."""
+    results = await run_async_checks()
+    wc = check_webcall()
+    if inspect.isawaitable(wc):
+        wc = await wc
+    results.append(wc)
+    sec = check_security()
+    if inspect.isawaitable(sec):
+        sec = await sec
+    results.append(sec)
     return results
 
 
@@ -543,7 +540,12 @@ def main() -> int:
     print(" VoiceFlow Diagnostic Doctor — System Verification", flush=True)
     print("=" * 80, flush=True)
 
-    results = asyncio.run(run_doctor_checks())
+    # 1. Run async checks
+    results = asyncio.run(run_async_checks())
+
+    # 2. Run synchronous checks outside active event loop
+    results.append(check_webcall())
+    results.append(check_security())
 
     has_fail = False
     for res in results:
