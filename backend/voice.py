@@ -445,7 +445,7 @@ async def _clone_speak(text: str, vid: str, locale: str) -> bytes:
         )
         return base
     try:
-        clone_timeout = float(os.getenv("CLONE_TIMEOUT_SECONDS", "8.0"))
+        clone_timeout = float(os.getenv("CLONE_TIMEOUT_SECONDS", "30.0"))
         res = await asyncio.wait_for(
             asyncio.to_thread(cloning.convert, base, vid[len(CLONE_PREFIX):], 0.20, text, True),
             timeout=clone_timeout,
@@ -558,9 +558,9 @@ async def clone(name: str, samples: list[tuple[str, bytes, str]],
         if reason := cloning.missing():
             raise RuntimeError(f"Local voice cloning is not installed: {reason}")
         # Every clip counts here — the embedding is averaged over all of them.
-        clone_id = await asyncio.to_thread(cloning.enroll, [data for _, data, _ in samples])
         old = db.get_setting(VOICE_ID_KEY)
-        if old.startswith(CLONE_PREFIX):
+        clone_id = await asyncio.to_thread(cloning.enroll, [data for _, data, _ in samples])
+        if old.startswith(CLONE_PREFIX) and old[len(CLONE_PREFIX):] != clone_id:
             cloning.delete(old[len(CLONE_PREFIX):])
         vid = CLONE_PREFIX + clone_id
 

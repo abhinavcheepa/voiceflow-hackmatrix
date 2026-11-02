@@ -189,10 +189,12 @@ function CloneYourVoice({ profile, onCloned }) {
   const [gender, setGender] = useState("female");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const [success, setSuccess] = useState(false);
 
   async function upload() {
     setBusy(true);
     setError(null);
+    setSuccess(false);
     const form = new FormData();
     form.append("name", name);
     form.append("gender", gender);
@@ -206,6 +208,7 @@ function CloneYourVoice({ profile, onCloned }) {
       });
       const body = await r.json();
       if (!r.ok) throw new Error(body.detail ?? r.statusText);
+      setSuccess(true);
       onCloned();
     } catch (e) {
       setError(e.message);
@@ -310,6 +313,12 @@ function CloneYourVoice({ profile, onCloned }) {
               </div>
               {total < 25 && <p className="text-xs text-dim">Record at least 25 seconds.</p>}
             </div>
+          )}
+
+          {success && (
+            <p className="mt-4 rounded-xl border border-aqua/30 bg-aqua/10 px-4 py-3 text-xs text-aqua font-medium">
+              ✓ Voice cloned and activated successfully! You can test it in “Try it” below.
+            </p>
           )}
 
           {error && (
