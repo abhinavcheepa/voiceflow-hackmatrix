@@ -127,8 +127,9 @@ GREETING = os.getenv(
     f"Namaste! {BUSINESS_NAME} me aapka swagat hai. Main aapki kya madad kar sakti hoon?",
 )
 
-# Anything shorter is a click, a cough, or the mic opening — not a turn.
-MIN_AUDIO_BYTES = 2000
+# Anything shorter than this is empty or micro-burst — not speech.
+# WebM Opus at 24kbps produces ~400-800 bytes for quick 0.3-0.5s words ("haan", "ji", "bill").
+MIN_AUDIO_BYTES = 400
 
 # Spoken when the LLM fails, so the caller hears something instead of silence.
 # Gendered to match the voice — "paayi" from a male voice is the same mismatch
@@ -480,10 +481,12 @@ async def handle_turn(ws, session: Session, audio: bytes) -> None:
 
     t_stt_0 = time.perf_counter()
     try:
+        stt_lang = "hi" if (session.language or "").lower() in ("hi", "hindi", "hinglish", "urdu") else (session.language or None)
         heard = await brain.transcribe(
             audio,
             "turn.webm",
             vocab=session.vocab,
+            language=stt_lang,
             fallback_language=session.language or os.getenv("VOICE_LANGUAGE", "hi"),
         )
     except Exception as e:  # noqa: BLE001

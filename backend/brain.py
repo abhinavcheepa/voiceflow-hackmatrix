@@ -42,7 +42,7 @@ CHAT_API_KEY = os.getenv("CHAT_API_KEY") or GROQ_KEY
 # Hosted models get retired with little warning — llama-3.3-70b-versatile was
 # the default here until Groq dropped it, and every reply started 404ing. If
 # replies stop, check this first: GET /v1/models lists what is actually served.
-CHAT_MODEL = os.getenv("CHAT_MODEL") or "openai/gpt-oss-120b"
+CHAT_MODEL = os.getenv("CHAT_MODEL") or "openai/gpt-oss-20b"
 MAX_REPLY_TOKENS = int(os.getenv("MAX_REPLY_TOKENS") or 400)
 
 
@@ -87,7 +87,7 @@ def chat_providers() -> list[dict]:
 # NVIDIA is not an option here: its speech models ship as self-hosted NIM
 # containers, so there is no endpoint to point a key at.
 STT_PROVIDER = (os.getenv("STT_PROVIDER") or "auto").lower()
-STT_MODEL = os.getenv("GROQ_STT_MODEL") or "whisper-large-v3"
+STT_MODEL = os.getenv("GROQ_STT_MODEL") or "whisper-large-v3-turbo"
 WHISPER_MODEL = os.getenv("WHISPER_MODEL") or os.getenv("LOCAL_STT_MODEL") or "base"
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE") or "int8"
 LOCAL_STT_MODEL = WHISPER_MODEL
@@ -464,7 +464,7 @@ def _effective_fallback_lang(fallback_language: str | None = None) -> str:
     return "hi"
 
 
-def check_audio_loudness(audio: bytes, min_duration_sec: float = 0.4, min_rms: float = 0.008) -> tuple[bool, str]:
+def check_audio_loudness(audio: bytes, min_duration_sec: float = 0.25, min_rms: float = 0.003) -> tuple[bool, str]:
     """RMS/VAD gate before STT call. Returns (ok, reason)."""
     if not audio:
         return False, "audio buffer empty"
@@ -498,8 +498,8 @@ def check_audio_loudness(audio: bytes, min_duration_sec: float = 0.4, min_rms: f
                     return True, f"ok (RMS={rms:.4f}, dur={duration:.2f}s)"
         except Exception as e:
             return False, f"wav parse error: {e}"
-    if len(audio) < 2000:
-        return False, f"audio size too small ({len(audio)} bytes < 2000)"
+    if len(audio) < 400:
+        return False, f"audio size too small ({len(audio)} bytes < 400)"
     return True, "ok"
 
 
@@ -566,9 +566,9 @@ def _filter_stt_segments(segs: list[dict]) -> list[dict]:
     for s in segs:
         if s.get("no_speech_prob", 0) > NO_SPEECH_LIMIT:
             continue
-        if s.get("avg_logprob", 0) < -1.0:
+        if s.get("avg_logprob", 0) < -1.25:
             continue
-        if s.get("compression_ratio", 1.0) > 2.4:
+        if s.get("compression_ratio", 1.0) > 2.5:
             continue
         kept.append(s)
     return kept

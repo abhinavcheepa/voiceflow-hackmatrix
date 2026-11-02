@@ -32,9 +32,9 @@ const TURN_TIMEOUT_MS = 20_000;
 // cancellation leaves). So each clip's first moments teach us how loud that
 // echo is, and only sound clearly above it, held for a moment, counts as the
 // caller cutting in.
-const ECHO_LEARN_MS = 400;
-const BARGE_OVER_ECHO = 2.5;
-const BARGE_MS = 300;
+const ECHO_LEARN_MS = 500;
+const BARGE_OVER_ECHO = 3.2;
+const BARGE_MS = 450;
 
 /** localStorage that never throws (private mode, blocked storage). */
 const store = {
@@ -110,14 +110,14 @@ export default function WebCall() {
   const [callId, setCallId] = useState(null);
   const [agentId, setAgentId] = useState("");
   const [level, setLevel] = useState(null);
-  const [allowBarge, setAllowBarge] = useState(true);
+  const [allowBarge, setAllowBarge] = useState(false);
   // "customer": try your agent as a caller would. "assistant": you are the
   // owner giving orders (bills, WhatsApp, stock) — Jarvis mode.
   const [mode, setMode] = useState(() => store.get("vf_call_mode") || "customer");
   const [pin, setPin] = useState(() => store.get("vf_owner_pin"));
   const [typed, setTyped] = useState("");
   const assistant = mode === "assistant";
-  const bargeOn = useRef(true);
+  const bargeOn = useRef(false);
   useEffect(() => {
     bargeOn.current = allowBarge;
   }, [allowBarge]);
@@ -261,13 +261,14 @@ export default function WebCall() {
           silenceMs.current = 0;
           peakRms.current = 0;
           if (!bargeOn.current || noiseFloor.current === null) return;
+          // Track peak speaker level dynamically so volume rise doesn't trip false barge-in
+          echoPeak.current = Math.max(echoPeak.current, rms);
           if (performance.now() - playStartedAt.current < ECHO_LEARN_MS) {
-            echoPeak.current = Math.max(echoPeak.current, rms);
             return;
           }
           const bar = Math.max(
             echoPeak.current * BARGE_OVER_ECHO,
-            noiseFloor.current * SPEECH_OVER_FLOOR * 1.5,
+            noiseFloor.current * SPEECH_OVER_FLOOR * 2.0,
           );
           bargeMs.current = rms > bar ? bargeMs.current + 16 : 0;
           if (bargeMs.current >= BARGE_MS) {
@@ -376,7 +377,7 @@ export default function WebCall() {
 
     try {
       stream.current = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
       });
     } catch {
       setError("Microphone access denied. Allow it in the browser and try again.");
