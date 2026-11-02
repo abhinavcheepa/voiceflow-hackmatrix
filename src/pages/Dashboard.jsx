@@ -1,4 +1,5 @@
-import { Phone, Clock, TrendingUp, MessageSquare, PhoneIncoming } from "lucide-react";
+import { useState } from "react";
+import { Phone, Clock, TrendingUp, MessageSquare, PhoneIncoming, Activity, RefreshCw, ChevronDown } from "lucide-react";
 import { Card, EmptyState, ErrorNote } from "../ui.jsx";
 import { useApi } from "../api.js";
 
@@ -155,6 +156,97 @@ function SetupStatus({ health }) {
   );
 }
 
+
+function SystemCheckCard() {
+  const { data: doctorData, loading, reload } = useApi("/api/doctor", null, 60000);
+  const [expanded, setExpanded] = useState({});
+
+  if (!doctorData?.checks && !loading) return null;
+
+  const toggle = (idx) => {
+    setExpanded((prev) => ({ ...prev, [idx]: !prev[idx] }));
+  };
+
+  const checks = doctorData?.checks || [];
+
+  return (
+    <Card className="mt-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Activity className="size-4 text-violet-soft" />
+          <h2 className="text-[15px] font-semibold">System Check</h2>
+        </div>
+        <button
+          onClick={() => reload()}
+          disabled={loading}
+          className="flex items-center gap-1.5 rounded-lg border border-line bg-panel-2 px-2.5 py-1 text-xs text-dim transition hover:text-white"
+        >
+          <RefreshCw className={`size-3 ${loading ? "animate-spin" : ""}`} />
+          {loading ? "Checking…" : "Run Doctor"}
+        </button>
+      </div>
+
+      <div className="mt-4 divide-y divide-line/40">
+        {checks.map((c, i) => {
+          const isFail = c.status === "FAIL";
+          const isWarn = c.status === "WARN";
+          const dotColor = isFail ? "bg-rose" : isWarn ? "bg-saffron" : "bg-aqua";
+          const isExp = Boolean(expanded[i]);
+
+          return (
+            <div
+              key={c.name}
+              onClick={() => toggle(i)}
+              className="cursor-pointer py-2.5 transition hover:bg-panel-2/50 rounded-lg px-2"
+            >
+              <div className="flex items-center justify-between gap-3 text-xs">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <span className={`size-2 shrink-0 rounded-full ${dotColor}`} />
+                  <span className="font-medium text-white">{c.name}</span>
+                  <span className="truncate text-dim">{c.message}</span>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <span
+                    className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${
+                      isFail
+                        ? "bg-rose/15 text-rose"
+                        : isWarn
+                        ? "bg-saffron/15 text-saffron"
+                        : "bg-aqua/15 text-aqua"
+                    }`}
+                  >
+                    {c.status}
+                  </span>
+                  <ChevronDown
+                    className={`size-3.5 text-dim transition-transform ${
+                      isExp ? "rotate-180" : ""
+                    }`}
+                  />
+                </div>
+              </div>
+
+              {isExp && (
+                <div className="mt-2.5 space-y-1.5 rounded-lg border border-line bg-panel p-3 text-xs">
+                  <p className="text-dim">
+                    <span className="font-medium text-white">Status: </span>
+                    {c.message}
+                  </p>
+                  {c.fix && c.fix !== "None required." && (
+                    <div className="rounded bg-violet/10 border border-violet/20 p-2 text-violet-soft">
+                      <span className="font-semibold text-white">Suggested Fix: </span>
+                      {c.fix}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
 export default function Dashboard() {
   const { data: stats, error } = useApi("/api/stats", ZERO_STATS);
   const { data: callsByHour } = useApi("/api/calls-by-hour", []);
@@ -188,6 +280,7 @@ export default function Dashboard() {
       </div>
 
       <SetupStatus health={health} />
+      <SystemCheckCard />
 
       <div className="mt-4 grid gap-4 lg:grid-cols-3">
         <CallVolume callsByHour={callsByHour} />

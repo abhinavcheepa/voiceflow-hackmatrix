@@ -238,7 +238,7 @@ function CloneYourVoice({ profile, onCloned }) {
         <>
           {profile?.cloneMissing && (
             <p className="mt-4 rounded-xl border border-saffron/30 bg-saffron/5 px-4 py-3 text-xs text-saffron">
-              Cloning isn't installed yet: {profile.cloneMissing}
+              Clone needs: {profile.cloneMissing}. Falling back to default Edge voice until installed.
             </p>
           )}
           <div className="mt-6 flex flex-col items-center">

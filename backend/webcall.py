@@ -423,8 +423,8 @@ async def speak(ws, session: Session, text: str) -> None:
         session.recorder.add("agent", audio, voice.OUTPUT_EXT)
         await ws.send_bytes(audio)
     except Exception as e:  # noqa: BLE001 - a call without audio still beats a dropped call
-        log.warning("TTS failed on %s: %s", session.id, e)
-        await ws.send_json({"type": "warning", "text": f"Voice unavailable: {e}"})
+        log.warning("TTS failed on %s: %s", session.id, mask_error(e))
+        await ws.send_json({"type": "warning", "text": "Voice abhi available nahi hai."})
 
 
 async def handle_turn(ws, session: Session, audio: bytes) -> None:
@@ -438,7 +438,8 @@ async def handle_turn(ws, session: Session, audio: bytes) -> None:
     try:
         heard = await brain.transcribe(audio, "turn.webm", vocab=session.vocab)
     except Exception as e:  # noqa: BLE001
-        await ws.send_json({"type": "error", "text": f"Could not hear that: {e}"})
+        log.warning("STT failed on %s: %s", session.id, mask_error(e))
+        await ws.send_json({"type": "error", "text": "Abhi thodi takleef hai, thodi der mein try karein."})
         return
 
     if not heard.strip():
@@ -507,7 +508,7 @@ async def respond(ws, session: Session, heard: str) -> None:
         # leaving the caller in silence — the call stays up either way.
         masked_err = mask_error(e)
         log.warning("LLM failed on %s: %s", session.id, masked_err)
-        await ws.send_json({"type": "error", "text": f"Could not answer: {masked_err}"})
+        await ws.send_json({"type": "error", "text": "Abhi thodi takleef hai, thodi der mein try karein."})
         fallback_msg = os.getenv("WEBCALL_FALLBACK") or LLM_FALLBACK_TEXT
         await speak(ws, session, fallback_msg)
         return

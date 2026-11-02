@@ -440,6 +440,14 @@ async def transcribe(audio: bytes, filename: str = "note.ogg", vocab: str = "") 
     Groq outage. No local model installed means no fallback — Groq is reliable
     enough that we don't force the ~460 MB download on everyone.
     """
+    if audio.startswith(b"ID3") or (len(audio) > 2 and audio[0] == 0xFF and (audio[1] & 0xE0) == 0xE0):
+        filename = "note.mp3"
+    elif audio.startswith(b"RIFF"):
+        filename = "note.wav"
+    elif audio.startswith(b"OggS"):
+        filename = "note.ogg"
+    elif audio.startswith(b"\x1a\x45\xdf\xa3"):
+        filename = "note.webm"
     vocab = vocab[:VOCAB_CHARS]
     if stt_backend() == "local":
         text = await asyncio.to_thread(_transcribe_local, audio, vocab)
@@ -543,8 +551,25 @@ def stt_status() -> dict:
 
 def llm_status() -> dict:
     """Structured LLM status for startup self-check and /health."""
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    chat_key = os.getenv("CHAT_API_KEY", "").strip()
+    chat_base = os.getenv("CHAT_BASE_URL", "").strip()
+
     if not configured():
-        return {"status": "fail", "reason": "no LLM API key configured (GROQ_API_KEY or CHAT_API_KEY)"}
+        return {
+            "status": "fail",
+            "reason": "no LLM API key configured — set GROQ_API_KEY (free at console.groq.com) or CHAT_BASE_URL and CHAT_API_KEY in backend/.env",
+            "fix": "Set GROQ_API_KEY in backend/.env or configure CHAT_BASE_URL and CHAT_API_KEY",
+        }
+    if chat_key and groq_key and not chat_base:
+        return {
+            "status": "warn",
+            "provider": CHAT_BASE_URL or "groq",
+            "model": CHAT_MODEL,
+            "reason": "key conflict: CHAT_API_KEY set without CHAT_BASE_URL while GROQ_API_KEY is present — set CHAT_BASE_URL or unset CHAT_API_KEY",
+            "detail": f"{CHAT_BASE_URL or 'groq'} ({CHAT_MODEL})",
+            "fix": "Set CHAT_BASE_URL (e.g. https://integrate.api.nvidia.com/v1) or unset CHAT_API_KEY",
+        }
     provider = CHAT_BASE_URL or "groq"
     return {"status": "ok", "provider": provider, "model": CHAT_MODEL, "detail": f"{provider} ({CHAT_MODEL})"}
 

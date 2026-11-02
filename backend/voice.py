@@ -321,9 +321,12 @@ async def synthesize(text: str, language: str | None = None,
     locale = LANGUAGE_CODES.get(language or "", DEFAULT_LANGUAGE)
 
     if vid.startswith(CLONE_PREFIX):
+        log.info("Speaking reply with cloned voice %s (locale: %s)", vid, locale)
         return await _clone_speak(text, vid, locale)
     if PROVIDER == EDGE_MODEL:
+        log.info("Speaking reply with Edge voice %s (locale: %s)", vid, locale)
         return await _edge_speak(text, vid, locale)
+    log.info("Speaking reply with Cartesia voice %s (locale: %s)", vid, locale)
     return await _cartesia_speak(text, vid, locale)
 
 
@@ -368,7 +371,7 @@ async def _clone_speak(text: str, vid: str, locale: str) -> bytes:
             timeout=clone_timeout,
         )
     except Exception as e:  # noqa: BLE001 - a stock voice beats a silent turn
-        log.warning("clone conversion failed or timed out (%s), speaking the base voice: %s", type(e).__name__, e)
+        log.warning("Clone conversion failed or timed out (%s); using base voice %s: %s", type(e).__name__, base_voice, e)
         return base
 
 

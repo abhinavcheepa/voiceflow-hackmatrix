@@ -275,6 +275,18 @@ def system_status() -> dict:
     }
 
 
+@app.get("/api/doctor")
+async def get_doctor_diagnostics(request: Request) -> dict:
+    """Run full diagnostic doctor checks and return results for the dashboard System Check card."""
+    auth.require_auth(request)
+    import doctor
+    checks = await doctor.run_doctor_checks()
+    return {
+        "ok": all(c.get("status") != "FAIL" for c in checks),
+        "checks": checks,
+    }
+
+
 @app.post("/api/system/controls")
 def system_controls(
     automation: bool | None = Body(None),

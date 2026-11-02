@@ -6,7 +6,7 @@ import { useCallback, useEffect, useState } from "react";
 export const API = import.meta.env.VITE_API_URL ?? "";
 
 export function getApiToken() {
-  return localStorage.getItem("voiceflow_api_token") || import.meta.env.VITE_API_TOKEN || "";
+  return localStorage.getItem("voiceflow_api_token") || "";
 }
 
 export function setApiToken(token) {

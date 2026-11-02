@@ -31,6 +31,13 @@ calls need hardware that isn't set up yet — see [Telephony](#telephony).
 
 ---
 
+### Data & Privacy
+
+Understand where audio, transcripts, and customer messages flow:
+- **With `GROQ_API_KEY` and `STT_PROVIDER=auto`**: Caller audio recordings and transcribed conversational turns are transmitted to Groq's cloud infrastructure (`api.groq.com`) for speech-to-text and LLM generation.
+- **With `STT_PROVIDER=local` and a local LLM**: Audio transcription runs strictly on your machine's CPU via `faster-whisper`, and replies are generated on-premise without outbound data transfer.
+- **Speech Synthesis (TTS)**: Microsoft Edge TTS (`VOICE_PROVIDER=edge`) connects to Microsoft's cloud endpoints (`speech.platform.bing.com`) to synthesize spoken replies into MP3 audio. Not all data stays local unless a local offline TTS engine is installed.
+
 ## Quick start
 
 Requirements: **Node 18+**, **Python 3.10+**.
@@ -64,16 +71,24 @@ Open **http://localhost:5174/app**.
 1. **Set your LLM Key in `backend/.env`**:
    - **Groq (Free)**: Sign up at [console.groq.com/keys](https://console.groq.com/keys) and set `GROQ_API_KEY=gsk_...`.
    - **Or NVIDIA NIM (Free)**: Sign up at [build.nvidia.com](https://build.nvidia.com) and set `CHAT_BASE_URL=https://integrate.api.nvidia.com/v1` and `CHAT_API_KEY=nvapi-...`.
-2. **Verify `/health` Self-Check**:
+2. **Run the Diagnostic Doctor**:
+   Before running a demo, verify all subsystems locally with:
+   ```bash
+   python backend/doctor.py
+   ```
+   Every core check (`Network`, `.env`, `LLM`, `STT`, `TTS`, `ffmpeg`, `Web-Call`, `Security`) must report `[ OK ]`.
+3. **Verify `/health` Self-Check**:
    Start the backend (`cd backend && uvicorn main:app --port 8000`) and query the health endpoint:
    ```bash
    curl http://127.0.0.1:8000/health
    ```
-   Confirm that the `self_check` response shows status `ok` across all core subsystems:
-   - `stt`: `local` (faster-whisper base, compute int8) or `groq`
-   - `tts`: `edge`
-   - `ffmpeg`: status `ok`
-   - `llm`: status `ok`
+   Confirm that `self_check` reports status `ok` across all core subsystems.
+
+#### Demo-Day Risks & Contingencies
+Before presenting or demonstrating live:
+1. **Venue DNS / Internet Outage**: Cloud LLM, Groq STT, and Edge TTS require internet. **Fallback**: Keep your smartphone's 4G/5G mobile hotspot active and ready to switch Wi-Fi networks in seconds.
+2. **Edge TTS Online Requirement**: `VOICE_PROVIDER=edge` streams speech audio in real-time from `speech.platform.bing.com`. If the network drops, WebCall falls back to display text and WhatsApp falls back to text replies.
+3. **WhatsApp Web Unofficial Ban Risk**: Running automated browser sessions via `whatsapp-web.js` carries risk of number flags or session disconnection. **Always** use a dedicated disposable or business test SIM, never your primary personal phone number.
 
 ### Connect WhatsApp (Local Web Bridge)
 
@@ -170,6 +185,10 @@ When running in production (`ENV=production` in Docker or root `.env`) with an `
      ```javascript
      localStorage.setItem("voiceflow_api_token", "your_api_token_here");
      location.reload();
+     ```
+  5. Verify no build-time credentials leak into production client assets:
+     ```bash
+     grep -rn "VITE_API_TOKEN" dist/  # returns 0 occurrences
      ```
 
 ---

@@ -125,12 +125,13 @@ async def test_webcall_llm_failure_does_not_blame_mic(monkeypatch):
         assert "sun nahi paaya" not in spoken
         assert "takleef" in spoken
 
-    # Verify error sent to client masks the API key
+    # Verify error sent to client is generic (Fix B.1: browser never sees provider exception text)
     error_sent = False
     for call in mock_ws.send_json.call_args_list:
         payload = call[0][0]
         if payload.get("type") == "error":
             error_sent = True
             assert "gsk_testsecret123456" not in payload.get("text", "")
-            assert "gsk_***" in payload.get("text", "")
+            assert "Groq 500" not in payload.get("text", "")
+            assert payload.get("text") == "Abhi thodi takleef hai, thodi der mein try karein."
     assert error_sent
