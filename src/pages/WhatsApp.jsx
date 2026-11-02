@@ -153,6 +153,7 @@ export default function WhatsApp() {
   const [imported, setImported] = useState(null);
   const [allowlist, setAllowlist] = useState("");
   const [allowlistSaved, setAllowlistSaved] = useState(false);
+  const [dismissedError, setDismissedError] = useState(null);
   const allowlistRef = useRef(allowlist); // latest value for unload handler
   const saveTimerRef = useRef(null);
 
@@ -273,13 +274,26 @@ export default function WhatsApp() {
               </span>
             )}
           </div>
-          {waStatus?.last_error && (
-            <div className="mt-2.5 rounded-lg border border-rose-500/30 bg-rose-500/10 px-2.5 py-1.5 text-[11px] text-rose-300 flex items-start gap-1.5">
-              <AlertTriangle className="size-3.5 shrink-0 mt-0.5 text-rose-400" />
-              <div className="min-w-0 flex-1">
-                <span className="font-semibold text-rose-200">Last Error: </span>
-                <span className="font-mono text-[10px] break-all">{waStatus.last_error}</span>
+          {waStatus?.last_error && waStatus.last_error !== dismissedError && (
+            <div className="mt-2.5 rounded-lg border border-rose-500/30 bg-rose-500/10 px-2.5 py-1.5 text-[11px] text-rose-300 flex items-start justify-between gap-1.5">
+              <div className="flex items-start gap-1.5 min-w-0 flex-1">
+                <AlertTriangle className="size-3.5 shrink-0 mt-0.5 text-rose-400" />
+                <div className="min-w-0 flex-1">
+                  <span className="font-semibold text-rose-200">Last Error: </span>
+                  <span className="font-mono text-[10px] break-all">{waStatus.last_error}</span>
+                </div>
               </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setDismissedError(waStatus.last_error);
+                  post("/api/whatsapp/clear-error", {}).catch(() => {});
+                }}
+                className="text-rose-400 hover:text-white px-1 leading-none text-xs ml-1"
+                title="Dismiss error"
+              >
+                ✕
+              </button>
             </div>
           )}
           {waStatus?.qr && waStatus?.qr_state === "waiting" && (

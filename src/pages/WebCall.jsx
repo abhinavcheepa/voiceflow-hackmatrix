@@ -14,15 +14,15 @@ const WS_BASE = `${(API || window.location.origin).replace(/^http/, "ws")}/api/w
 // wrong on the first quiet laptop mic they met: real speech never cleared the
 // bar, every turn was discarded, and the call simply never responded. Mic gain
 // varies enormously between machines, so calibrate against this room instead.
-const CALIBRATE_FRAMES = 45;  // ambient frames to measure before trusting a floor
-const SILENCE_OVER_FLOOR = 2.0;  // speech starts at 2x the noise floor
-const SPEECH_OVER_FLOOR = 3.5;   // a real voice peaks well past that
-const FLOOR_MIN = 0.004;    // a silent room still needs a non-zero bar
+const CALIBRATE_FRAMES = 30;  // ambient frames to measure before trusting a floor
+const SILENCE_OVER_FLOOR = 1.3;  // speech starts at 1.3x the noise floor
+const SPEECH_OVER_FLOOR = 1.8;   // conversational speech peaks comfortably past this
+const FLOOR_MIN = 0.003;    // a silent room still needs a non-zero bar
 const FLOOR_MAX = 0.030;    // a noisy room must not set an impossible one
 
-const SILENCE_MS = 800;    // how long silence must hold to end a turn (sharper listening)
-const MIN_SPEECH_MS = 300;  // ignore coughs, clicks and door slams
-const MAX_TURN_MS = 12_000; // never wait longer than this for a silence
+const SILENCE_MS = 450;    // fast natural turn turnaround (~450ms silence)
+const MIN_SPEECH_MS = 180;  // capture short crisp words ("haan", "ji", "bill")
+const MAX_TURN_MS = 10_000; // never wait longer than this for a silence
 
 // A turn normally completes in 4-6s. Past this the backend is not coming back,
 // so stop waiting for it and let the caller speak again.

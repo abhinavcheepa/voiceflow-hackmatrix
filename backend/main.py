@@ -511,11 +511,13 @@ async def whatsapp_status(request: Request) -> dict:
             last_incoming_time = row[2]
 
         if not last_error:
-            err_row = conn.execute(
-                "SELECT body, created_at FROM messages WHERE failed = 1 ORDER BY created_at DESC LIMIT 1"
+            # Only report error if the most recent outbound message failed.
+            # If newer messages succeeded, past errors are considered resolved.
+            last_outbound = conn.execute(
+                "SELECT body, failed FROM messages WHERE sender = 'us' ORDER BY id DESC LIMIT 1"
             ).fetchone()
-            if err_row:
-                last_error = err_row[0]
+            if last_outbound and last_outbound[1] == 1:
+                last_error = last_outbound[0]
 
     return {
         "provider": provider,
@@ -527,6 +529,14 @@ async def whatsapp_status(request: Request) -> dict:
         "last_incoming_time": last_incoming_time,
         "last_error": last_error,
     }
+
+
+@app.post("/api/whatsapp/clear-error")
+def clear_whatsapp_error(request: Request) -> dict:
+    auth.require_auth(request)
+    with db.connect() as conn:
+        conn.execute("UPDATE messages SET failed = 0 WHERE failed = 1")
+    return {"ok": True}
 
 
 @app.post("/api/whatsapp/allowlist")
