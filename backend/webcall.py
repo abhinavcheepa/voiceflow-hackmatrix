@@ -485,14 +485,14 @@ async def handle_turn(ws, session: Session, audio: bytes) -> None:
 
     t_stt_0 = time.perf_counter()
     try:
-        stt_lang = "hi" if (session.language or "").lower() in ("hi", "hindi", "hinglish", "urdu") else (session.language or None)
+        stt_lang = brain.to_iso_lang(session.language)
         brain.last_stt_status = "rejected"
         heard = await brain.transcribe(
             audio,
             "turn.webm",
             vocab=session.vocab,
             language=stt_lang,
-            fallback_language=session.language or os.getenv("VOICE_LANGUAGE", "hi"),
+            fallback_language=stt_lang or os.getenv("VOICE_LANGUAGE", "hi"),
         )
     except Exception as e:  # noqa: BLE001
         log.warning("STT failed on %s: %s", session.id, mask_error(e))

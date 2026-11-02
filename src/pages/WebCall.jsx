@@ -15,9 +15,9 @@ const WS_BASE = `${(API || window.location.origin).replace(/^http/, "ws")}/api/w
 // bar, every turn was discarded, and the call simply never responded. Mic gain
 // varies enormously between machines, so calibrate against this room instead.
 const CALIBRATE_FRAMES = 30;  // ambient frames to measure before trusting a floor
-const SILENCE_OVER_FLOOR = 1.3;  // speech starts at 1.3x the noise floor
-const SPEECH_OVER_FLOOR = 1.8;   // conversational speech peaks comfortably past this
-const FLOOR_MIN = 0.003;    // a silent room still needs a non-zero bar
+const SILENCE_OVER_FLOOR = 1.15; // speech starts at 1.15x the noise floor
+const SPEECH_OVER_FLOOR = 1.35;  // conversational speech peaks comfortably past this
+const FLOOR_MIN = 0.002;    // a silent room still needs a non-zero bar
 const FLOOR_MAX = 0.030;    // a noisy room must not set an impossible one
 
 const SILENCE_MS = 450;    // fast natural turn turnaround (~450ms silence)
@@ -700,10 +700,16 @@ export default function WebCall() {
               <p className="mt-1.5 text-center text-[11px] text-dim">
                 Mic level — speak past the threshold line to be heard
               </p>
-              {status === "listening" && level.rms < level.speechBar * 0.5 && (
-                <p className="mt-1 text-center text-xs font-medium text-amber-400">
-                  Speak closer — mic volume too low
-                </p>
+              {status === "listening" && (
+                level.rms >= level.speechBar ? (
+                  <p className="mt-1 text-center text-xs font-medium text-aqua">
+                    ✓ Voice detected
+                  </p>
+                ) : (
+                  <p className="mt-1 text-center text-xs text-dim">
+                    Listening… speak clearly into your mic
+                  </p>
+                )
               )}
             </div>
           )}

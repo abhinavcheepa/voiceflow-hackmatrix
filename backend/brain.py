@@ -462,8 +462,28 @@ def _local_stt_available() -> bool:
 ALLOWED_STT_LANGUAGES = {"hi", "en", "ur", "hindi", "english", "urdu"}
 
 
+def to_iso_lang(lang: str | None) -> str | None:
+    """Normalize language names ('English', 'Hindi', 'hi', etc.) to 2-letter ISO codes."""
+    if not lang:
+        return None
+    l = str(lang).strip().lower()
+    mapping = {
+        "en": "en", "english": "en",
+        "hi": "hi", "hindi": "hi", "hinglish": "hi",
+        "ur": "ur", "urdu": "ur",
+        "ta": "ta", "tamil": "ta",
+        "mr": "mr", "marathi": "mr",
+        "te": "te", "telugu": "te",
+        "bn": "bn", "bengali": "bn",
+        "gu": "gu", "gujarati": "gu",
+        "kn": "kn", "kannada": "kn",
+        "ml": "ml", "malayalam": "ml",
+    }
+    return mapping.get(l, l[:2] if len(l) >= 2 else None)
+
+
 def _effective_fallback_lang(fallback_language: str | None = None) -> str:
-    fb = (fallback_language or os.getenv("VOICE_LANGUAGE", "hi")).strip().lower()
+    fb = to_iso_lang(fallback_language) or to_iso_lang(os.getenv("VOICE_LANGUAGE", "hi")) or "hi"
     if fb in ("en", "english"):
         return "en"
     return "hi"
@@ -636,8 +656,9 @@ async def _transcribe_groq_detailed(
         "temperature": 0,
         "prompt": prompt_hint,
     }
-    if language:
-        data["language"] = language
+    iso_lang = to_iso_lang(language)
+    if iso_lang:
+        data["language"] = iso_lang
 
     r = await _post(
         http(),
@@ -810,11 +831,12 @@ def _transcribe_local(
 
     effective_fb = _effective_fallback_lang(fallback_language)
     prompt_hint = f"Hindi, English, Hinglish conversation: Namaste, Hello. {vocab}".strip()[:VOCAB_CHARS]
+    iso_lang = to_iso_lang(language)
 
     try:
-        if language:
+        if iso_lang:
             segments, _ = model.transcribe(
-                io.BytesIO(audio), beam_size=1, temperature=0.0, language=language, initial_prompt=prompt_hint or None
+                io.BytesIO(audio), beam_size=1, temperature=0.0, language=iso_lang, initial_prompt=prompt_hint or None
             )
         else:
             segments, info = model.transcribe(
