@@ -714,10 +714,11 @@ async def voice_clone(request: Request, name: str = Form(...), samples: list[Upl
             mime = upload_security.validate_magic_bytes_audio(data, safe_name)
             payload.append((safe_name, data, mime))
 
+        clone_timeout = float(os.getenv("VOICE_CLONE_TIMEOUT", "120.0"))
         try:
             voice_id = await asyncio.wait_for(
                 voice.clone(name, payload, gender_=gender),
-                timeout=upload_security.PARSING_TIMEOUT_SECONDS * 2
+                timeout=clone_timeout
             )
         except asyncio.TimeoutError:
             raise HTTPException(408, "Voice cloning operation timed out.")

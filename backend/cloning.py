@@ -56,7 +56,6 @@ def _init_models():
 
     try:
         from openvoice.api import ToneColorConverter
-        from openvoice.se_extractor import get_se
 
         ckpt = _CHECKPOINTS_DIR / "converter"
         config_path = ckpt / "config.json"
@@ -68,7 +67,11 @@ def _init_models():
 
         _CONVERTER = ToneColorConverter(str(config_path), device=_DEVICE)
         _CONVERTER.load_ckpt(str(model_path))
-        _EXTRACTOR = get_se
+        try:
+            from openvoice.se_extractor import get_se
+            _EXTRACTOR = get_se
+        except Exception:
+            _EXTRACTOR = None
         logger.info("OpenVoice v2 ToneColorConverter loaded successfully on %s", _DEVICE)
     except Exception as e:
         logger.error("Failed to initialize OpenVoice v2: %s", e, exc_info=True)
@@ -97,16 +100,19 @@ def enroll(clips: list[bytes]) -> str:
         raise ValueError("No audio clips provided for voice cloning")
     cid = hashlib.sha256(b"".join(clips)).hexdigest()[:16]
     import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp.write(clips[0])
-        tmp_path = tmp.name
+    tmp_paths: list[str] = []
     try:
-        enroll_sample(tmp_path, cid)
+        for c in clips:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp.write(c)
+                tmp_paths.append(tmp.name)
+        enroll_samples(tmp_paths, cid)
     finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+        for p in tmp_paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
     return cid
 
 
@@ -147,14 +153,24 @@ def _path(clone_id: str) -> Path:
 
 def enroll_sample(sample_path: str, clone_id: str) -> dict:
     """Extract speaker embedding from sample audio and save to disk + cache."""
+    return enroll_samples([sample_path], clone_id)
+
+
+def enroll_samples(sample_paths: list[str], clone_id: str) -> dict:
+    """Extract speaker embedding from sample audios directly and save to disk + cache.
+
+    Uses ToneColorConverter.extract_se directly on local audio files, running completely
+    offline without Silero-VAD downloads or Whisper CUDA dependencies.
+    """
     _init_models()
-    if _CONVERTER is None or _EXTRACTOR is None:
+    if _CONVERTER is None:
         raise RuntimeError("OpenVoice v2 models not available")
 
     import torch
     out_pt = _path(clone_id)
-    se, audio_name = _EXTRACTOR(sample_path, _CONVERTER, target_dir=str(_CLONES_DIR), vad=True)
-    torch.save(se, str(out_pt))
+    se = _CONVERTER.extract_se(sample_paths, se_save_path=str(out_pt))
+    if not out_pt.exists():
+        torch.save(se, str(out_pt))
 
     # Update in-memory target cache
     _target_cache[clone_id] = se
@@ -209,7 +225,7 @@ def convert(
     - Saves output MP3 to recordings/cloned/ and records in SQLite DB.
     """
     _init_models()
-    if _CONVERTER is None or _EXTRACTOR is None:
+    if _CONVERTER is None:
         logger.warning("ToneColorConverter unavailable, returning base audio")
         return base_audio_bytes
 
@@ -241,8 +257,8 @@ def convert(
         tmp_out = tmp_in + ".converted.wav"
         tmp_base_se = tmp_in + ".se.pt"
 
-        # Extract base audio speaker embedding
-        base_se, _ = _EXTRACTOR(tmp_in, _CONVERTER, target_dir=os.path.dirname(tmp_in), vad=False)
+        # Extract base audio speaker embedding directly (offline, no network or whisper-cuda dependency)
+        base_se = _CONVERTER.extract_se([tmp_in])
 
         # Convert tone color (tau=0.20 balances speaker timbre without distorting phonemes)
         _CONVERTER.convert(
