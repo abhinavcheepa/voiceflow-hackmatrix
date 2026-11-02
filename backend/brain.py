@@ -22,6 +22,15 @@ log = logging.getLogger("voiceflow.brain")
 
 GROQ_URL = "https://api.groq.com/openai/v1"
 GROQ_KEY = os.getenv("GROQ_API_KEY", "")
+if not GROQ_KEY and not os.getenv("CHAT_API_KEY"):
+    from pathlib import Path
+    from dotenv import load_dotenv
+    _b = Path(__file__).resolve().parent
+    if (_b / ".env").is_file():
+        load_dotenv(_b / ".env")
+    if (_b.parent / ".env").is_file():
+        load_dotenv(_b.parent / ".env")
+    GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 
 # Reply generation. Any OpenAI-compatible provider works — set CHAT_BASE_URL to
 # https://integrate.api.nvidia.com/v1 with an nvapi- key to use NVIDIA instead.

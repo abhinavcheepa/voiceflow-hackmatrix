@@ -7,10 +7,26 @@ Vapi only runs the conversation.
 """
 
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()  # must run before the local imports read os.getenv at import time
+# Ensure .env is found whether started from repository root, backend/, or container
+_base_dir = Path(__file__).resolve().parent
+_root_dir = _base_dir.parent
+
+if (_base_dir / ".env").is_file():
+    load_dotenv(_base_dir / ".env")
+if (_root_dir / ".env").is_file():
+    load_dotenv(_root_dir / ".env")
+load_dotenv()
+
+# If GROQ_API_KEY / CHAT_API_KEY was shadowed or empty, re-try loading with override
+if not os.getenv("GROQ_API_KEY") and not os.getenv("CHAT_API_KEY"):
+    if (_base_dir / ".env").is_file():
+        load_dotenv(_base_dir / ".env", override=True)
+    if (_root_dir / ".env").is_file():
+        load_dotenv(_root_dir / ".env", override=True)
 
 # A key that exists in .env but is left blank returns "", and os.getenv's
 # default never fires — so `CHAT_BASE_URL=` silently became an empty URL rather
