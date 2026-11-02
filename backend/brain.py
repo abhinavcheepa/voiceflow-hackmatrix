@@ -314,6 +314,10 @@ ALIEN_SCRIPT_RE = re.compile(
 # Above this, Whisper itself believes the audio held no speech.
 NO_SPEECH_LIMIT = float(os.getenv("STT_NO_SPEECH_LIMIT") or 0.6)
 
+# Track last STT turn status for webcall routing: 'valid' | 'silence' | 'rejected'
+last_stt_status: str = "valid"
+last_stt_reason: str = "ok"
+
 
 def _clean(text: str) -> str:
     """Empty string for anything that looks like a hallucination, not speech."""
@@ -339,8 +343,9 @@ def _clean(text: str) -> str:
     if ALIEN_SCRIPT_RE.search(stripped):
         log.debug("dropped foreign-script hallucination: %r", stripped[:60])
         return ""
-    # A single short token carries no intent and is almost always noise.
-    if len(stripped) < 3:
+    # Valid short words ("ji", "ha", "ok", "no", "haan", "nahi") must never be rejected.
+    # Only drop pure single punctuation/symbol noise.
+    if len(stripped) < 2:
         return ""
     return stripped
 
@@ -503,28 +508,26 @@ def check_audio_loudness(audio: bytes, min_duration_sec: float = 0.25, min_rms: 
     return True, "ok"
 
 
-async def transcribe(
+async def transcribe_detailed(
     audio: bytes,
     filename: str = "note.ogg",
     vocab: str = "",
     language: str | None = None,
     fallback_language: str | None = None,
-) -> str:
-    """Speech-to-text. Language constrained to Hindi/English (hi, en).
-
-    `vocab` primes Whisper with words it should expect — the product name and
-    people's names. Without it "VoiceFlow" came back as "Vice Flow" and a
-    contact's name as an unrelated phrase, so a name could never be matched.
-
-    Hosted Groq Whisper is primary; if it fails and faster-whisper is installed,
-    fall back to on-device transcription so a caller is still heard through a
-    Groq outage. No local model installed means no fallback — Groq is reliable
-    enough that we don't force the ~460 MB download on everyone.
+) -> tuple[str, str, str]:
+    """Detailed transcription returning (text, status, reason).
+    status is one of:
+      - 'silence': below VAD/RMS threshold, empty wav, or Whisper detected no speech.
+      - 'rejected': sound was heard, but failed objective quality/hallucination checks.
+      - 'valid': valid speech text.
     """
+    global last_stt_status, last_stt_reason
     ok, reason = check_audio_loudness(audio)
     if not ok:
         log.debug("transcribe: rejected audio by RMS/VAD gate (%s)", reason)
-        return ""
+        last_stt_status = "silence"
+        last_stt_reason = f"vad_gate: {reason}"
+        return "", "silence", last_stt_reason
 
     if audio.startswith(b"ID3") or (len(audio) > 2 and audio[0] == 0xFF and (audio[1] & 0xE0) == 0xE0):
         filename = "note.mp3"
@@ -535,17 +538,60 @@ async def transcribe(
     elif audio.startswith(b"\x1a\x45\xdf\xa3"):
         filename = "note.webm"
     vocab = vocab[:VOCAB_CHARS]
+
     if stt_backend() == "local":
-        text = await asyncio.to_thread(_transcribe_local, audio, vocab, language, fallback_language)
-    else:
-        try:
-            text = await _transcribe_groq(audio, filename, vocab, language, fallback_language)
-        except Exception as e:  # noqa: BLE001 - any Groq failure is worth a local retry
-            if not _local_stt_available():
-                raise
-            log.warning("Groq STT failed (%s) — falling back to local whisper", type(e).__name__)
-            text = await asyncio.to_thread(_transcribe_local, audio, vocab, language, fallback_language)
-    return "" if vocab and _echoes_vocab(text, vocab) else text
+        raw_text = await asyncio.to_thread(_transcribe_local, audio, vocab, language, fallback_language)
+        if not raw_text.strip():
+            last_stt_status = "silence"
+            last_stt_reason = "local_empty"
+            return "", "silence", "local_empty"
+        cleaned = _clean(raw_text)
+        if not cleaned:
+            last_stt_status = "rejected"
+            last_stt_reason = "local_hallucination_or_degenerate"
+            return "", "rejected", last_stt_reason
+        last_stt_status = "valid"
+        last_stt_reason = "ok"
+        return cleaned, "valid", "ok"
+
+    try:
+        raw_text, status, reason = await _transcribe_groq_detailed(audio, filename, vocab, language, fallback_language)
+        if vocab and _echoes_vocab(raw_text, vocab):
+            last_stt_status = "silence"
+            last_stt_reason = "echoes_vocab"
+            return "", "silence", "echoes_vocab"
+        last_stt_status = status
+        last_stt_reason = reason
+        return raw_text, status, reason
+    except Exception as e:  # noqa: BLE001 - any Groq failure is worth a local retry
+        if not _local_stt_available():
+            raise
+        log.warning("Groq STT failed (%s) — falling back to local whisper", type(e).__name__)
+        raw_text = await asyncio.to_thread(_transcribe_local, audio, vocab, language, fallback_language)
+        if not raw_text.strip():
+            last_stt_status = "silence"
+            last_stt_reason = "fallback_local_empty"
+            return "", "silence", "fallback_local_empty"
+        cleaned = _clean(raw_text)
+        if not cleaned:
+            last_stt_status = "rejected"
+            last_stt_reason = "fallback_local_hallucination"
+            return "", "rejected", last_stt_reason
+        last_stt_status = "valid"
+        last_stt_reason = "ok"
+        return cleaned, "valid", "ok"
+
+
+async def transcribe(
+    audio: bytes,
+    filename: str = "note.ogg",
+    vocab: str = "",
+    language: str | None = None,
+    fallback_language: str | None = None,
+) -> str:
+    """Speech-to-text. Language constrained to Hindi/English (hi, en)."""
+    text, _, _ = await transcribe_detailed(audio, filename, vocab, language, fallback_language)
+    return text
 
 
 # Whisper's prompt is capped at 224 tokens; names average a few tokens each.
@@ -574,13 +620,13 @@ def _filter_stt_segments(segs: list[dict]) -> list[dict]:
     return kept
 
 
-async def _transcribe_groq(
+async def _transcribe_groq_detailed(
     audio: bytes,
     filename: str,
     vocab: str = "",
     language: str | None = None,
     fallback_language: str | None = None,
-) -> str:
+) -> tuple[str, str, str]:
     effective_fb = _effective_fallback_lang(fallback_language)
     prompt_hint = f"Hindi, English, Hinglish conversation: Namaste, Hello. {vocab}".strip()[:VOCAB_CHARS]
 
@@ -603,10 +649,14 @@ async def _transcribe_groq(
     body = r.json()
 
     raw_segments = body.get("segments") or []
+    # If all segments were detected as no_speech, this is silence/noise
+    if raw_segments and all(s.get("no_speech_prob", 0) > NO_SPEECH_LIMIT for s in raw_segments):
+        return "", "silence", "all_segments_no_speech"
+
     segments = _filter_stt_segments(raw_segments)
     if raw_segments and not segments:
         log.debug("dropped: all segments failed STT quality threshold (no_speech/logprob/compression)")
-        return ""
+        return "", "rejected", "segments_failed_quality"
 
     detected_lang = (body.get("language") or "").strip().lower()
     duration = float(body.get("duration") or 0.0)
@@ -634,13 +684,32 @@ async def _transcribe_groq(
         )
         body = r_retry.json()
         raw_segments = body.get("segments") or []
+        if raw_segments and all(s.get("no_speech_prob", 0) > NO_SPEECH_LIMIT for s in raw_segments):
+            return "", "silence", "retry_all_segments_no_speech"
         segments = _filter_stt_segments(raw_segments)
         if raw_segments and not segments:
-            return ""
+            return "", "rejected", "retry_segments_failed_quality"
 
     joined = " ".join(s.get("text", "") for s in segments if s.get("text")).strip() if segments else ""
-    text = joined or body.get("text", "")
-    return _clean(text)
+    raw_text = joined or body.get("text", "")
+    if not raw_text.strip():
+        return "", "silence", "empty_text"
+
+    cleaned = _clean(raw_text)
+    if not cleaned:
+        return "", "rejected", f"cleaned_hallucination: {raw_text[:40]}"
+    return cleaned, "valid", "ok"
+
+
+async def _transcribe_groq(
+    audio: bytes,
+    filename: str,
+    vocab: str = "",
+    language: str | None = None,
+    fallback_language: str | None = None,
+) -> str:
+    text, _, _ = await _transcribe_groq_detailed(audio, filename, vocab, language, fallback_language)
+    return text
 
 
 _local_model = None
@@ -1106,6 +1175,7 @@ async def reply(phone: str, message: str, history: list[dict] | None = None,
     # When the model returns text with no tool call, the turn ends immediately
     # and that single message is returned. Texts are never concatenated across iterations.
     rounds = 4
+    last_tool_sigs = None
     for _round in range(rounds):
         msg = await _chat_once(messages, with_tools=use_tools, is_owner=is_owner)
         calls = msg.get("tool_calls")
@@ -1120,6 +1190,17 @@ async def reply(phone: str, message: str, history: list[dict] | None = None,
                 f"({MAX_REPLY_TOKENS}) was consumed by reasoning. Raise "
                 f"MAX_REPLY_TOKENS or lower REASONING_EFFORT in backend/.env."
             )
+
+        # Loop breaker: if identical tool call is repeated consecutively in the loop, break!
+        current_sigs = [(tc.get("function", {}).get("name"), tc.get("function", {}).get("arguments")) for tc in calls]
+        if last_tool_sigs is not None and current_sigs == last_tool_sigs:
+            log.warning("Loop breaker triggered: identical tool call repeated consecutively %r", current_sigs)
+            content = (msg.get("content") or "").strip()
+            if content:
+                return sanitize_output(fix_gender(content, gender), is_owner=is_owner)
+            raise RuntimeError("model kept calling tools without answering: duplicate tool call loop detected")
+        last_tool_sigs = current_sigs
+
         # Run each requested tool and hand the results back for a spoken reply.
         messages.append(msg)  # the assistant message must precede its tool results
         for tc in calls:

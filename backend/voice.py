@@ -22,6 +22,68 @@ import db
 
 log = logging.getLogger("voiceflow.voice")
 
+
+class TTSCircuitBreaker:
+    """In-memory circuit breaker for TTS to avoid hanging calls during outages.
+    Trips open after 5 failures within 30 seconds.
+    Stays open for 60 seconds (switching callers to text-only mode).
+    After 60 seconds, allows a single probe attempt (HALF_OPEN).
+    """
+
+    def __init__(self, failure_threshold: int = 5, window_sec: float = 30.0, reset_sec: float = 60.0):
+        self.failure_threshold = failure_threshold
+        self.window_sec = window_sec
+        self.reset_sec = reset_sec
+        self.failure_times: list[float] = []
+        self.state: str = "CLOSED"  # "CLOSED", "OPEN", "HALF_OPEN"
+        self.opened_at: float = 0.0
+
+    def can_attempt(self) -> bool:
+        import time
+
+        now = time.time()
+        if self.state == "OPEN":
+            if now - self.opened_at >= self.reset_sec:
+                self.state = "HALF_OPEN"
+                log.info("TTS circuit breaker HALF_OPEN - allowing single probe attempt")
+                return True
+            return False
+        return True
+
+    def record_success(self) -> None:
+        if self.state == "HALF_OPEN":
+            log.info("TTS circuit breaker probe succeeded - resetting to CLOSED")
+        self.state = "CLOSED"
+        self.failure_times.clear()
+
+    def record_failure(self) -> None:
+        import time
+
+        now = time.time()
+        if self.state == "HALF_OPEN":
+            log.warning("TTS probe failed - reopening circuit breaker for %ds", int(self.reset_sec))
+            self.state = "OPEN"
+            self.opened_at = now
+            return
+
+        self.failure_times = [t for t in self.failure_times if now - t <= self.window_sec]
+        self.failure_times.append(now)
+        if len(self.failure_times) >= self.failure_threshold:
+            self.state = "OPEN"
+            self.opened_at = now
+            log.warning(
+                "TTS circuit breaker OPEN (5 failures in 30s) - falling back to text-only mode for %ds",
+                int(self.reset_sec),
+            )
+
+    def reset(self) -> None:
+        self.state = "CLOSED"
+        self.failure_times.clear()
+        self.opened_at = 0.0
+
+
+circuit_breaker = TTSCircuitBreaker()
+
 PROVIDER = (os.getenv("VOICE_PROVIDER") or "edge").lower()
 
 VOICE_ID_KEY = "voice_id"
@@ -314,22 +376,32 @@ async def synthesize(text: str, language: str | None = None,
 
     `as_voice` auditions a specific voice without changing the saved one.
     """
+    if not circuit_breaker.can_attempt():
+        raise RuntimeError("TTS circuit breaker is OPEN (text-only mode active)")
+
     text = speakable(text) or text
     vid = as_voice or voice_id()
     if not vid:
         raise RuntimeError("No voice selected — pick one in Voice Studio first")
     locale = LANGUAGE_CODES.get(language or "", DEFAULT_LANGUAGE)
 
-    if vid.startswith(CLONE_PREFIX):
-        log.info("Reply voice requested: clone %s (locale: %s)", vid, locale)
-        return await _clone_speak(text, vid, locale)
-    if PROVIDER == EDGE_MODEL:
-        by_language = EDGE_MALE_BY_LANGUAGE if gender(vid) == "male" else EDGE_BY_LANGUAGE
-        effective_voice = vid if vid.startswith(f"{locale}-") else by_language.get(locale, vid)
-        log.info("Reply synthesized using Edge voice: %s (locale: %s)", effective_voice, locale)
-        return await _edge_speak(text, vid, locale)
-    log.info("Reply synthesized using Cartesia voice: %s (locale: %s)", vid, locale)
-    return await _cartesia_speak(text, vid, locale)
+    try:
+        if vid.startswith(CLONE_PREFIX):
+            log.info("Reply voice requested: clone %s (locale: %s)", vid, locale)
+            audio = await _clone_speak(text, vid, locale)
+        elif PROVIDER == EDGE_MODEL:
+            by_language = EDGE_MALE_BY_LANGUAGE if gender(vid) == "male" else EDGE_BY_LANGUAGE
+            effective_voice = vid if vid.startswith(f"{locale}-") else by_language.get(locale, vid)
+            log.info("Reply synthesized using Edge voice: %s (locale: %s)", effective_voice, locale)
+            audio = await _edge_speak(text, vid, locale)
+        else:
+            log.info("Reply synthesized using Cartesia voice: %s (locale: %s)", vid, locale)
+            audio = await _cartesia_speak(text, vid, locale)
+        circuit_breaker.record_success()
+        return audio
+    except Exception:
+        circuit_breaker.record_failure()
+        raise
 
 
 async def warm_up() -> None:

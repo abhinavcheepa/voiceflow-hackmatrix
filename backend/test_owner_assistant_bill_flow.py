@@ -57,7 +57,7 @@ def test_loop_bounds_tool_iterations_at_max_4():
                 {
                     "id": f"call_{call_count}",
                     "type": "function",
-                    "function": {"name": "check_stock", "arguments": '{"item_name": "pen"}'},
+                    "function": {"name": "check_stock", "arguments": f'{{"item_name": "pen_{call_count}"}}'},
                 }
             ],
         }

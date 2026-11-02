@@ -340,15 +340,21 @@ export default function WhatsApp() {
               personal chats — otherwise friends get answered by a bot. */}
           <div className="mt-2 rounded-xl border border-line bg-panel-2 px-3 py-2.5">
             <div className="flex items-center justify-between">
-              <p className="text-xs font-medium">Only reply to these numbers</p>
+              <p className="text-xs font-medium">
+                {waStatus?.auto_reply_mode === "all"
+                  ? "Allowed numbers (Optional Filter)"
+                  : "Only reply to these numbers (Allowlist Mode)"}
+              </p>
               {allowlistSaved && (
                 <span className="text-[10px] text-aqua animate-pulse">Saved ✓</span>
               )}
             </div>
             <p className="mt-0.5 text-[11px] leading-tight text-dim">
               {allowlist.trim()
-                ? "Everyone else is stored but not answered."
-                : "Empty = the agent answers everyone who messages this number."}
+                ? "Only these numbers receive automated replies. Everyone else is stored without replying."
+                : (waStatus?.auto_reply_mode === "all"
+                    ? "Empty = the agent answers everyone who messages this number."
+                    : "Empty = no one receives automated replies (silent mode).")}
             </p>
             <textarea
               value={allowlist}
@@ -357,7 +363,7 @@ export default function WhatsApp() {
                 saveAllowlist(e.target.value);
               }}
               rows={2}
-              placeholder={"919812345678\n919876543210"}
+              placeholder={waStatus?.auto_reply_mode === "all" ? "Optional: 919812345678\n919876543210" : "Required: 919812345678\n919876543210"}
               className="mt-2 w-full resize-none rounded-lg border border-line bg-panel px-2.5 py-2 font-mono text-[11px] outline-none focus:border-violet/50"
             />
           </div>

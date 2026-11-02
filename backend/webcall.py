@@ -186,6 +186,7 @@ class Session:
         # swap bodies when you switch language; the reply wording changes, the
         # speaker does not.
         self.voice_language = self.language
+        self.clarification_count = 0
 
     @property
     def prompt(self) -> str:
@@ -463,8 +464,11 @@ async def speak(ws, session: Session, text: str, stt_ms: int = 0) -> None:
         session.recorder.add("agent", audio, voice.OUTPUT_EXT)
         await ws.send_bytes(audio)
     except Exception as e:  # noqa: BLE001 - a call without audio still beats a dropped call
-        log.warning("TTS failed on %s: %s", session.id, mask_error(e))
-        await ws.send_json({"type": "warning", "text": "Voice abhi available nahi hai."})
+        log.warning("TTS failed or skipped on %s: %s", session.id, mask_error(e))
+        if "circuit breaker is OPEN" in str(e):
+            await ws.send_json({"type": "warning", "text": "Voice temporarily offline (text-only mode)."})
+        else:
+            await ws.send_json({"type": "warning", "text": "Voice abhi available nahi hai."})
 
     prompt_toks = brain.last_turn_stats.get("prompt_tokens", 0)
     llm_stat = brain.last_turn_stats.get("llm_status", "none")
@@ -482,6 +486,7 @@ async def handle_turn(ws, session: Session, audio: bytes) -> None:
     t_stt_0 = time.perf_counter()
     try:
         stt_lang = "hi" if (session.language or "").lower() in ("hi", "hindi", "hinglish", "urdu") else (session.language or None)
+        brain.last_stt_status = "rejected"
         heard = await brain.transcribe(
             audio,
             "turn.webm",
@@ -495,14 +500,32 @@ async def handle_turn(ws, session: Session, audio: bytes) -> None:
         return
     stt_ms = int((time.perf_counter() - t_stt_0) * 1000)
 
+    stt_status = getattr(brain, "last_stt_status", "valid")
+
     if not heard.strip():
-        log.info("STT returned empty or rejected audio on %s (%d ms); asking to repeat with NO LLM call", session.id, stt_ms)
+        # Path (a): silence/noise -> NO LLM call, NO reply, send idle
+        if stt_status == "silence":
+            log.info("STT silence/noise on %s (%d ms); returning idle with NO speech", session.id, stt_ms)
+            await ws.send_json({"type": "idle"})
+            return
+
+        # Path (b): rejected speech -> clarification ladder (max 2 then handoff)
+        log.info("STT rejected speech on %s (%d ms); clarification count=%d", session.id, stt_ms, session.clarification_count)
         await ws.send_json({"type": "caller", "text": "...", "language": session.language})
-        await speak(ws, session, "Awaaz saaf nahi aayi, dobara bolein.", stt_ms=stt_ms)
+        if session.clarification_count == 0:
+            session.clarification_count = 1
+            await speak(ws, session, "Awaaz saaf nahi aayi, dobara bolein.", stt_ms=stt_ms)
+        elif session.clarification_count == 1:
+            session.clarification_count = 2
+            await speak(ws, session, "Aapki awaaz theek se nahi sun paayi, kya aap thoda saaf ya tez bol sakte hain?", stt_ms=stt_ms)
+        else:
+            session.clarification_count += 1
+            await speak(ws, session, "Awaaz mein pareshani ho rahi hai. Kripya humein WhatsApp par message karein ya text chat use karein.", stt_ms=stt_ms)
+            await ws.send_json({"type": "handoff", "channel": "whatsapp"})
         return
 
-    # Only turns that held speech go into the recording — noise blobs that
-    # transcribed to nothing would just be dead air in the file.
+    # Path (c): valid speech -> reset clarification counter, proceed to LLM
+    session.clarification_count = 0
     session.recorder.add("caller", audio, "webm")
     await respond(ws, session, heard, stt_ms=stt_ms)
 

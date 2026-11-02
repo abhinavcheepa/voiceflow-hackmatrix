@@ -528,6 +528,7 @@ async def whatsapp_status(request: Request) -> dict:
         "last_incoming": last_incoming,
         "last_incoming_time": last_incoming_time,
         "last_error": last_error,
+        "auto_reply_mode": os.getenv("AUTO_REPLY_MODE", "allowlist").strip().lower(),
     }
 
 
