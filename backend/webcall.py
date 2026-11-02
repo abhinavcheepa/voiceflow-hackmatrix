@@ -436,7 +436,12 @@ async def handle_turn(ws, session: Session, audio: bytes) -> None:
     await ws.send_json({"type": "thinking"})
 
     try:
-        heard = await brain.transcribe(audio, "turn.webm", vocab=session.vocab)
+        heard = await brain.transcribe(
+            audio,
+            "turn.webm",
+            vocab=session.vocab,
+            fallback_language=session.language or os.getenv("VOICE_LANGUAGE", "hi"),
+        )
     except Exception as e:  # noqa: BLE001
         log.warning("STT failed on %s: %s", session.id, mask_error(e))
         await ws.send_json({"type": "error", "text": "Abhi thodi takleef hai, thodi der mein try karein."})

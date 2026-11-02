@@ -25,6 +25,12 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+# Ensure UTF-8 stdout encoding on Windows consoles
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # Load .env if present
 import dotenv
 env_path = BACKEND_DIR / ".env"
@@ -205,20 +211,27 @@ async def check_stt() -> Dict[str, Any]:
 
     hindi_transcription = ""
     english_transcription = ""
+    hinglish_transcription = ""
     status = "OK"
     warnings = []
 
     try:
         hindi_audio = await voice.synthesize("Namaste", "Hindi")
-        hindi_transcription = await brain.transcribe(hindi_audio, "hindi.mp3")
+        hindi_transcription = await brain.transcribe(hindi_audio, "hindi.mp3", fallback_language="hi")
     except Exception as e:
         warnings.append(f"Hindi transcription failed ({e})")
 
     try:
         en_audio = await voice.synthesize("Hello", "English")
-        english_transcription = await brain.transcribe(en_audio, "english.mp3")
+        english_transcription = await brain.transcribe(en_audio, "english.mp3", fallback_language="en")
     except Exception as e:
         warnings.append(f"English transcription failed ({e})")
+
+    try:
+        hinglish_audio = await voice.synthesize("Hello, booking karni hai", "Hindi")
+        hinglish_transcription = await brain.transcribe(hinglish_audio, "hinglish.mp3", fallback_language="hi")
+    except Exception as e:
+        warnings.append(f"Hinglish transcription failed ({e})")
 
     hindi_ok = "namaste" in hindi_transcription.lower() or "नमस्ते" in hindi_transcription
     if not hindi_ok and backend_choice == "local" and model_name == "base":
@@ -231,7 +244,7 @@ async def check_stt() -> Dict[str, Any]:
     msg = (
         f"Backend: {backend_choice} (STT_PROVIDER={os.getenv('STT_PROVIDER', 'auto')}) | "
         f"Model: {model_name} ({compute}), cached={cached}, load_time={load_time_ms}ms | "
-        f"Hindi: '{hindi_transcription}' | English: '{english_transcription}'"
+        f"Hindi: '{hindi_transcription}' | English: '{english_transcription}' | Hinglish: '{hinglish_transcription}'"
     )
     if warnings:
         msg += f" | Warnings: {'; '.join(warnings)}"
@@ -384,13 +397,31 @@ def check_whatsapp() -> Dict[str, Any]:
     ]
     chrome_found = next((c for c in candidates if c and os.path.exists(c)), None)
 
-    status = "OK" if bridge_reachable else "WARN"
+    if provider == "web":
+        failures = []
+        fixes = []
+        if not bridge_reachable:
+            failures.append("wa-bridge is Offline")
+            fixes.append("Start wa-bridge: run 'cd wa-bridge; npm start' (or 'docker compose up -d wa-bridge')")
+        if mode == "allowlist" and allowlist_count == 0:
+            failures.append("allowlist is empty in allowlist mode")
+            fixes.append("Add test phone number to allowlist via dashboard or db.add_to_allowlist('+91...')")
+
+        if failures:
+            status = "FAIL"
+            fix = " | ".join(fixes)
+        else:
+            status = "OK"
+            fix = "None required."
+    else:
+        status = "OK" if bridge_reachable else "WARN"
+        fix = "cd wa-bridge && npm start (or start Docker stack with docker compose up -d)" if not bridge_reachable else "None required."
+
     msg = (
         f"Provider: {provider} | Bridge on {bridge_url}: {'Online (' + bridge_state + ')' if bridge_reachable else 'Offline'} | "
         f"Secret: {secret_match} | Auto-reply mode: {mode} (allowlisted: {allowlist_count} numbers) | "
         f"Chrome path: {chrome_found or 'Puppeteer default'}"
     )
-    fix = "cd wa-bridge && npm start (or start Docker stack with docker compose up -d)" if not bridge_reachable else "None required."
 
     return {
         "name": "WhatsApp Bridge",
@@ -535,10 +566,110 @@ async def run_doctor_checks() -> List[Dict[str, Any]]:
     return results
 
 
+def check_cloning_deep() -> Dict[str, Any]:
+    """In-depth verification of voice cloning prerequisites (--cloning flag).
+    Checks torch, OpenVoice, checkpoints_v2 files, sizes, and model loading.
+    """
+    issues = []
+    fixes = []
+
+    # 1. PyTorch check
+    torch_version = None
+    cuda_avail = False
+    try:
+        import torch
+        torch_version = torch.__version__
+        cuda_avail = torch.cuda.is_available()
+    except ImportError:
+        issues.append("PyTorch (torch) is not installed")
+        fixes.append("Run 'pip install --extra-index-url https://download.pytorch.org/whl/cpu torch'")
+
+    # 2. OpenVoice library check
+    openvoice_ok = False
+    try:
+        from openvoice.api import ToneColorConverter
+        from openvoice.se_extractor import get_se
+        openvoice_ok = True
+    except ImportError as e:
+        issues.append(f"openvoice library import failed ({e})")
+        fixes.append("Run 'pip install --no-deps git+https://github.com/myshell-ai/OpenVoice.git' or run backend/install_cloning.ps1")
+
+    # 3. Checkpoints_v2 directory & files
+    checkpoints_dir = BACKEND_DIR / "openvoice" / "checkpoints_v2" / "converter"
+    config_path = checkpoints_dir / "config.json"
+    ckpt_path = checkpoints_dir / "checkpoint.pth"
+
+    config_size = 0
+    ckpt_size_mb = 0.0
+
+    if not config_path.exists():
+        issues.append(f"Missing config.json at {config_path}")
+        fixes.append("Download config.json into backend/openvoice/checkpoints_v2/converter/")
+    else:
+        config_size = config_path.stat().st_size
+        if config_size < 500:
+            issues.append(f"config.json appears corrupted/empty ({config_size} bytes)")
+            fixes.append("Re-download config.json from https://huggingface.co/myshell-ai/OpenVoiceV2")
+
+    if not ckpt_path.exists():
+        issues.append(f"Missing checkpoint.pth at {ckpt_path}")
+        fixes.append("Download checkpoint.pth into backend/openvoice/checkpoints_v2/converter/ (or run backend/install_cloning.ps1)")
+    else:
+        ckpt_size_bytes = ckpt_path.stat().st_size
+        ckpt_size_mb = round(ckpt_size_bytes / (1024 * 1024), 2)
+        if ckpt_size_mb < 100.0:
+            issues.append(f"checkpoint.pth is incomplete or truncated ({ckpt_size_mb} MB, expected ~131 MB)")
+            fixes.append("Re-download complete checkpoint.pth (~131 MB) with resume support")
+
+    # 4. Model instantiation check if imports & files are present
+    model_loaded = False
+    if torch_version and openvoice_ok and config_path.exists() and ckpt_path.exists() and not issues:
+        try:
+            device = "cuda:0" if cuda_avail else "cpu"
+            converter = ToneColorConverter(str(config_path), device=device)
+            converter.load_ckpt(str(ckpt_path))
+            model_loaded = True
+        except Exception as e:
+            issues.append(f"Converter initialization/load failed ({e})")
+            fixes.append("Verify model architecture compatibility with installed PyTorch")
+
+    status = "OK" if not issues else "FAIL"
+    msg = (
+        f"PyTorch: {torch_version or 'missing'} (CUDA: {cuda_avail}) | "
+        f"OpenVoice: {'ready' if openvoice_ok else 'missing'} | "
+        f"checkpoints_v2: {checkpoints_dir} (checkpoint.pth: {ckpt_size_mb} MB, config.json: {config_size} B) | "
+        f"Model load: {'success' if model_loaded else 'failed or skipped'}"
+    )
+    if issues:
+        msg += f" | Issues: {'; '.join(issues)}"
+
+    return {
+        "name": "Voice Cloning (--cloning)",
+        "status": status,
+        "message": msg,
+        "fix": " | ".join(fixes) if fixes else "None required.",
+    }
+
+
 def main() -> int:
     print("=" * 80, flush=True)
     print(" VoiceFlow Diagnostic Doctor — System Verification", flush=True)
     print("=" * 80, flush=True)
+
+    if "--cloning" in sys.argv:
+        res = check_cloning_deep()
+        status = res["status"]
+        tag = "[FAIL]" if status == "FAIL" else "[ OK ]"
+        line = f"{tag} {res['name']}: {res['message']}"
+        if status == "FAIL" and res.get("fix") and res["fix"] != "None required.":
+            line += f" -> FIX: {res['fix']}"
+        print(line, flush=True)
+        print("=" * 80, flush=True)
+        if status == "FAIL":
+            print("OVERALL: FAILED (cloning prerequisites incomplete). See FIX suggestions above.", flush=True)
+            return 1
+        print("OVERALL: PASSED (cloning prerequisites verified).", flush=True)
+        return 0
 
     # 1. Run async checks
     results = asyncio.run(run_async_checks())

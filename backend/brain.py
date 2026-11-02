@@ -428,8 +428,24 @@ def _local_stt_available() -> bool:
     return importlib.util.find_spec("faster_whisper") is not None
 
 
-async def transcribe(audio: bytes, filename: str = "note.ogg", vocab: str = "") -> str:
-    """Speech-to-text. Language is auto-detected, so nothing to configure.
+ALLOWED_STT_LANGUAGES = {"hi", "en", "ur", "hindi", "english", "urdu"}
+
+
+def _effective_fallback_lang(fallback_language: str | None = None) -> str:
+    fb = (fallback_language or os.getenv("VOICE_LANGUAGE", "hi")).strip().lower()
+    if fb in ("en", "english"):
+        return "en"
+    return "hi"
+
+
+async def transcribe(
+    audio: bytes,
+    filename: str = "note.ogg",
+    vocab: str = "",
+    language: str | None = None,
+    fallback_language: str | None = None,
+) -> str:
+    """Speech-to-text. Language constrained to Hindi/English (hi, en).
 
     `vocab` primes Whisper with words it should expect — the product name and
     people's names. Without it "VoiceFlow" came back as "Vice Flow" and a
@@ -450,15 +466,15 @@ async def transcribe(audio: bytes, filename: str = "note.ogg", vocab: str = "") 
         filename = "note.webm"
     vocab = vocab[:VOCAB_CHARS]
     if stt_backend() == "local":
-        text = await asyncio.to_thread(_transcribe_local, audio, vocab)
+        text = await asyncio.to_thread(_transcribe_local, audio, vocab, language, fallback_language)
     else:
         try:
-            text = await _transcribe_groq(audio, filename, vocab)
+            text = await _transcribe_groq(audio, filename, vocab, language, fallback_language)
         except Exception as e:  # noqa: BLE001 - any Groq failure is worth a local retry
             if not _local_stt_available():
                 raise
             log.warning("Groq STT failed (%s) — falling back to local whisper", type(e).__name__)
-            text = await asyncio.to_thread(_transcribe_local, audio, vocab)
+            text = await asyncio.to_thread(_transcribe_local, audio, vocab, language, fallback_language)
     return "" if vocab and _echoes_vocab(text, vocab) else text
 
 
@@ -475,16 +491,30 @@ def _echoes_vocab(text: str, vocab: str) -> bool:
     return len(words) >= 3 and len(words & known) / len(words) >= 0.8
 
 
-async def _transcribe_groq(audio: bytes, filename: str, vocab: str = "") -> str:
+async def _transcribe_groq(
+    audio: bytes,
+    filename: str,
+    vocab: str = "",
+    language: str | None = None,
+    fallback_language: str | None = None,
+) -> str:
+    effective_fb = _effective_fallback_lang(fallback_language)
+    prompt_hint = f"Hindi, English, Hinglish conversation: Namaste, Hello. {vocab}".strip()[:VOCAB_CHARS]
+
+    data = {
+        "model": STT_MODEL,
+        "response_format": "verbose_json",
+        "prompt": prompt_hint,
+    }
+    if language:
+        data["language"] = language
+
     r = await _post(
         http(),
         f"{GROQ_URL}/audio/transcriptions",
         headers=_stt_headers(),
         files={"file": (filename, audio, "application/octet-stream")},
-        # verbose_json carries no_speech_prob per segment, which is the only
-        # reliable signal that Whisper was handed silence.
-        data={"model": STT_MODEL, "response_format": "verbose_json",
-              **({"prompt": vocab} if vocab else {})},
+        data=data,
     )
     body = r.json()
 
@@ -492,6 +522,32 @@ async def _transcribe_groq(audio: bytes, filename: str, vocab: str = "") -> str:
     if segments and all(s.get("no_speech_prob", 0) > NO_SPEECH_LIMIT for s in segments):
         log.debug("dropped: every segment looks like silence")
         return ""
+
+    detected_lang = (body.get("language") or "").strip().lower()
+    duration = float(body.get("duration") or 0.0)
+
+    # If language was unconstrained and came back outside (hi, en, ur), or short clip (<1.5s)
+    # was misdetected, retry with forced fallback language.
+    if not language and (detected_lang not in ALLOWED_STT_LANGUAGES or (duration > 0 and duration < 1.5 and detected_lang not in ("hi", "en"))):
+        log.warning(
+            "Groq STT detected outlier language '%s' (duration=%.2fs); retrying with fallback language '%s'",
+            detected_lang, duration, effective_fb,
+        )
+        retry_data = {
+            "model": STT_MODEL,
+            "response_format": "verbose_json",
+            "prompt": prompt_hint,
+            "language": effective_fb,
+        }
+        r_retry = await _post(
+            http(),
+            f"{GROQ_URL}/audio/transcriptions",
+            headers=_stt_headers(),
+            files={"file": (filename, audio, "application/octet-stream")},
+            data=retry_data,
+        )
+        body = r_retry.json()
+
     return _clean(body.get("text", ""))
 
 
@@ -574,7 +630,12 @@ def llm_status() -> dict:
     return {"status": "ok", "provider": provider, "model": CHAT_MODEL, "detail": f"{provider} ({CHAT_MODEL})"}
 
 
-def _transcribe_local(audio: bytes, vocab: str = "") -> str:
+def _transcribe_local(
+    audio: bytes,
+    vocab: str = "",
+    language: str | None = None,
+    fallback_language: str | None = None,
+) -> str:
     """Blocking — always call via asyncio.to_thread so the event loop keeps running."""
     try:
         model = _load_local()
@@ -586,8 +647,32 @@ def _transcribe_local(audio: bytes, vocab: str = "") -> str:
             raise RuntimeError("Whisper model download failed: no internet connection") from e
         raise RuntimeError(f"Whisper model load failed: {e}") from e
 
+    effective_fb = _effective_fallback_lang(fallback_language)
+    prompt_hint = f"Hindi, English, Hinglish conversation: Namaste, Hello. {vocab}".strip()[:VOCAB_CHARS]
+
     try:
-        segments, _ = model.transcribe(io.BytesIO(audio), beam_size=1, initial_prompt=vocab or None)
+        if language:
+            segments, _ = model.transcribe(
+                io.BytesIO(audio), beam_size=1, language=language, initial_prompt=prompt_hint or None
+            )
+        else:
+            segments, info = model.transcribe(
+                io.BytesIO(audio), beam_size=1, initial_prompt=prompt_hint or None
+            )
+            detected_lang = getattr(info, "language", "")
+            prob = getattr(info, "language_probability", 1.0)
+            dur = getattr(info, "duration", 0.0)
+
+            # If detected language is outside (hi, en, ur) or low confidence on short clip, fall back
+            if detected_lang not in ALLOWED_STT_LANGUAGES or (prob < 0.6 and dur < 2.0):
+                log.warning(
+                    "Local faster-whisper detected outlier language '%s' (prob=%.2f, dur=%.2fs); retrying with fallback '%s'",
+                    detected_lang, prob, dur, effective_fb,
+                )
+                segments, _ = model.transcribe(
+                    io.BytesIO(audio), beam_size=1, language=effective_fb, initial_prompt=prompt_hint or None
+                )
+
         kept = [s for s in segments if getattr(s, "no_speech_prob", 0) <= NO_SPEECH_LIMIT]
         return _clean(" ".join(s.text for s in kept))
     except Exception as e:

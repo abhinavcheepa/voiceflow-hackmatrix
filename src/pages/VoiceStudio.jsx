@@ -227,9 +227,13 @@ function CloneYourVoice({ profile, onCloned }) {
           <p className="mt-1 text-xs text-dim">
             Record yourself and the agent speaks in your voice — runs on this machine, free.
           </p>
-          {profile?.cloned && (
-            <p className="mt-1 text-xs text-aqua">Active: {profile.name}</p>
-          )}
+          {profile?.cloned ? (
+            <p className="mt-1 text-xs text-aqua font-medium">Active: {profile.name}</p>
+          ) : profile?.cloneMissing ? (
+            <p className="mt-1 text-xs text-saffron font-medium">
+              Clone not active: {profile.cloneMissing}, using default voice
+            </p>
+          ) : null}
         </div>
         <ChevronDown className={`size-4 shrink-0 text-dim transition ${open ? "rotate-180" : ""}`} />
       </button>
@@ -237,8 +241,8 @@ function CloneYourVoice({ profile, onCloned }) {
       {open && (
         <>
           {profile?.cloneMissing && (
-            <p className="mt-4 rounded-xl border border-saffron/30 bg-saffron/5 px-4 py-3 text-xs text-saffron">
-              Clone needs: {profile.cloneMissing}. Falling back to default Edge voice until installed.
+            <p className="mt-4 rounded-xl border border-saffron/30 bg-saffron/5 px-4 py-3 text-xs text-saffron font-medium">
+              Clone not active: {profile.cloneMissing}, using default voice
             </p>
           )}
           <div className="mt-6 flex flex-col items-center">

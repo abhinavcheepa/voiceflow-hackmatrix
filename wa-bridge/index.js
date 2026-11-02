@@ -413,7 +413,7 @@ async function onIncoming(msg, source) {
   // need to know is whether the event fired at all.
   state.lastEventAt = Date.now();
   log(
-    `[msg:${source}] from=${msg.from} type=${msg.type} fromMe=${msg.fromMe} status=${msg.isStatus}`
+    `[whatsapp:trace] bridge received: from=${msg.from} type=${msg.type} fromMe=${msg.fromMe} status=${msg.isStatus} (event=${source})`
   );
 
   // Ignore groups, status broadcasts and our own messages — this agent answers
@@ -477,6 +477,7 @@ async function forward(payload, attempt = 1) {
       headers: { "Content-Type": "application/json", "X-Bridge-Token": TOKEN },
       body: JSON.stringify(payload),
     });
+    log(`[whatsapp:trace] POST status=${r.status} id=${payload.id} from=${payload.from} (attempt=${attempt})`);
     if (r.ok) {
       if (attempt > 1) log(`Forwarded on attempt ${attempt}`);
       return;

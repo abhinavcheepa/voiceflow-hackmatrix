@@ -416,14 +416,23 @@ async def whatsapp_web_incoming(
     import hmac
     is_prod = os.getenv("ENV", "").lower() in ("production", "prod")
     bridge_secret = os.getenv("BRIDGE_SECRET") or os.getenv("WA_BRIDGE_TOKEN") or whatsapp_web.TOKEN
+    payload = await request.json()
+    msg_id = payload.get("id")
+    sender = payload.get("from")
+
     if not bridge_secret:
         if not is_prod and os.getenv("ALLOW_UNSIGNED_WEBHOOKS", "").lower() in ("true", "1", "yes"):
-            tasks.add_task(whatsapp.handle, whatsapp_web.parse(await request.json()))
+            log.info("[whatsapp:trace] backend accepted (unsigned dev flag): msg_id=%s from=%s", msg_id, sender)
+            tasks.add_task(whatsapp.handle, whatsapp_web.parse(payload))
             return {"ok": True}
+        log.warning("[whatsapp:trace] backend rejected: BRIDGE_SECRET unset (fail closed) msg_id=%s from=%s", msg_id, sender)
         raise HTTPException(401, "BRIDGE_SECRET / WA_BRIDGE_TOKEN is unset (fail closed)")
     if not x_bridge_token or not hmac.compare_digest(x_bridge_token, bridge_secret):
+        log.warning("[whatsapp:trace] backend rejected: bad or missing bridge token msg_id=%s from=%s", msg_id, sender)
         raise HTTPException(401, "bad or missing bridge token")
-    tasks.add_task(whatsapp.handle, whatsapp_web.parse(await request.json()))
+
+    log.info("[whatsapp:trace] backend accepted: msg_id=%s from=%s", msg_id, sender)
+    tasks.add_task(whatsapp.handle, whatsapp_web.parse(payload))
     return {"ok": True}
 
 
@@ -433,12 +442,18 @@ async def whatsapp_status(request: Request) -> dict:
     auth.require_auth(request)
     provider = whatsapp.PROVIDER
     bridge_reachable = False
+    bridge_state = "offline"
     qr_state = "none"
+    qr_data = None
+    last_error = None
 
     if provider == "web":
         try:
             st = await whatsapp_web.status()
             s_status = st.get("status")
+            bridge_state = s_status or "offline"
+            qr_data = st.get("qr")
+            last_error = st.get("error")
             if s_status == "offline":
                 bridge_reachable = False
                 qr_state = "offline"
@@ -450,24 +465,51 @@ async def whatsapp_status(request: Request) -> dict:
                     qr_state = "waiting"
                 else:
                     qr_state = s_status or "none"
-        except Exception:
+        except Exception as e:
             bridge_reachable = False
+            bridge_state = "offline"
             qr_state = "offline"
+            last_error = str(e)
     else:
         bridge_reachable = True
+        bridge_state = "connected" if whatsapp.configured() else "offline"
         qr_state = "scanned" if whatsapp.configured() else "none"
 
+    last_incoming = None
     last_incoming_time = None
     with db.connect() as conn:
-        row = conn.execute("SELECT MAX(created_at) FROM messages WHERE sender = 'them'").fetchone()
-        if row and row[0]:
-            last_incoming_time = row[0]
+        row = conn.execute(
+            """SELECT c.phone, m.body, m.created_at, c.name
+               FROM messages m
+               JOIN conversations c ON m.conversation_id = c.id
+               WHERE m.sender = 'them'
+               ORDER BY m.created_at DESC LIMIT 1"""
+        ).fetchone()
+        if row:
+            last_incoming = {
+                "phone": row[0],
+                "text": row[1],
+                "time": row[2],
+                "name": row[3],
+            }
+            last_incoming_time = row[2]
+
+        if not last_error:
+            err_row = conn.execute(
+                "SELECT body, created_at FROM messages WHERE failed = 1 ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if err_row:
+                last_error = err_row[0]
 
     return {
         "provider": provider,
         "bridge_reachable": bridge_reachable,
+        "bridge_state": bridge_state,
+        "qr": qr_data,
         "qr_state": qr_state,
+        "last_incoming": last_incoming,
         "last_incoming_time": last_incoming_time,
+        "last_error": last_error,
     }
 
 

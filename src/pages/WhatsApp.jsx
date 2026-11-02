@@ -259,20 +259,35 @@ export default function WhatsApp() {
               waStatus?.bridge_reachable ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" : "bg-rose-500/10 text-rose-400 border border-rose-500/20"
             }`}>
               <span className={`size-1.5 rounded-full ${waStatus?.bridge_reachable ? "bg-emerald-400" : "bg-rose-400"}`} />
-              Bridge: {waStatus?.bridge_reachable ? "Online" : "Offline"}
+              Bridge: {waStatus?.bridge_state || (waStatus?.bridge_reachable ? "Online" : "Offline")}
             </span>
             <span className="px-2 py-0.5 rounded-full bg-panel-2 text-dim border border-line">
               Provider: {waStatus?.provider || "web"}
             </span>
-            <span className="px-2 py-0.5 rounded-full bg-panel-2 text-dim border border-line">
+            <span className={`px-2 py-0.5 rounded-full border border-line ${waStatus?.qr_state === "waiting" ? "bg-saffron/10 text-saffron border-saffron/30" : "bg-panel-2 text-dim"}`}>
               QR: {waStatus?.qr_state || "none"}
             </span>
-            {waStatus?.last_incoming_time && (
-              <span className="px-2 py-0.5 rounded-full bg-panel-2 text-dim border border-line" title={waStatus.last_incoming_time}>
-                Last In: {new Date(waStatus.last_incoming_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            {waStatus?.last_incoming && (
+              <span className="px-2 py-0.5 rounded-full bg-panel-2 text-dim border border-line" title={`${waStatus.last_incoming.phone}: ${waStatus.last_incoming.text}`}>
+                Last In: {new Date(waStatus.last_incoming.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} ({waStatus.last_incoming.name || waStatus.last_incoming.phone})
               </span>
             )}
           </div>
+          {waStatus?.last_error && (
+            <div className="mt-2.5 rounded-lg border border-rose-500/30 bg-rose-500/10 px-2.5 py-1.5 text-[11px] text-rose-300 flex items-start gap-1.5">
+              <AlertTriangle className="size-3.5 shrink-0 mt-0.5 text-rose-400" />
+              <div className="min-w-0 flex-1">
+                <span className="font-semibold text-rose-200">Last Error: </span>
+                <span className="font-mono text-[10px] break-all">{waStatus.last_error}</span>
+              </div>
+            </div>
+          )}
+          {waStatus?.qr && waStatus?.qr_state === "waiting" && (
+            <div className="mt-3 rounded-xl border border-line bg-panel-2 p-3 text-center">
+              <p className="text-xs font-semibold text-white">Scan WhatsApp Web QR</p>
+              <img src={waStatus.qr} alt="WhatsApp QR" className="mx-auto mt-2 max-w-[160px] rounded-lg bg-white p-1.5" />
+            </div>
+          )}
           {imported && (
             <div
               className={`mt-2 flex items-start gap-2 text-[11px] leading-relaxed ${

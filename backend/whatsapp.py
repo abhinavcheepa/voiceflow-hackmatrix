@@ -248,11 +248,22 @@ async def handle(message: dict) -> None:
                 if not message.get("media_id"):
                     return
                 audio = await download_media(message["media_id"])
-            incoming = await brain.transcribe(audio)
+            last_lang = None
+            with db.connect() as conn:
+                row = conn.execute(
+                    "SELECT language FROM messages WHERE phone = ? AND language IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                    (sender,),
+                ).fetchone()
+                if row and row[0]:
+                    last_lang = row[0]
+            incoming = await brain.transcribe(
+                audio, fallback_language=last_lang or os.getenv("VOICE_LANGUAGE", "hi")
+            )
         else:
             incoming = message.get("text", "")
 
         if not incoming.strip():
+            log.info("[whatsapp:trace] dropped empty incoming message from %s", sender)
             return
 
         language = brain.detect_language(incoming)
@@ -269,26 +280,28 @@ async def handle(message: dict) -> None:
             or sender == "status@broadcast"
         )
         if is_group_or_broadcast:
-            log.info("ignoring group/broadcast/status update from %s", sender)
+            log.info("[whatsapp:trace] handle() decision: ignored group/broadcast/status update from %s", sender)
             return
 
         # Check for opt-out / STOP keywords (ISSUE-15)
         import opt_out
         if opt_out.is_opt_out_keyword(incoming):
-            log.info("Opt-out request received from %s: '%s'", sender, incoming)
+            log.info("[whatsapp:trace] handle() decision: opt-out request from %s: '%s'", sender, incoming)
             db.add_message(sender, "them", "voice" if is_voice else "text", incoming, name=name, language=language, needs_reply=False, wa_id=wa_id)
             db.opt_out(sender, reason=f"keyword: {incoming[:50]}")
             await send_text(sender, opt_out.ACK_OPTOUT_TEXT)
             db.add_message(sender, "us", "text", opt_out.ACK_OPTOUT_TEXT, name=name, language=language)
+            log.info("[whatsapp:trace] send result: opt-out confirmation sent to %s", sender)
             return
 
         # Check for resubscribe / START keywords (ISSUE-15)
         if opt_out.is_resubscribe_keyword(incoming):
-            log.info("Resubscribe request received from %s: '%s'", sender, incoming)
+            log.info("[whatsapp:trace] handle() decision: resubscribe request from %s: '%s'", sender, incoming)
             db.add_message(sender, "them", "voice" if is_voice else "text", incoming, name=name, language=language, needs_reply=False, wa_id=wa_id)
             db.opt_in(sender)
             await send_text(sender, opt_out.ACK_RESUBSCRIBE_TEXT)
             db.add_message(sender, "us", "text", opt_out.ACK_RESUBSCRIBE_TEXT, name=name, language=language)
+            log.info("[whatsapp:trace] send result: resubscribe confirmation sent to %s", sender)
             return
 
         # The message is recorded whatever happens next.
@@ -302,9 +315,13 @@ async def handle(message: dict) -> None:
             name=name, language=language, needs_reply=msg_needs_reply,
             wa_id=wa_id,
         )
+        log.info(
+            "[whatsapp:trace] stored: message_id=%s from=%s type=%s needs_reply=%s",
+            message_id, sender, "voice" if is_voice else "text", msg_needs_reply,
+        )
 
         if wa_id and message_id is None:
-            log.info("duplicate message %s from %s ignored", wa_id, sender)
+            log.info("[whatsapp:trace] duplicate message %s from %s ignored", wa_id, sender)
             return
 
         events.broadcast("message_update", {"phone": sender, "direction": "them", "name": name})
@@ -313,16 +330,17 @@ async def handle(message: dict) -> None:
         if blocked:
             # Name the switch. "Not replying" with three possible causes and no
             # log line is the single most time-wasting failure this thing has.
-            log.warning("no auto-reply to %s — %s (message stored)", sender, blocked)
+            log.warning("[whatsapp:trace] handle() decision: auto-reply blocked (%s) for %s — stored only", blocked, sender)
             return
 
+        log.info("[whatsapp:trace] handle() decision: generating auto-reply for %s", sender)
         await reply_to(sender, name, incoming, is_voice, language, message_id)
 
     except Exception as e:  # noqa: BLE001 - never let a webhook crash the worker
         # Logged on the thread so the owner sees the gap, but flagged so it
         # doesn't count as a reply in the response-rate metric. needs_reply stays
         # set, so the sweep retries it rather than leaving the customer hanging.
-        log.warning("auto-reply failed for %s: %s", sender, describe(e))
+        log.warning("[whatsapp:trace] send result: auto-reply failed for %s: %s", sender, describe(e))
         db.add_message(sender, "us", "text", f"[auto-reply failed: {describe(e)}]",
                        name=name, failed=True)
 
@@ -392,6 +410,7 @@ async def reply_to(sender: str, name: str | None, incoming: str, is_voice: bool,
 
     events.broadcast("message_update", {"phone": sender, "direction": "us", "name": name})
     rate_limiter.record_send(sender)
+    log.info("[whatsapp:trace] send result: reply sent to %s (voice=%s)", sender, is_voice)
 
     # Answered — nothing left to pick up on the next startup.
     if message_id:
